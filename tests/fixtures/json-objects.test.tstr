@@ -1,0 +1,32 @@
+// Simple object
+simple = { name: "test", count: 42 };
+
+// Nested object
+nested = {
+  user: {
+    name: "Doug",
+    role: "admin"
+  },
+  active: true
+};
+
+// Object with quoted keys
+quoted = { "content-type": "application/json", "x-custom": "value" };
+
+// Empty object
+empty = {};
+
+// Array
+ids = [1, 2, 3];
+
+// Empty array
+emptyArr = [];
+
+// Mixed nesting
+complex = {
+  items: [
+    { id: 1, name: "first" },
+    { id: 2, name: "second" }
+  ],
+  meta: { total: 2 }
+};

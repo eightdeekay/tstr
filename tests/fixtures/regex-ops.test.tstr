@@ -1,0 +1,10 @@
+req -->
+r = req.get("/v4/groups") ? 2xx | "Failed";
+
+// Regex test (boolean)
+r.tag ~? /test/ | "tag should contain test";
+r.name !~ /^temp/ | "name should not start with temp";
+
+// Regex extract
+matched = r.tag ~ /group-(\w+)/;
+accountId = r ~ /"accountId": "(.*?)"/;

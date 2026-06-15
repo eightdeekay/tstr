@@ -1,0 +1,24 @@
+// Arithmetic
+total = price * quantity + tax;
+half = total / 2;
+remainder = total % 10;
+
+// Comparisons
+total > 0 | "total must be positive";
+total >= 100 | "total too small";
+total < 99999 | "total too large";
+total <= 99999 | "total way too large";
+
+// Logical operators
+(total > 0 && total < 99999) | "out of range";
+(status == "active" || status == "pending") | "bad status";
+
+// Negation
+!disabled | "should not be disabled";
+
+// Null checks
+r.id != null | "missing id";
+r.deletedAt == null | "should not be deleted";
+
+// Parenthesized
+result = (a + b) * (c - d);

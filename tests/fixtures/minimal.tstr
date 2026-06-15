@@ -1,0 +1,2 @@
+req -->
+r = req.get("/v4/groups") ? 2xx | "Failed";

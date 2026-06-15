@@ -1,0 +1,4 @@
+// The body of a false `if` is skipped — the assertions inside never run.
+if false {
+    false | "should not reach this";
+}

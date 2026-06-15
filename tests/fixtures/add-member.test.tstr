@@ -1,0 +1,7 @@
+groupId, headers, req -->
+
+req.headers = headers;
+req.body = { accountId: "some-uuid" };
+r = req.post("/v4/groups/{{groupId}}/members") ? 2xx | "Failed to add member";
+
+r.accountId == "some-uuid" | "wrong account";

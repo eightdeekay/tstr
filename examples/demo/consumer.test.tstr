@@ -1,0 +1,9 @@
+// Consume values from upstream (data-flow.test.tstr)
+groupId, groupName -->
+
+groupId == 12345 | "wrong groupId";
+groupName == "Test Group" | "wrong groupName";
+
+// Build on upstream data
+fullLabel = groupName + " (#" + groupId + ")";
+fullLabel == "Test Group (#12345)" | "bad label: {{fullLabel}}";

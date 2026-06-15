@@ -1,0 +1,16 @@
+headers, req -->
+
+// Simple field set
+req.body = { name: "Test" };
+
+// Nested field mutation
+req.headers = headers;
+req.headers."content-type" = "text/plain";
+req.headers."authorization" = "Bearer {{token}}";
+
+// Override loaded data
+postBody = @fixtures/group.json;
+postBody.name = "Override Name";
+postBody.description = "Override Description";
+
+r = req.post("/v4/groups") ? 2xx | "Failed";

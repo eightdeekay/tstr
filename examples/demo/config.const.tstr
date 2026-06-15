@@ -1,0 +1,8 @@
+// Shared configuration for the demo suite
+baseUrl = "http://localhost:8080";
+defaultHeaders = {
+  "content-type": "application/json",
+  "accept": "application/json"
+};
+
+<-- baseUrl, defaultHeaders

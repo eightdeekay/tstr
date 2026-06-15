@@ -1,0 +1,14 @@
+req -->
+r = req.get("/v4/groups") ? 2xx | "Failed";
+
+// JS in assignment
+filtered = js:{ r.items.filter(i => i.active).map(i => i.id) };
+
+// Multi-line JS
+avg = js:{
+  let total = r.items.reduce((sum, i) => sum + i.count, 0);
+  return total / r.items.length;
+};
+
+// Standalone JS block
+js:{ console.log("debug:", r.items.length) };

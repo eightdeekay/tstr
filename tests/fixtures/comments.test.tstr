@@ -1,0 +1,16 @@
+// Line comment at the top
+
+req -->
+r = req.get("/v4/groups") ? 2xx | "Failed"; // trailing comment
+
+/* Block comment
+   spanning multiple
+   lines */
+
+groupId = r.id; /* inline block comment */
+
+// Comment with "string inside" should be stripped
+// Comment with // nested slash should be stripped
+
+msg = "hello // not a comment"; // but this is
+msg2 = "hello /* also not a comment */";

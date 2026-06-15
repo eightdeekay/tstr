@@ -1,0 +1,17 @@
+headers, req -->
+
+// Set up the request
+req.headers = headers;
+req.body = {
+  name: "Test Group",
+  description: "Created by test"
+};
+
+r = req.post("/v4/groups") ? 2xx | "Failed to create group";
+
+// Validate response
+r.id != null | "missing group id";
+r.name == "Test Group" | "wrong name";
+groupId = r.id;
+
+<-- groupId

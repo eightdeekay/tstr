@@ -1,0 +1,18 @@
+req -->
+
+// All on one line
+r = req.get("/v4/groups") ? 2xx | "Failed"; groupId = r.id; r.name != null | "no name";
+
+// Spread across lines with weird indentation
+r2 = post(
+    req,
+    "/v4/groups"
+)
+  ? 200 201
+  | "Bad status";
+
+// Extra whitespace everywhere
+  name   =   r.name  ;
+
+// Tabs and spaces mixed
+	tabbed = r.id;

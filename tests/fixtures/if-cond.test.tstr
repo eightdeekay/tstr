@@ -1,0 +1,6 @@
+groupId, req -->
+
+if groupId != null {
+    req.body = { groupId: {{groupId}} };
+    r = req.post("/v4/groups/{{groupId}}/activate") ? 2xx | "Activation failed";
+}

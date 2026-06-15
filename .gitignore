@@ -1,0 +1,11 @@
+/target
+
+# IDE
+/.idea
+
+# Local-only docs (kept out of the public repo)
+/CLAUDE.md
+/TODO.md
+
+# Per-run log the runner writes to cwd
+tstr-last-run.log
