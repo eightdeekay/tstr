@@ -637,4 +637,4 @@ through borrow-checker puzzles, writing the test suite, and talking through
 design trade-offs as the DSL evolved. The result is a genuine collaboration,
 and I've tried to keep this README honest about how it came together.
 
-Built by Doug Kress — **8D-K**
+Built by Doug Kress — **8DK**
