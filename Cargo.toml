@@ -1,6 +1,6 @@
 [package]
 name = "tstr"
-version = "0.3.17"
+version = "0.3.18"
 edition = "2021"
 license = "MIT"
 description = "CLI HTTP API test runner with a custom DSL"
@@ -22,6 +22,10 @@ atty = "=0.2.14"
 terminal_size = "=0.3.0"
 idna = "=0.4.0"
 url = "=2.4.1"
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4.3"
+base64 = "0.22.1"
 
 [dev-dependencies]
 tempfile = "=3.8.0"

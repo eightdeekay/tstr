@@ -502,9 +502,20 @@ email = $.randEmail();                          // random@example.com
 email = $.randEmail("doug@example.com");        // doug+rand@example.com
 timestamp = $.now();                            // unix timestamp
 $.log("checkpoint: groupId =", groupId);        // log message
+
+sig = $.hmacSha256(secret, payload);            // HMAC-SHA256, lowercase hex
+sig = $.hmacSha256(secret, payload, "base64");  // ...or standard base64
+header = $.stripeSign(whsec, body);             // "t=<now>,v1=<hex>"
+header = $.stripeSign(whsec, body, 1700000000); // ...with explicit timestamp
 ```
 
 `$.log()` messages are collected per-test and shown for failures (normal mode) or always (verbose mode).
+
+`$.stripeSign(secret, payload)` emulates Stripe's `Stripe-Signature` header: it
+HMAC-SHA256s `"{timestamp}.{payload}"` and returns the `t=…,v1=…` value Stripe's
+`v1` scheme expects. The timestamp defaults to the current time; pass an explicit
+one for deterministic tests or to exercise replay-tolerance windows. For other
+providers' signing schemes, build the header yourself from `$.hmacSha256()`.
 
 ### Other Features
 

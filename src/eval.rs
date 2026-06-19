@@ -884,7 +884,120 @@ fn eval_builtin(name: &str, args: &[Expr], scope: &Scope) -> Result<Value, EvalE
             Ok(Value::Null)
         }
 
+        "hmacSha256" => {
+            // $.hmacSha256(key, message)            -> lowercase hex digest
+            // $.hmacSha256(key, message, encoding)  -> "hex" (default) or "base64"
+            if args.len() < 2 || args.len() > 3 {
+                return Err(EvalError::new(
+                    "$.hmacSha256() takes 2 or 3 arguments (key, message, [encoding])",
+                ));
+            }
+            let key = match eval_expr(&args[0], scope)? {
+                Value::String(s) => s,
+                _ => return Err(EvalError::new("$.hmacSha256(key, ...) expects key to be a string")),
+            };
+            let message = match eval_expr(&args[1], scope)? {
+                Value::String(s) => s,
+                _ => {
+                    return Err(EvalError::new(
+                        "$.hmacSha256(key, message) expects message to be a string",
+                    ))
+                }
+            };
+            let encoding = if args.len() == 3 {
+                match eval_expr(&args[2], scope)? {
+                    Value::String(s) => s,
+                    _ => {
+                        return Err(EvalError::new(
+                            "$.hmacSha256(key, message, encoding) expects encoding to be a string",
+                        ))
+                    }
+                }
+            } else {
+                "hex".to_string()
+            };
+            Ok(Value::String(hmac_sha256(
+                key.as_bytes(),
+                message.as_bytes(),
+                &encoding,
+            )?))
+        }
+
+        "stripeSign" => {
+            // $.stripeSign(secret, payload)             -> "t={now},v1={hex}"
+            // $.stripeSign(secret, payload, timestamp)  -> use an explicit timestamp
+            // Emulates Stripe's Stripe-Signature header: HMAC-SHA256 over
+            // "{timestamp}.{payload}", hex-encoded as the v1 scheme.
+            if args.len() < 2 || args.len() > 3 {
+                return Err(EvalError::new(
+                    "$.stripeSign() takes 2 or 3 arguments (secret, payload, [timestamp])",
+                ));
+            }
+            let secret = match eval_expr(&args[0], scope)? {
+                Value::String(s) => s,
+                _ => {
+                    return Err(EvalError::new(
+                        "$.stripeSign(secret, ...) expects secret to be a string",
+                    ))
+                }
+            };
+            let payload = match eval_expr(&args[1], scope)? {
+                Value::String(s) => s,
+                _ => {
+                    return Err(EvalError::new(
+                        "$.stripeSign(secret, payload) expects payload to be a string",
+                    ))
+                }
+            };
+            let timestamp = if args.len() == 3 {
+                match eval_expr(&args[2], scope)? {
+                    Value::Number(n) => n as i64,
+                    Value::String(s) => s.parse::<i64>().map_err(|_| {
+                        EvalError::new("$.stripeSign() timestamp must be an integer")
+                    })?,
+                    _ => {
+                        return Err(EvalError::new(
+                            "$.stripeSign(secret, payload, timestamp) expects timestamp to be a number",
+                        ))
+                    }
+                }
+            } else {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64
+            };
+            let signed_payload = format!("{}.{}", timestamp, payload);
+            let v1 = hmac_sha256(secret.as_bytes(), signed_payload.as_bytes(), "hex")?;
+            Ok(Value::String(format!("t={},v1={}", timestamp, v1)))
+        }
+
         _ => Err(EvalError::new(format!("unknown built-in function '$.{}()'", name))),
+    }
+}
+
+/// Compute HMAC-SHA256 over `message` keyed by `key`, encoded as `encoding`
+/// ("hex" for lowercase hex, "base64" for standard base64).
+fn hmac_sha256(key: &[u8], message: &[u8], encoding: &str) -> Result<String, EvalError> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(key)
+        .map_err(|e| EvalError::new(format!("$.hmacSha256() invalid key: {}", e)))?;
+    mac.update(message);
+    let digest = mac.finalize().into_bytes();
+
+    match encoding {
+        "hex" => Ok(hex::encode(digest)),
+        "base64" => {
+            use base64::Engine;
+            Ok(base64::engine::general_purpose::STANDARD.encode(digest))
+        }
+        other => Err(EvalError::new(format!(
+            "$.hmacSha256() unknown encoding '{}' (expected 'hex' or 'base64')",
+            other
+        ))),
     }
 }
 
@@ -2285,6 +2398,85 @@ mod tests {
             Value::Number(n) => assert!(n > 1_700_000_000.0), // after 2023
             _ => panic!("expected number"),
         }
+    }
+
+    // --- hmacSha256 / stripeSign ---
+
+    // RFC 4231 Test Case 2 — a well-known HMAC-SHA256 vector.
+    const RFC4231_KEY: &str = "Jefe";
+    const RFC4231_MSG: &str = "what do ya want for nothing?";
+    const RFC4231_HEX: &str =
+        "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843";
+
+    #[test]
+    fn test_builtin_hmac_sha256_hex() {
+        let v = eval(&format!(
+            "$.hmacSha256(\"{}\", \"{}\")",
+            RFC4231_KEY, RFC4231_MSG
+        ));
+        assert_eq!(v, Value::String(RFC4231_HEX.to_string()));
+    }
+
+    #[test]
+    fn test_builtin_hmac_sha256_explicit_hex() {
+        let v = eval(&format!(
+            "$.hmacSha256(\"{}\", \"{}\", \"hex\")",
+            RFC4231_KEY, RFC4231_MSG
+        ));
+        assert_eq!(v, Value::String(RFC4231_HEX.to_string()));
+    }
+
+    #[test]
+    fn test_builtin_hmac_sha256_base64() {
+        let v = eval(&format!(
+            "$.hmacSha256(\"{}\", \"{}\", \"base64\")",
+            RFC4231_KEY, RFC4231_MSG
+        ));
+        let b64 = match v {
+            Value::String(s) => s,
+            _ => panic!("expected string"),
+        };
+        // The base64 output must decode to the same bytes as the hex vector.
+        use base64::Engine;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&b64)
+            .expect("valid base64");
+        assert_eq!(decoded, hex::decode(RFC4231_HEX).unwrap());
+    }
+
+    #[test]
+    fn test_builtin_hmac_sha256_arity_error() {
+        let msg = eval_err("$.hmacSha256(\"key\")");
+        assert!(msg.contains("2 or 3 arguments"), "got: {}", msg);
+    }
+
+    #[test]
+    fn test_builtin_hmac_sha256_unknown_encoding() {
+        let msg = eval_err("$.hmacSha256(\"key\", \"msg\", \"base32\")");
+        assert!(msg.contains("unknown encoding"), "got: {}", msg);
+    }
+
+    #[test]
+    fn test_builtin_stripe_sign_explicit_timestamp() {
+        let header = match eval("$.stripeSign(\"whsec\", \"hello\", 1234567890)") {
+            Value::String(s) => s,
+            _ => panic!("expected string"),
+        };
+        // v1 is HMAC-SHA256 over "{timestamp}.{payload}", hex-encoded.
+        let expected_v1 = hmac_sha256(b"whsec", b"1234567890.hello", "hex").unwrap();
+        assert_eq!(header, format!("t=1234567890,v1={}", expected_v1));
+    }
+
+    #[test]
+    fn test_builtin_stripe_sign_default_timestamp() {
+        let header = match eval("$.stripeSign(\"whsec\", \"hello\")") {
+            Value::String(s) => s,
+            _ => panic!("expected string"),
+        };
+        assert!(header.starts_with("t="), "got: {}", header);
+        let v1 = header.split(",v1=").nth(1).expect("has v1 segment");
+        assert_eq!(v1.len(), 64); // SHA-256 hex digest is 64 chars
+        assert!(v1.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     // --- retry block ---
