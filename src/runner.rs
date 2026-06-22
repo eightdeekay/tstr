@@ -146,8 +146,11 @@ fn collect_slot_totals(
     display_root: &std::path::Path,
     totals: &mut HashMap<String, usize>,
 ) {
+    let is_leaf = dir.children.is_empty();
     for entry in dir.entries.values() {
-        if entry.file.file_type == FileType::Const {
+        // Consts are loads, not tests; scaffolding (non-leaf setup/cleanup)
+        // never claims a slot. Both stay out of the bar sizing.
+        if entry.file.file_type == FileType::Const || is_scaffold(entry, is_leaf) {
             continue;
         }
         let key = slot_key(&entry.path, display_root);
@@ -199,6 +202,7 @@ fn run_dir_structural(
     use rayon::prelude::*;
 
     let mut totals = RunTotals::new();
+    let is_leaf = dir.children.is_empty();
 
     // Sort entries into phase buckets, each by filename for lex order.
     let mut consts: Vec<&TestEntry> = dir.entries.values()
@@ -213,6 +217,16 @@ fn run_dir_structural(
     let mut cleanups: Vec<&TestEntry> = dir.entries.values()
         .filter(|e| e.file.file_type == FileType::Cleanup)
         .collect();
+
+    // Leaf rule: a directory with no child suites has nothing below it for a
+    // setup to establish or a cleanup to tear down across, so the type tag
+    // carries no special meaning. Fold `.setup`/`.cleanup` into the regular
+    // test sequence — lex-ordered with the tests, counted as tests, and no
+    // fail-fast cascade. (cli.rs warns the author this is happening.)
+    if is_leaf {
+        tests.append(&mut setups);
+        tests.append(&mut cleanups);
+    }
 
     let lex_key = |e: &&TestEntry| e.path.file_name()
         .map(|n| n.to_os_string())
@@ -235,11 +249,14 @@ fn run_dir_structural(
             blocked = Some(block_reason(&result, entry));
         }
         merge_exports_into(&mut dir_ambient, &result.exports);
-        report_file(entry, &result, index, display_root, printer, &mut totals);
+        report_file(entry, &result, index, display_root, printer, &mut totals, is_scaffold(entry, is_leaf));
     }
 
-    // Freeze the scope; children read it immutably and run concurrently.
-    let dir_ambient = dir_ambient;
+    // Children read the dir scope immutably and run concurrently. The shared
+    // borrow lasts only for the parallel reduce, so phases 3 & 4 below can
+    // resume mutating `dir_ambient` once it returns. Children see the scope as
+    // it stood after const + setup — tests run after children, so a leaf's
+    // test exports never reach a sibling subtree (leaves have no children).
     let blocked = blocked;
     let children: Vec<&Suite> = dir.children.values().collect();
     let child_totals = children.par_iter()
@@ -247,16 +264,22 @@ fn run_dir_structural(
         .reduce(RunTotals::new, |mut a, b| { a.merge(b); a });
     totals.merge(child_totals);
 
-    // Phase 3 — tests in this dir (sequential, lex order).
+    // Phase 3 — tests in this dir (sequential, lex order). Each test's exports
+    // cascade into the dir scope so a later test can consume an earlier one's
+    // output (e.g. an id returned by an earlier call), the same way setups do.
     for entry in tests {
         let result = run_or_skip(entry, &dir_ambient, blocked.as_deref(), index, opts);
-        report_file(entry, &result, index, display_root, printer, &mut totals);
+        merge_exports_into(&mut dir_ambient, &result.exports);
+        report_file(entry, &result, index, display_root, printer, &mut totals, is_scaffold(entry, is_leaf));
     }
 
-    // Phase 4 — cleanups in this dir (sequential, lex order).
+    // Phase 4 — cleanups in this dir (sequential, lex order). They see the
+    // accumulated test scope and chain among themselves too. Only reached in
+    // non-leaf dirs — leaf cleanups were folded into the tests bucket above.
     for entry in cleanups {
         let result = run_or_skip(entry, &dir_ambient, blocked.as_deref(), index, opts);
-        report_file(entry, &result, index, display_root, printer, &mut totals);
+        merge_exports_into(&mut dir_ambient, &result.exports);
+        report_file(entry, &result, index, display_root, printer, &mut totals, is_scaffold(entry, is_leaf));
     }
 
     totals
@@ -344,8 +367,22 @@ fn skipped_result(entry: &TestEntry, reason: &str) -> FileResult {
     }
 }
 
+/// A file is display *scaffolding* when it's a setup/cleanup in a non-leaf
+/// directory — infrastructure that establishes or tears down scope for the
+/// leaves below it, not a test in its own right. Leaf setup/cleanup are folded
+/// into the test sequence (see `run_dir_structural`) and are NOT scaffolding.
+fn is_scaffold(entry: &TestEntry, dir_is_leaf: bool) -> bool {
+    !dir_is_leaf && matches!(entry.file.file_type, FileType::Setup | FileType::Cleanup)
+}
+
 /// Report one file's result to every consumer: the run log + streaming output
 /// (file_result), the interactive slot display (record_test), and the totals.
+///
+/// `scaffold` files (non-leaf setup/cleanup) are kept out of the live slot
+/// display and the per-suite summary table — those show only leaf tests. They
+/// still always count toward `totals` (so a failed setup yields a non-zero exit)
+/// and a *failed* scaffold file is still streamed and tabled (see file_result);
+/// only passing/skipped scaffolding is invisible.
 fn report_file(
     entry: &TestEntry,
     result: &eval::FileResult,
@@ -353,13 +390,17 @@ fn report_file(
     display_root: &std::path::Path,
     printer: &Arc<Printer>,
     totals: &mut RunTotals,
+    scaffold: bool,
 ) {
     printer.file_result(
         result,
         depth_of_path(&entry.path, &index.root),
         Some(&rel_path_of(&entry.path, &index.root)),
+        scaffold,
     );
-    printer.record_test(&slot_key(&entry.path, display_root), 0, result);
+    if !scaffold {
+        printer.record_test(&slot_key(&entry.path, display_root), 0, result);
+    }
     totals.record(result);
 }
 
@@ -492,5 +533,122 @@ mod tests {
         let e = entry("00 Login", "x = 1;");
         let result = skipped_result(&e, "placeholder"); // skipped=true, failures empty
         assert_eq!(block_reason(&result, &e), "prior setup '00 Login' did not run");
+    }
+
+    /// Regression: within a directory, a test's exports must cascade to a
+    /// later test (same way setups cascade). Before the fix, phase 3 froze
+    /// the dir scope and never merged test exports, so `02` couldn't see a
+    /// value `01` exported — it would skip with "input parameter not
+    /// available". Run two pure-computation tests end-to-end and assert both
+    /// pass with nothing skipped.
+    #[test]
+    fn test_exports_cascade_to_later_test_in_same_dir() {
+        use crate::output::{BarStyle, OutputMode, Printer};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("tstr.yaml"), "constants: {}\n").unwrap();
+        std::fs::write(root.join("01-make.test.tstr"), "value = 42;\n<-- value\n").unwrap();
+        std::fs::write(
+            root.join("02-use.test.tstr"),
+            "value -->\nvalue == 42 | \"chaining broken: value not seen\";\n",
+        )
+        .unwrap();
+
+        let suite = crate::discovery::discover(root).unwrap();
+        let index = crate::scheduler::FileIndex::build(suite.clone(), root.to_path_buf());
+        let opts = RunOptions {
+            stop_on_error: false,
+            halt_flag: None,
+            display_root: None,
+            config: crate::config::Config::default(),
+            constants: Arc::new(HashMap::new()),
+        };
+        let printer = Arc::new(Printer::new(OutputMode::Quiet, BarStyle::Auto));
+
+        let totals = run_structural(&suite, &index, &HashMap::new(), &opts, &printer);
+
+        assert_eq!(totals.passed, 2, "both tests should pass");
+        assert_eq!(totals.skipped, 0, "second test must not skip — it should see 01's export");
+        assert_eq!(totals.failed, 0);
+    }
+
+    /// At a leaf, `.setup`/`.cleanup` are treated as regular tests: they run in
+    /// lex order, count toward totals, and — crucially — a failing one does
+    /// NOT cascade-block later files (that fail-fast is reserved for setups in
+    /// scaffolding/non-leaf dirs). Here `01` is a setup that fails its
+    /// assertion; `02` must still run, not skip.
+    #[test]
+    fn leaf_setup_failure_does_not_block_later_tests() {
+        use crate::output::{BarStyle, OutputMode, Printer};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("tstr.yaml"), "constants: {}\n").unwrap();
+        std::fs::write(root.join("01-make.setup.tstr"), "1 == 2 | \"boom\";\n").unwrap();
+        std::fs::write(root.join("02-after.test.tstr"), "1 == 1 | \"unreachable\";\n").unwrap();
+
+        let suite = crate::discovery::discover(root).unwrap();
+        let index = crate::scheduler::FileIndex::build(suite.clone(), root.to_path_buf());
+        let opts = RunOptions {
+            stop_on_error: false,
+            halt_flag: None,
+            display_root: None,
+            config: crate::config::Config::default(),
+            constants: Arc::new(HashMap::new()),
+        };
+        let printer = Arc::new(Printer::new(OutputMode::Quiet, BarStyle::Auto));
+
+        let totals = run_structural(&suite, &index, &HashMap::new(), &opts, &printer);
+
+        assert_eq!(totals.failed, 1, "the leaf setup's failed assertion counts as a failure");
+        assert_eq!(totals.passed, 1, "the later test still runs");
+        assert_eq!(totals.skipped, 0, "no cascade-block at a leaf");
+    }
+
+    /// Scaffolding (a non-leaf setup) is kept out of the slot display: it gets
+    /// no slot and never produces a "(root)" bucket. Only the leaf test below
+    /// it sizes a bar. (Failure visibility + totals are exercised separately.)
+    #[test]
+    fn non_leaf_setup_is_excluded_from_slot_totals() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("tstr.yaml"), "constants: {}\n").unwrap();
+        std::fs::write(root.join("req.setup.tstr"), "token = \"abc\";\n<-- token\n").unwrap();
+        std::fs::create_dir(root.join("child")).unwrap();
+        std::fs::write(
+            root.join("child/01-use.test.tstr"),
+            "token == \"abc\" | \"missing\";\n",
+        )
+        .unwrap();
+
+        let suite = crate::discovery::discover(root).unwrap();
+        let slots = compute_slot_totals(&suite, root);
+
+        assert_eq!(slots.get("child"), Some(&1), "the leaf test sizes a 'child' slot");
+        assert!(!slots.contains_key("(root)"), "non-leaf setup must not create a (root) slot");
+        assert_eq!(slots.len(), 1, "only the leaf test is a display slot");
+    }
+
+    #[test]
+    fn is_scaffold_only_flags_non_leaf_setup_cleanup() {
+        // entry() always builds a .test.tstr path, so parse explicit filenames
+        // to get setup/cleanup/test file types.
+        let mk = |fname: &str| TestEntry {
+            path: std::path::PathBuf::from(fname),
+            name: "f".to_string(),
+            file: crate::parser::parse_file("x = 1;", fname).unwrap(),
+        };
+        let s = mk("a.setup.tstr");
+        let c = mk("a.cleanup.tstr");
+        let t = mk("a.test.tstr");
+        // Non-leaf: setup/cleanup are scaffolding; test never is.
+        assert!(is_scaffold(&s, false));
+        assert!(is_scaffold(&c, false));
+        assert!(!is_scaffold(&t, false));
+        // Leaf: nothing is scaffolding (setup/cleanup run as tests there).
+        assert!(!is_scaffold(&s, true));
+        assert!(!is_scaffold(&c, true));
+        assert!(!is_scaffold(&t, true));
     }
 }

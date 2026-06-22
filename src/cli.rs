@@ -245,6 +245,16 @@ fn run_command(
         process::exit(1);
     }
 
+    // Setup/cleanup in a leaf directory have no scaffolding role there — the
+    // runner treats them as regular tests. Warn, but run.
+    let leaf_scaffolding = discovery::check_leaf_scaffolding(&suite, &root);
+    if !leaf_scaffolding.is_empty() {
+        eprintln!("warning: setup/cleanup scripts are treated as regular tests at the leaf level");
+        for v in &leaf_scaffolding {
+            eprintln!("         {}", v);
+        }
+    }
+
     let mode = if quiet {
         OutputMode::Quiet
     } else if verbose {

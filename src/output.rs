@@ -821,12 +821,17 @@ impl Printer {
         }
     }
 
-    pub fn file_result(&self, result: &FileResult, depth: usize, source_file: Option<&str>) {
-        // Log every test (PASS/FAIL/SKIP) regardless of mode
+    pub fn file_result(&self, result: &FileResult, depth: usize, source_file: Option<&str>, scaffold: bool) {
+        // Log every test (PASS/FAIL/SKIP) to the run log regardless of mode.
         self.log_test(result, source_file);
 
-        // Accumulate per-tld stats (consts excluded — they're loads, not tests)
-        if !result.is_const {
+        let failed = !result.skipped && !result.failures.is_empty();
+
+        // Per-suite summary stats. Consts are loads, not tests. Scaffolding
+        // (non-leaf setup/cleanup) is infrastructure — it only earns a table
+        // row when it FAILS (so the table's Fail count matches the exit code);
+        // passing/skipped scaffolding stays invisible.
+        if !result.is_const && (!scaffold || failed) {
             let tld = source_file.map(tld_of).unwrap_or_else(|| "(root)".to_string());
             let mut stats = self.tld_stats.lock().unwrap();
             let entry = stats.entry(tld).or_default();
@@ -847,7 +852,12 @@ impl Printer {
             return;
         }
 
+        // Consts (loads) and passing/skipped scaffolding stream only under -v;
+        // a failed scaffold always streams so the failure is never swallowed.
         if result.is_const && self.mode != OutputMode::Verbose {
+            return;
+        }
+        if scaffold && !failed && self.mode != OutputMode::Verbose {
             return;
         }
 

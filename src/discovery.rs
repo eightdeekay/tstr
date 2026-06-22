@@ -176,6 +176,32 @@ fn collect_leaf_violations(suite: &Suite, root: &Path, out: &mut Vec<String>) {
     }
 }
 
+/// Find `.setup.tstr` / `.cleanup.tstr` files sitting in a **leaf** directory.
+/// A leaf has nothing below it for a setup to establish or a cleanup to tear
+/// down across, so the type tag carries no special meaning there — the runner
+/// folds these into the regular test sequence. Returns suite-root-relative
+/// paths so the caller can warn about it (empty = nothing to warn).
+pub fn check_leaf_scaffolding(suite: &Suite, root: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    collect_leaf_scaffolding(suite, root, &mut found);
+    found.sort();
+    found
+}
+
+fn collect_leaf_scaffolding(suite: &Suite, root: &Path, out: &mut Vec<String>) {
+    if suite.is_leaf() {
+        for entry in suite.entries.values() {
+            if matches!(entry.file.file_type, FileType::Setup | FileType::Cleanup) {
+                let rel = entry.path.strip_prefix(root).unwrap_or(&entry.path);
+                out.push(rel.to_string_lossy().to_string());
+            }
+        }
+    }
+    for child in suite.children.values() {
+        collect_leaf_scaffolding(child, root, out);
+    }
+}
+
 fn discover_dir(dir: &Path, errors: &mut Vec<String>, target: Option<&Path>) -> Suite {
     let mut entries = HashMap::new();
     let mut children = HashMap::new();
