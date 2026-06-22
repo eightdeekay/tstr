@@ -318,25 +318,25 @@ mod tests {
         // Root const
         fs::write(
             root.join("shared-values.const.tstr"),
-            "baseUrl = \"http://localhost:8080\";\n<-- baseUrl\n",
+            "--> { baseUrl = \"http://localhost:8080\"; return baseUrl; }\n",
         ).unwrap();
 
         // crud/ subdirectory (leaf)
         fs::create_dir(root.join("crud")).unwrap();
         fs::write(
             root.join("crud/create-group.test.tstr"),
-            "req -->\nr = req.post(\"http://localhost/v4/groups\") ? 2xx | \"Failed\";\ngroupId = r.id;\n<-- groupId\n",
+            "req --> { r = req.post(\"http://localhost/v4/groups\") ? 2xx | \"Failed\"; groupId = r.id; return groupId; }\n",
         ).unwrap();
         fs::write(
             root.join("crud/delete-group.test.tstr"),
-            "req, groupId -->\nr = req.delete(\"http://localhost/v4/groups\") ? 2xx | \"Failed\";\n",
+            "req, groupId --> { r = req.delete(\"http://localhost/v4/groups\") ? 2xx | \"Failed\"; }\n",
         ).unwrap();
 
         // members/ subdirectory (leaf)
         fs::create_dir(root.join("members")).unwrap();
         fs::write(
             root.join("members/add-member.test.tstr"),
-            "req, groupId -->\nr = req.post(\"http://localhost/v4/members\") ? 2xx | \"Failed\";\n",
+            "req, groupId --> { r = req.post(\"http://localhost/v4/members\") ? 2xx | \"Failed\"; }\n",
         ).unwrap();
 
         dir
@@ -412,9 +412,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let root = dir.path();
         // A non-leaf dir (has a child) that ALSO holds a test file.
-        fs::write(root.join("oops.test.tstr"), "true || \"x\";\n").unwrap();
+        fs::write(root.join("oops.test.tstr"), "--> { true || \"x\"; }\n").unwrap();
         fs::create_dir(root.join("sub")).unwrap();
-        fs::write(root.join("sub/ok.test.tstr"), "true || \"x\";\n").unwrap();
+        fs::write(root.join("sub/ok.test.tstr"), "--> { true || \"x\"; }\n").unwrap();
 
         let suite = discover(root).unwrap();
         let violations = check_leaf_only_tests(&suite, root);
@@ -432,7 +432,7 @@ mod tests {
         let create = &crud.entries["create-group"];
         assert_eq!(create.file.inputs, vec!["req"]);
         assert_eq!(create.file.outputs, vec!["groupId"]);
-        assert_eq!(create.file.body.len(), 2); // HTTP call + assignment
+        assert_eq!(create.file.body.len(), 3); // HTTP call + assignment + return
     }
 
     #[test]

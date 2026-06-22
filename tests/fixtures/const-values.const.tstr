@@ -1,5 +1,6 @@
-testSiteId = "00000000-0000-0000-0000-000000000001";
-testAccountId = "00000000-0000-0000-0000-000000000002";
-baseGroup = { name: "Test Group", description: "Created by test" };
-
-<-- testSiteId, testAccountId, baseGroup
+--> {
+  testSiteId = "00000000-0000-0000-0000-000000000001";
+  testAccountId = "00000000-0000-0000-0000-000000000002";
+  baseGroup = { name: "Test Group", description: "Created by test" };
+  return testSiteId, testAccountId, baseGroup;
+}

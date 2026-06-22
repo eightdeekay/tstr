@@ -1,10 +1,12 @@
-// Escaped quotes in strings
-msg = "he said \"hello\"";
+--> {
+  // Escaped quotes in strings
+  msg = "he said \"hello\"";
 
-// Various escape sequences
-tabStr = "col1\tcol2";
-newlineStr = "line1\nline2";
-backslash = "path\\to\\file";
+  // Various escape sequences
+  tabStr = "col1\tcol2";
+  newlineStr = "line1\nline2";
+  backslash = "path\\to\\file";
 
-// String with special chars that aren't comments
-url = "http://example.com/path?foo=bar&baz=qux";
+  // String with special chars that aren't comments
+  url = "http://example.com/path?foo=bar&baz=qux";
+}

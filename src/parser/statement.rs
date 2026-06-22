@@ -90,8 +90,29 @@ fn disabled_stmt(input: &mut &str) -> ModalResult<Statement> {
     Ok(Statement::Disabled { reason })
 }
 
-/// Parse `return expr;` or bare `return;`. Universal output mechanism under
-/// the structural execution model — see ast::Statement::Return.
+/// Parse the optional `as <name>` alias that follows a return item. `as` is a
+/// keyword only here, and only when followed by whitespace — `asThing` stays a
+/// plain identifier.
+fn as_alias(input: &mut &str) -> ModalResult<String> {
+    "as".parse_next(input)?;
+    if !input.chars().next().map_or(false, |c| c.is_whitespace()) {
+        return Err(winnow::error::ErrMode::Backtrack(
+            winnow::error::ContextError::new(),
+        ));
+    }
+    ws.parse_next(input)?;
+    let name = identifier.parse_next(input)?;
+    Ok(name.to_string())
+}
+
+/// Parse `return a, b, expr as name, ...;` or bare `return;`.
+///
+/// Each item is `expr [as name]`. A bare identifier self-names (`return foo`
+/// exports `foo`); anything computed needs an alias (`return r.id as id`) — a
+/// non-identifier without `as` is an error. The list desugars to an object
+/// literal `{ name: expr, ... }`, which the evaluator already splats into the
+/// file's exports. A single bare object literal (`return { ... };`) passes
+/// through unchanged — that's the escape hatch for nested return shapes.
 fn return_stmt(input: &mut &str) -> ModalResult<Statement> {
     "return".parse_next(input)?;
     // Must be followed by whitespace or ';' — otherwise this is a bare
@@ -108,10 +129,47 @@ fn return_stmt(input: &mut &str) -> ModalResult<Statement> {
         ';'.parse_next(input)?;
         return Ok(Statement::Return { value: None });
     }
-    let value = expr.parse_next(input)?;
-    ws.parse_next(input)?;
+
+    // Parse the comma-separated item list: `expr [as name]`.
+    let mut items: Vec<(Option<String>, Expr)> = Vec::new();
+    loop {
+        let e = expr.parse_next(input)?;
+        ws.parse_next(input)?;
+        let alias = opt(as_alias).parse_next(input)?;
+        items.push((alias, e));
+        ws.parse_next(input)?;
+        if input.starts_with(',') {
+            ','.parse_next(input)?;
+            ws.parse_next(input)?;
+        } else {
+            break;
+        }
+    }
     ';'.parse_next(input)?;
-    Ok(Statement::Return { value: Some(value) })
+
+    // A lone bare object literal returns as-is (nested shapes / escape hatch).
+    if items.len() == 1 && items[0].0.is_none() && matches!(items[0].1, Expr::JsonObject(_)) {
+        let (_, value) = items.pop().unwrap();
+        return Ok(Statement::Return { value: Some(value) });
+    }
+
+    // Otherwise build an object from the named items.
+    let mut pairs: Vec<(String, Expr)> = Vec::with_capacity(items.len());
+    for (alias, e) in items {
+        let name = match alias {
+            Some(n) => n,
+            None => match &e {
+                Expr::Identifier(n) => n.clone(),
+                _ => {
+                    return Err(winnow::error::ErrMode::Backtrack(
+                        winnow::error::ContextError::new(),
+                    ));
+                }
+            },
+        };
+        pairs.push((name, e));
+    }
+    Ok(Statement::Return { value: Some(Expr::JsonObject(pairs)) })
 }
 
 /// Shorthand for a backtracking parse error (lets `alt` try the next branch).

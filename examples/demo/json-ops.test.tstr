@@ -1,24 +1,26 @@
-// JSON object construction and field access
-user = {
-  name: "Doug",
-  role: "developer",
-  active: true
-};
+--> {
+  // JSON object construction and field access
+  user = {
+    name: "Doug",
+    role: "developer",
+    active: true
+  };
 
-user.name == "Doug" | "wrong name";
-user.role == "developer" | "wrong role";
-user.active == true | "should be active";
+  user.name == "Doug" | "wrong name";
+  user.role == "developer" | "wrong role";
+  user.active == true | "should be active";
 
-// Nested objects
-req = {};
-req.headers = { "content-type": "application/json" };
-req.body = { name: "New Group" };
+  // Nested objects
+  req = {};
+  req.headers = { "content-type": "application/json" };
+  req.body = { name: "New Group" };
 
-req.headers."content-type" == "application/json" | "bad content type";
-req.body.name == "New Group" | "bad body name";
+  req.headers."content-type" == "application/json" | "bad content type";
+  req.body.name == "New Group" | "bad body name";
 
-// Arrays
-items = [1, 2, 3, 4, 5];
-items.size == 5 | "expected 5 items";
-items[0] == 1 | "first item should be 1";
-items[-1] == 5 | "last item should be 5";
+  // Arrays
+  items = [1, 2, 3, 4, 5];
+  items.size == 5 | "expected 5 items";
+  items[0] == 1 | "first item should be 1";
+  items[-1] == 5 | "last item should be 5";
+}

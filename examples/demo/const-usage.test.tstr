@@ -1,5 +1,6 @@
-// Verify that const values are available in scope
-baseUrl, defaultHeaders -->
+baseUrl, defaultHeaders --> {
+  // Verify that const values are available in scope
 
-baseUrl == "http://localhost:8080" | "wrong base URL";
-defaultHeaders."content-type" == "application/json" | "wrong content type";
+  baseUrl == "http://localhost:8080" | "wrong base URL";
+  defaultHeaders."content-type" == "application/json" | "wrong content type";
+}

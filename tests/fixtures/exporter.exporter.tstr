@@ -1,3 +1,3 @@
-groupId, groupName -->
-
-<-- groupId, groupName
+groupId, groupName --> {
+  return groupId, groupName;
+}

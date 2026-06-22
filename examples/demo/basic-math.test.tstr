@@ -1,13 +1,15 @@
-// Basic expression evaluation tests (no HTTP needed)
-total = 10 * 5 + 3;
-total == 53 | "expected 53, got {{total}}";
+--> {
+  // Basic expression evaluation tests (no HTTP needed)
+  total = 10 * 5 + 3;
+  total == 53 | "expected 53, got {{total}}";
 
-half = total / 2;
-half == 26.5 | "expected 26.5";
+  half = total / 2;
+  half == 26.5 | "expected 26.5";
 
-remainder = total % 10;
-remainder == 3 | "expected remainder 3";
+  remainder = total % 10;
+  remainder == 3 | "expected remainder 3";
 
-name = "tstr";
-greeting = "Hello " + name + "!";
-greeting == "Hello tstr!" | "bad greeting: {{greeting}}";
+  name = "tstr";
+  greeting = "Hello " + name + "!";
+  greeting == "Hello tstr!" | "bad greeting: {{greeting}}";
+}

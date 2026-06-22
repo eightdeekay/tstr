@@ -2007,12 +2007,23 @@ mod tests {
 
     // --- Statement execution ---
 
+    /// Wrap a bare statement body in the mandatory function form so the strict
+    /// parser (header + braces) accepts test sources written as plain bodies.
+    fn wrap_body(source: &str) -> String {
+        // Body inline after `{` so the source keeps its original line numbers
+        // (line 1 stays line 1); closing brace on its own line so a trailing
+        // line comment in `source` can't swallow it.
+        format!("--> {{ {}\n}}", source)
+    }
+
     fn exec(source: &str) -> (Scope, Vec<AssertionFailure>) {
         exec_with_scope(source, Scope::new())
     }
 
     fn exec_with_scope(source: &str, initial_scope: Scope) -> (Scope, Vec<AssertionFailure>) {
-        let file = crate::parser::parse_file(source, "test.tstr").unwrap();
+        // These tests pass a bare statement body; wrap it in the mandatory
+        // function form so the strict parser accepts it.
+        let file = crate::parser::parse_file(&wrap_body(source), "test.tstr").unwrap();
         let mut scope = initial_scope;
         // Seed scope with file inputs (they'd normally come from upstream)
         let result = exec_file(&file, "test", &mut scope).unwrap();
@@ -2112,8 +2123,8 @@ mod tests {
 
     #[test]
     fn test_exec_exports() {
-        let source = "groupId = 123; groupName = \"Test\"; temp = 999; <-- groupId, groupName";
-        let file = crate::parser::parse_file(source, "test.tstr").unwrap();
+        let source = "groupId = 123; groupName = \"Test\"; temp = 999; return groupId, groupName;";
+        let file = crate::parser::parse_file(&wrap_body(source), "test.tstr").unwrap();
         let mut scope = Scope::new();
         let result = exec_file(&file, "test", &mut scope).unwrap();
 
@@ -2130,7 +2141,7 @@ mod tests {
         // so it is neither `skipped` nor `disabled` (unlike the old exitIf,
         // which marked the whole file skipped and cascaded to siblings).
         let source = "if false { false | \"unreached\"; }";
-        let file = crate::parser::parse_file(source, "test.tstr").unwrap();
+        let file = crate::parser::parse_file(&wrap_body(source), "test.tstr").unwrap();
         let mut scope = Scope::new();
         let result = exec_file(&file, "test", &mut scope).unwrap();
         assert!(!result.skipped);
@@ -2144,7 +2155,7 @@ mod tests {
         // assertion failure after it must not run, and the file must report as
         // disabled (a distinct flavor of skip) carrying the reason.
         let source = r#"disabled "I-123: fix postponed"; false | "this must not fire";"#;
-        let file = crate::parser::parse_file(source, "test.tstr").unwrap();
+        let file = crate::parser::parse_file(&wrap_body(source), "test.tstr").unwrap();
         let mut scope = Scope::new();
         let result = exec_file(&file, "test", &mut scope).unwrap();
         assert!(result.disabled);
@@ -2158,7 +2169,7 @@ mod tests {
         // Even if the marker isn't first, the file is off and the earlier
         // statement's HTTP/side effects never run.
         let source = r#"x = 1; disabled "off";"#;
-        let file = crate::parser::parse_file(source, "test.tstr").unwrap();
+        let file = crate::parser::parse_file(&wrap_body(source), "test.tstr").unwrap();
         let mut scope = Scope::new();
         let result = exec_file(&file, "test", &mut scope).unwrap();
         assert!(result.disabled);
@@ -2530,7 +2541,7 @@ mod tests {
     #[test]
     fn test_retry_rejects_return_in_body() {
         // Control-flow statements don't compose with re-execution.
-        let (_scope, failures) = exec("retry(max: 2, interval: 1ms) { return 5; }");
+        let (_scope, failures) = exec("retry(max: 2, interval: 1ms) { x = 1; return x; }");
         assert_eq!(failures.len(), 1);
         assert!(
             failures[0].message.contains("return is not allowed inside a retry block"),

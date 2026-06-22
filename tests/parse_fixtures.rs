@@ -25,7 +25,7 @@ fn const_file() {
     let file = parse_file(&load_fixture("const-values.const.tstr"), "const-values.const.tstr").unwrap();
     assert_eq!(file.file_type, FileType::Const);
     assert!(file.inputs.is_empty());
-    assert_eq!(file.body.len(), 3); // three assignments
+    assert_eq!(file.body.len(), 4); // three assignments + return
     assert_eq!(file.outputs, vec!["testSiteId", "testAccountId", "baseGroup"]);
 }
 
@@ -35,8 +35,8 @@ fn test_with_inputs_and_outputs() {
     assert_eq!(file.file_type, FileType::Test);
     assert_eq!(file.inputs, vec!["headers", "req"]);
     assert_eq!(file.outputs, vec!["groupId"]);
-    // body: headers assign, body assign, http call, 2 assertions, groupId assign = 6
-    assert_eq!(file.body.len(), 6);
+    // ...6 statements + return = 7
+    assert_eq!(file.body.len(), 7);
 }
 
 #[test]
@@ -53,7 +53,7 @@ fn exporter_file() {
     let file = parse_file(&load_fixture("exporter.exporter.tstr"), "exporter.exporter.tstr").unwrap();
     assert_eq!(file.file_type, FileType::Exporter);
     assert_eq!(file.inputs, vec!["groupId", "groupName"]);
-    assert!(file.body.is_empty());
+    assert_eq!(file.body.len(), 1); // just the return
     assert_eq!(file.outputs, vec!["groupId", "groupName"]);
 }
 
@@ -433,8 +433,8 @@ fn multi_service_parse() {
     assert_eq!(file.inputs, vec!["profile", "commerce", "req", "req2"]);
     assert_eq!(file.outputs, vec!["accountId", "orderId"]);
     // urlPrefix assign, body assign, http, accountId assign,
-    // urlPrefix assign, body assign, http, orderId assign = 8
-    assert_eq!(file.body.len(), 8);
+    // ...8 statements + return = 9
+    assert_eq!(file.body.len(), 9);
 }
 
 // ---------------------------------------------------------------------------

@@ -21,14 +21,6 @@ fn input_line(input: &mut &str) -> ModalResult<Vec<String>> {
     Ok(vars.unwrap_or_default())
 }
 
-/// Parse the output line: `<-- var1, var2`
-/// Returns the list of exported variable names.
-fn output_line(input: &mut &str) -> ModalResult<Vec<String>> {
-    "<--".parse_next(input)?;
-    ws.parse_next(input)?;
-    var_list.parse_next(input)
-}
-
 /// Determine the FileType from a filename's middle extension.
 /// `create-group.test.tstr` → Test, `values.const.tstr` → Const, `foo.tstr` → Test
 pub fn file_type_from_filename(filename: &str) -> FileType {
@@ -91,12 +83,19 @@ pub fn parse_file(source: &str, filename: &str) -> Result<File, String> {
     // Skip leading whitespace
     let _ = ws.parse_next(input);
 
-    // Try to parse input line (optional)
-    let inputs = match opt(input_line).parse_next(input) {
-        Ok(Some(vars)) => vars,
-        Ok(None) => Vec::new(),
-        Err(_) => return Err(format_parse_error_ctx(source, &stripped, *input, "expected input line (var1, var2 -->)")),
+    // Input header is mandatory under the function form: `a, b -->`, or a bare
+    // `-->` for a file that takes no inputs.
+    let inputs = match input_line.parse_next(input) {
+        Ok(vars) => vars,
+        Err(_) => return Err(format_parse_error_ctx(source, &stripped, *input, "expected input header ('a, b -->', or '-->' for none)")),
     };
+
+    // The body is a braced block: `--> { ... }`.
+    let _ = ws.parse_next(input);
+    if !input.starts_with('{') {
+        return Err(format_parse_error_ctx(source, &stripped, *input, "expected '{' to open the file body"));
+    }
+    *input = &input[1..];
 
     // Parse the body statements (with line tracking)
     let (body, line_map) = match statements_with_lines(input, &stripped) {
@@ -104,19 +103,26 @@ pub fn parse_file(source: &str, filename: &str) -> Result<File, String> {
         Err(_) => return Err(format_parse_error_ctx(source, &stripped, *input, "expected statement")),
     };
 
-    // Try to parse output line (optional)
     let _ = ws.parse_next(input);
-    let outputs = match opt(output_line).parse_next(input) {
-        Ok(Some(vars)) => vars,
-        Ok(None) => Vec::new(),
-        Err(_) => return Err(format_parse_error_ctx(source, &stripped, *input, "expected output line (<-- var1, var2)")),
-    };
+    if !input.starts_with('}') {
+        return Err(format_parse_error_ctx(source, &stripped, *input, "expected '}' to close the file body"));
+    }
+    *input = &input[1..];
 
     // Verify all input consumed
     let _ = ws.parse_next(input);
     if !input.is_empty() {
         return Err(format_parse_error_ctx(source, &stripped, *input, "unexpected content after end of file"));
     }
+
+    // Declared outputs = the names the file's `return` publishes. Derived from
+    // the last return so downstream skip/block messages can still name them
+    // (the old `<-- a, b` line is gone; `return a, b` carries this now).
+    let outputs: Vec<String> = body.iter().rev().find_map(|s| match s {
+        crate::ast::Statement::Return { value: Some(crate::ast::Expr::JsonObject(pairs)) } =>
+            Some(pairs.iter().map(|(k, _)| k.clone()).collect()),
+        _ => None,
+    }).unwrap_or_default();
 
     Ok(File {
         file_type,
@@ -145,13 +151,6 @@ mod tests {
         let mut input = "-->";
         let result = input_line(&mut input).unwrap();
         assert_eq!(result, Vec::<String>::new());
-    }
-
-    #[test]
-    fn test_output_line() {
-        let mut input = "<-- groupId, groupName";
-        let result = output_line(&mut input).unwrap();
-        assert_eq!(result, vec!["groupId", "groupName"]);
     }
 
     // --- file type detection ---
@@ -200,19 +199,19 @@ mod tests {
 
     #[test]
     fn test_parse_minimal_file() {
-        let source = r#"r = req.get("/v4/groups") ? 2xx | "Failed";"#;
+        let source = r#"--> { r = req.get("/v4/groups") ? 2xx | "Failed"; }"#;
         let file = parse_file(source, "list-groups.test.tstr").unwrap();
         assert_eq!(file.file_type, FileType::Test);
         assert_eq!(file.inputs, Vec::<String>::new());
         assert_eq!(file.body.len(), 1);
-        assert_eq!(file.outputs, Vec::<String>::new());
     }
 
     #[test]
     fn test_parse_file_with_inputs() {
         let source = r#"
-            groupId -->
+            groupId --> {
             r = req.get("/v4/groups") ? 2xx | "Failed";
+            }
         "#;
         let file = parse_file(source, "check-group.test.tstr").unwrap();
         assert_eq!(file.inputs, vec!["groupId"]);
@@ -220,84 +219,96 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_file_with_outputs() {
+    fn test_parse_file_with_return() {
         let source = r#"
+            --> {
             r = req.post("/v4/groups") ? 2xx | "Failed";
             groupId = r.id;
-            <-- groupId
+            return groupId;
+            }
         "#;
         let file = parse_file(source, "create-group.test.tstr").unwrap();
         assert_eq!(file.inputs, Vec::<String>::new());
-        assert_eq!(file.body.len(), 2);
-        assert_eq!(file.outputs, vec!["groupId"]);
+        // r = ..., groupId = ..., return groupId
+        assert_eq!(file.body.len(), 3);
     }
 
     #[test]
     fn test_parse_full_file() {
         let source = r#"
-            groupId, headers -->
-
+            groupId, headers --> {
             req.headers = headers;
             req.body = "test";
             r = req.post("/v4/groups") ? 2xx | "Failed";
             r.name != null | "missing name";
             memberId = r.id;
-
-            <-- memberId
+            return memberId;
+            }
         "#;
         let file = parse_file(source, "add-member.test.tstr").unwrap();
         assert_eq!(file.file_type, FileType::Test);
         assert_eq!(file.inputs, vec!["groupId", "headers"]);
-        assert_eq!(file.body.len(), 5);
-        assert_eq!(file.outputs, vec!["memberId"]);
+        // 5 body statements + the return
+        assert_eq!(file.body.len(), 6);
     }
 
     #[test]
     fn test_parse_const_file() {
         let source = r#"
+            --> {
             testSiteId = "00000000-0000-0000-0000-000000000001";
             testAccountId = "00000000-0000-0000-0000-000000000002";
-            <-- testSiteId, testAccountId
+            return testSiteId, testAccountId;
+            }
         "#;
         let file = parse_file(source, "shared-values.const.tstr").unwrap();
         assert_eq!(file.file_type, FileType::Const);
         assert_eq!(file.inputs, Vec::<String>::new());
-        assert_eq!(file.body.len(), 2);
-        assert_eq!(file.outputs, vec!["testSiteId", "testAccountId"]);
+        // 2 assignments + the return
+        assert_eq!(file.body.len(), 3);
     }
 
     #[test]
     fn test_parse_file_with_comments() {
         let source = r#"
+            --> {
             // This test creates a group
             r = req.post("/v4/groups") ? 2xx | "Failed";
             groupId = r.id; /* capture for downstream */
-            <-- groupId
+            return groupId;
+            }
         "#;
         let file = parse_file(source, "create-group.test.tstr").unwrap();
-        assert_eq!(file.body.len(), 2);
-        assert_eq!(file.outputs, vec!["groupId"]);
+        assert_eq!(file.body.len(), 3);
     }
 
     // --- error message tests ---
 
     #[test]
     fn test_parse_error_shows_line_number() {
-        let source = "r = req.get(\"/v4/groups\") ? 2xx | \"Failed\";\nthis is garbage";
+        let source = "--> {\nr = req.get(\"/v4/groups\") ? 2xx | \"Failed\";\nthis is garbage\n}";
         let err = parse_file(source, "bad.test.tstr").unwrap_err();
-        assert!(err.contains("line 2"), "should mention line 2, got: {}", err);
+        assert!(err.contains("line 3"), "should mention line 3, got: {}", err);
     }
 
     #[test]
     fn test_parse_error_shows_offending_line() {
-        let source = "r = req.get(\"/v4/groups\") ? 2xx | \"Failed\";\nthis is garbage";
+        let source = "--> {\nr = req.get(\"/v4/groups\") ? 2xx | \"Failed\";\nthis is garbage\n}";
         let err = parse_file(source, "bad.test.tstr").unwrap_err();
         assert!(err.contains("this is garbage"), "should show the bad line, got: {}", err);
     }
 
     #[test]
+    fn test_parse_error_missing_header() {
+        // No `-->` header is now a hard error.
+        let source = r#"r = req.get("/v4/groups") ? 2xx | "Failed";"#;
+        let err = parse_file(source, "bad.test.tstr").unwrap_err();
+        assert!(err.contains("input header"), "should demand a header, got: {}", err);
+    }
+
+    #[test]
     fn test_parse_error_trailing_content() {
-        let source = "x = 1; } extra";
+        let source = "--> { x = 1; } extra";
         let err = parse_file(source, "bad.test.tstr").unwrap_err();
         assert!(err.contains("line 1"), "should mention line 1, got: {}", err);
         assert!(err.contains("unexpected content"), "should say unexpected, got: {}", err);
@@ -305,7 +316,7 @@ mod tests {
 
     #[test]
     fn test_parse_error_with_comments_preserves_line() {
-        let source = "// comment\n// another comment\nbad syntax here";
+        let source = "// comment\n// another comment\n--> { bad syntax here }";
         let err = parse_file(source, "bad.test.tstr").unwrap_err();
         assert!(err.contains("line 3"), "should mention line 3, got: {}", err);
     }

@@ -484,7 +484,7 @@ mod tests {
 
     #[test]
     fn missing_inputs_flags_absent_and_null() {
-        let file = parse("orgId, token -->\nx = 1;");
+        let file = parse("orgId, token --> { x = 1; }");
         let mut ambient: HashMap<String, Value> = HashMap::new();
         ambient.insert("token".to_string(), Value::Null); // present but null counts as missing
         // orgId absent + token null → both reported
@@ -495,7 +495,7 @@ mod tests {
 
     #[test]
     fn missing_inputs_empty_when_available() {
-        let file = parse("orgId -->\nx = 1;");
+        let file = parse("orgId --> { x = 1; }");
         let mut ambient: HashMap<String, Value> = HashMap::new();
         ambient.insert("orgId".to_string(), Value::String("abc".to_string()));
         assert!(missing_inputs(&file, &ambient).is_empty());
@@ -505,7 +505,7 @@ mod tests {
     fn missing_inputs_empty_when_nothing_declared() {
         // A file with no input header can't be skipped by this check — the
         // upstream-failure backstop covers ambient-only dependents instead.
-        let file = parse("x = 1;");
+        let file = parse("--> { x = 1; }");
         assert!(missing_inputs(&file, &HashMap::new()).is_empty());
     }
 
@@ -519,7 +519,7 @@ mod tests {
 
     #[test]
     fn block_reason_failed_setup_names_its_outputs() {
-        let e = entry("00 Login", "x = 1;\n<-- orgId");
+        let e = entry("00 Login", "--> { x = 1; return orgId; }");
         let mut result = skipped_result(&e, "placeholder");
         result.failures = vec![crate::eval::AssertionFailure::new("boom")];
         assert_eq!(block_reason(&result, &e),
@@ -530,7 +530,7 @@ mod tests {
     fn block_reason_setup_without_outputs_is_generic() {
         // No declared outputs to name, and it was skipped/disabled rather than
         // failed → "did not run".
-        let e = entry("00 Login", "x = 1;");
+        let e = entry("00 Login", "--> { x = 1; }");
         let result = skipped_result(&e, "placeholder"); // skipped=true, failures empty
         assert_eq!(block_reason(&result, &e), "prior setup '00 Login' did not run");
     }
@@ -548,10 +548,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join("tstr.yaml"), "constants: {}\n").unwrap();
-        std::fs::write(root.join("01-make.test.tstr"), "value = 42;\n<-- value\n").unwrap();
+        std::fs::write(root.join("01-make.test.tstr"), "--> { value = 42; return value; }\n").unwrap();
         std::fs::write(
             root.join("02-use.test.tstr"),
-            "value -->\nvalue == 42 | \"chaining broken: value not seen\";\n",
+            "value --> { value == 42 | \"chaining broken: value not seen\"; }\n",
         )
         .unwrap();
 
@@ -585,8 +585,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join("tstr.yaml"), "constants: {}\n").unwrap();
-        std::fs::write(root.join("01-make.setup.tstr"), "1 == 2 | \"boom\";\n").unwrap();
-        std::fs::write(root.join("02-after.test.tstr"), "1 == 1 | \"unreachable\";\n").unwrap();
+        std::fs::write(root.join("01-make.setup.tstr"), "--> { 1 == 2 | \"boom\"; }\n").unwrap();
+        std::fs::write(root.join("02-after.test.tstr"), "--> { 1 == 1 | \"unreachable\"; }\n").unwrap();
 
         let suite = crate::discovery::discover(root).unwrap();
         let index = crate::scheduler::FileIndex::build(suite.clone(), root.to_path_buf());
@@ -614,11 +614,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join("tstr.yaml"), "constants: {}\n").unwrap();
-        std::fs::write(root.join("req.setup.tstr"), "token = \"abc\";\n<-- token\n").unwrap();
+        std::fs::write(root.join("req.setup.tstr"), "--> { token = \"abc\"; return token; }\n").unwrap();
         std::fs::create_dir(root.join("child")).unwrap();
         std::fs::write(
             root.join("child/01-use.test.tstr"),
-            "token == \"abc\" | \"missing\";\n",
+            "--> { token == \"abc\" | \"missing\"; }\n",
         )
         .unwrap();
 
@@ -637,7 +637,7 @@ mod tests {
         let mk = |fname: &str| TestEntry {
             path: std::path::PathBuf::from(fname),
             name: "f".to_string(),
-            file: crate::parser::parse_file("x = 1;", fname).unwrap(),
+            file: crate::parser::parse_file("--> { x = 1; }", fname).unwrap(),
         };
         let s = mk("a.setup.tstr");
         let c = mk("a.cleanup.tstr");

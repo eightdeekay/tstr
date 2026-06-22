@@ -1,29 +1,30 @@
-req -->
-r = req.get("/v4/groups") ? 2xx | "Failed";
+req --> {
+  r = req.get("/v4/groups") ? 2xx | "Failed";
 
-// Simple property access
-name = r.name;
+  // Simple property access
+  name = r.name;
 
-// Nested property
-city = r.user.address.city;
+  // Nested property
+  city = r.user.address.city;
 
-// Quoted property (hyphenated keys)
-contentType = r."content-type";
-headerVal = _response.headers."x-custom-header";
+  // Quoted property (hyphenated keys)
+  contentType = r."content-type";
+  headerVal = _response.headers."x-custom-header";
 
-// Optional chaining
-maybeName = r.user?.name;
-deepChain = r.user?.address?.city;
+  // Optional chaining
+  maybeName = r.user?.name;
+  deepChain = r.user?.address?.city;
 
-// Array indexing
-first = r.items[0];
-last = r.items[-1];
+  // Array indexing
+  first = r.items[0];
+  last = r.items[-1];
 
-// Slice
-firstThree = r.items[0:3];
+  // Slice
+  firstThree = r.items[0:3];
 
-// Collect
-allIds = r.items[].id;
+  // Collect
+  allIds = r.items[].id;
 
-// Chained index + property
-firstId = r.items[0].id;
+  // Chained index + property
+  firstId = r.items[0].id;
+}

@@ -1,19 +1,19 @@
-req -->
+req --> {
+  // Wildcard status
+  r1 = req.get("/v4/groups") ? 2xx | "Expected 2xx";
 
-// Wildcard status
-r1 = req.get("/v4/groups") ? 2xx | "Expected 2xx";
+  // Exact status
+  r2 = req.post("/v4/groups") ? 201 | "Expected 201";
 
-// Exact status
-r2 = req.post("/v4/groups") ? 201 | "Expected 201";
+  // Multiple exact
+  r3 = req.put("/v4/groups/123") ? 200 204 | "Expected 200 or 204";
 
-// Multiple exact
-r3 = req.put("/v4/groups/123") ? 200 204 | "Expected 200 or 204";
+  // Range
+  r4 = req.delete("/v4/groups/123") ? 200-204 | "Expected 200-204";
 
-// Range
-r4 = req.delete("/v4/groups/123") ? 200-204 | "Expected 200-204";
+  // Comparison
+  r5 = req.get("/v4/health") ? <400 | "Expected non-error";
 
-// Comparison
-r5 = req.get("/v4/health") ? <400 | "Expected non-error";
-
-// No status check
-r6 = req.get("/v4/optional");
+  // No status check
+  r6 = req.get("/v4/optional");
+}

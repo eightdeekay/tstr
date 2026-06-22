@@ -1,8 +1,10 @@
-// Load a JSON file and access its fields
-template = @examples/demo/fixtures/group.json;
-template.name == "Test Group" | "wrong template name";
-template.active == true | "should be active";
+--> {
+  // Load a JSON file and access its fields
+  template = @examples/demo/fixtures/group.json;
+  template.name == "Test Group" | "wrong template name";
+  template.active == true | "should be active";
 
-// Modify loaded data
-template.description = "Modified";
-template.description == "Modified" | "modification failed";
+  // Modify loaded data
+  template.description = "Modified";
+  template.description == "Modified" | "modification failed";
+}

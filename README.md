@@ -64,7 +64,7 @@ Putting a test in a non-leaf dir is a hard error at startup.
 
 **Two state-sharing mechanisms (picked deliberately):**
 
-- **Setup files: broadcast.** `return { ... }` merges into ambient scope for subsequent files.
+- **Setup files: broadcast.** `return a, b` (named bindings) merges into ambient scope for subsequent files.
 - **Library functions: request/response.** Called explicitly with site-local args; return value bound at the call site.
 
 Filename order matters. Use numeric prefixes (`01-`, `02-`, ...) when you want explicit ordering. Zero-pad to avoid lex-sort surprises (`02-` vs `10-`, not `2-` vs `10-`).
@@ -342,14 +342,16 @@ Libraries are `*.lib.tstr` files: callable functions with explicit parameters.
 
 ```
 # lib/createTag.lib.tstr
-name, type -->
-
-req.body = { name, type };
-r = req.post("/v4/tags") ? 2xx | "create-tag failed";
-return { id: r.id };
+name, type --> {
+  req.body = { name, type };
+  r = req.post("/v4/tags") ? 2xx | "create-tag failed";
+  return r.id as id;
+}
 ```
 
-The `name, type -->` header declares the parameters. `req` and any other ambient names come from the lib's **own** directory hierarchy (see Scope below).
+The `name, type -->` header declares the parameters and the `{ ... }` block is
+the body. `req` and any other ambient names come from the lib's **own**
+directory hierarchy (see Scope below).
 
 ### Calling a lib
 
@@ -611,9 +613,31 @@ Tracked here for visibility; none are blockers:
 - **Library call caching** — every call re-executes; opt-in memoization will land when the semantics are pinned down.
 - **`--reachable`** for `tstr list --type lib` — call-graph analysis to limit listed libs to those actually invoked.
 
-## Legacy Compat
+## File form
 
-The pre-0.3 syntax (`name -->` parameter declarations, `_in.X` / `_out.X` references, `<-- name` output declarations) still **parses** during the transition, so existing test files don't break overnight. The structural runner builds a synthetic `_in` object from ambient scope so legacy `_in.X` references continue to resolve. Migrate at your pace.
+Every file is a function: a mandatory input header, a braced body, and an
+optional `return`.
+
+```
+a, b --> {
+  ... statements ...
+  return x, r.id as id, payIntentId;
+}
+```
+
+- **Input header is required.** `a, b -->` declares the ambient values the file
+  consumes; a file that takes none still writes a bare `-->`.
+- **Body is braced.** `{ ... }` wraps the statements.
+- **`return` publishes named bindings.** A comma list of `expr [as name]`. A
+  bare identifier self-names (`return payIntentId`); anything computed needs an
+  alias (`return r.id as id` — `return r.id` alone is an error). For a
+  setup/test these names broadcast into ambient scope; for a lib they're the
+  returned object. A lone `return { ... };` returns the object as-is, for nested
+  shapes.
+
+> Note: the block-collect arrow inside lambdas (`map({ x --> ... <-- v; })`) is a
+> separate construct and is unchanged. The legacy `_in.X` object is still seeded
+> into scope for in-body reads.
 
 ## Tech Stack
 
