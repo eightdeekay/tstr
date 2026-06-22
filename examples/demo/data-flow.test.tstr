@@ -2,5 +2,5 @@
   // Produce values for downstream tests
   groupId = 12345;
   groupName = "Test Group";
-  return groupId, groupName;
+  export groupId, groupName;
 }

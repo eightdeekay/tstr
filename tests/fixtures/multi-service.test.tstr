@@ -9,5 +9,5 @@ profile, commerce, req, req2 --> {
   req2.body = { accountId: "{{accountId}}" };
   r2 = req2.post("/v3/orders") ? 201 | "Failed to create order";
   orderId = r2.id;
-  return accountId, orderId;
+  export accountId, orderId;
 }

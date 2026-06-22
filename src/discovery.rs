@@ -318,14 +318,14 @@ mod tests {
         // Root const
         fs::write(
             root.join("shared-values.const.tstr"),
-            "--> { baseUrl = \"http://localhost:8080\"; return baseUrl; }\n",
+            "--> { baseUrl = \"http://localhost:8080\"; export baseUrl; }\n",
         ).unwrap();
 
         // crud/ subdirectory (leaf)
         fs::create_dir(root.join("crud")).unwrap();
         fs::write(
             root.join("crud/create-group.test.tstr"),
-            "req --> { r = req.post(\"http://localhost/v4/groups\") ? 2xx | \"Failed\"; groupId = r.id; return groupId; }\n",
+            "req --> { r = req.post(\"http://localhost/v4/groups\") ? 2xx | \"Failed\"; groupId = r.id; export groupId; }\n",
         ).unwrap();
         fs::write(
             root.join("crud/delete-group.test.tstr"),

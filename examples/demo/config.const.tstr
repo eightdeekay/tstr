@@ -5,5 +5,5 @@
     "content-type": "application/json",
     "accept": "application/json"
   };
-  return baseUrl, defaultHeaders;
+  export baseUrl, defaultHeaders;
 }

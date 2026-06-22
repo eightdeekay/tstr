@@ -127,13 +127,16 @@ pub enum Statement {
         /// assertion's line rather than the `retry` statement's.
         body_lines: Vec<usize>,
     },
-    /// `return { key: value, ... };` or bare `return;` — universal output
-    /// mechanism under the structural execution model.
-    /// - In a setup.tstr: returned object merges into ambient scope for
-    ///   subsequent files in scope.
-    /// - In a lib.tstr: returned object is bound at the call site.
-    /// - In a const.tstr: returned values enter the constants namespace.
-    /// - In a test.tstr: ignored (tests assert; they don't publish).
+    /// `export a, b, expr as name, ...;` — publish named bindings into the
+    /// file's exports (ambient broadcast for setup/test/const). Non-terminating;
+    /// may appear multiple times, each merging more bindings. The parser
+    /// desugars the item list to a `JsonObject` whose keys are the export names.
+    Export {
+        value: Expr,
+    },
+    /// `return expr;` or bare `return;` — a single value that terminates
+    /// execution: a lib call's result, a lambda block's yield, or an early exit.
+    /// Publishing to ambient scope is `export`, not `return`.
     Return {
         value: Option<Expr>,
     },

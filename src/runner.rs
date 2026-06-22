@@ -519,7 +519,7 @@ mod tests {
 
     #[test]
     fn block_reason_failed_setup_names_its_outputs() {
-        let e = entry("00 Login", "--> { x = 1; return orgId; }");
+        let e = entry("00 Login", "--> { x = 1; export orgId; }");
         let mut result = skipped_result(&e, "placeholder");
         result.failures = vec![crate::eval::AssertionFailure::new("boom")];
         assert_eq!(block_reason(&result, &e),
@@ -548,7 +548,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join("tstr.yaml"), "constants: {}\n").unwrap();
-        std::fs::write(root.join("01-make.test.tstr"), "--> { value = 42; return value; }\n").unwrap();
+        std::fs::write(root.join("01-make.test.tstr"), "--> { value = 42; export value; }\n").unwrap();
         std::fs::write(
             root.join("02-use.test.tstr"),
             "value --> { value == 42 | \"chaining broken: value not seen\"; }\n",
@@ -614,7 +614,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join("tstr.yaml"), "constants: {}\n").unwrap();
-        std::fs::write(root.join("req.setup.tstr"), "--> { token = \"abc\"; return token; }\n").unwrap();
+        std::fs::write(root.join("req.setup.tstr"), "--> { token = \"abc\"; export token; }\n").unwrap();
         std::fs::create_dir(root.join("child")).unwrap();
         std::fs::write(
             root.join("child/01-use.test.tstr"),

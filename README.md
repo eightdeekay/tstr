@@ -64,7 +64,7 @@ Putting a test in a non-leaf dir is a hard error at startup.
 
 **Two state-sharing mechanisms (picked deliberately):**
 
-- **Setup files: broadcast.** `return a, b` (named bindings) merges into ambient scope for subsequent files.
+- **Setup files: broadcast.** `export a, b` (named bindings) merges into ambient scope for subsequent files.
 - **Library functions: request/response.** Called explicitly with site-local args; return value bound at the call site.
 
 Filename order matters. Use numeric prefixes (`01-`, `02-`, ...) when you want explicit ordering. Zero-pad to avoid lex-sort surprises (`02-` vs `10-`, not `2-` vs `10-`).
@@ -131,7 +131,7 @@ constants:
 Three categories of named values:
 
 - **`${name}` — constants, bare-expression form.** Sourced from yaml `constants:` (and, future: `.const.tstr` returns). Immutable. Dotted access works: `${orgService.baseUrl}`. Use it where an expression is expected — assignments, arguments, JSON values. **`${name}` is NOT interpolated inside string literals** (a `${...}` sequence inside `"..."` is passed through verbatim, since `$`-templating commonly appears in API payloads). To put a constant inside a string, use `{{name}}`.
-- **`name` (bare) — ambient scope variables.** Published by `setup.tstr` `return` blocks. Scope-bound to the publishing file's directory, cascading to children.
+- **`name` (bare) — ambient scope variables.** Published by `setup.tstr` `export` statements. Scope-bound to the publishing file's directory, cascading to children.
 - **`{{name}}` — string interpolation.** The in-string form. Resolves a name against **ambient scope first, then the constants namespace**, so it works for both. Dotted access works: `{{orgService.baseUrl}}`.
 
 ```
@@ -147,19 +147,28 @@ Rule of thumb: **inside a string literal, always use `{{name}}`** (resolves ambi
 
 Files are sequences of statements. Semicolons terminate every statement. `//` line comments, `/* */` block comments. Whitespace is cosmetic.
 
+### `export`
+
+The output mechanism. Publishes named bindings — a comma list of
+`expr [as name]` (bare identifier self-names; computed needs `as`):
+
+```
+export r.id as tagId, r.name as tagName;
+export tagId;                              // self-named
+export { meta: r } as detail;             // object value, for nested shapes
+```
+
+- In **setup**: merges into ambient scope for subsequent files.
+- In **lib**: the exported object is bound at the call site as the lib's value.
+- In **const**: exported values become constants (full integration TODO — for
+  now they flow into ambient scope like setup).
+- In **test**: tests assert; exporting is allowed but usually pointless.
+
 ### `return`
 
-The universal output mechanism. Captures the file's published values:
-
-```
-return { tagId: r.id, tagName: r.name };
-return;                                    // bare return ends execution, exports nothing
-```
-
-- In **setup**: merges into ambient scope.
-- In **lib**: bound at the call site as the lib's return value.
-- In **test**: tests assert; `return` is unused but tolerated.
-- In **const**: returned values become constants (full integration TODO — for now, returns flow into ambient scope like setup).
+Control flow, not output. At a file's top level `return;` is **void** — it just
+halts execution; `return <value>` there is an error. A *value* `return` belongs
+inside a lambda, where it's the block's yield (`{ x --> ...; return v; }`).
 
 ### Assignment
 
@@ -345,7 +354,7 @@ Libraries are `*.lib.tstr` files: callable functions with explicit parameters.
 name, type --> {
   req.body = { name, type };
   r = req.post("/v4/tags") ? 2xx | "create-tag failed";
-  return r.id as id;
+  export r.id as id;
 }
 ```
 
@@ -410,32 +419,40 @@ r.status == "ok" | "unhealthy: {{r.status}}";
 
 ```
 # tests/tag-crud/01-create.setup.tstr
-req = { urlPrefix: ${orgService.baseUrl} };
-req.body = { name: "test-tag", type: "label" };
-r = req.post("/v4/tags") ? 2xx | "create failed";
-return { req, tagId: r.id };
+--> {
+  req = { urlPrefix: ${orgService.baseUrl} };
+  req.body = { name: "test-tag", type: "label" };
+  r = req.post("/v4/tags") ? 2xx | "create failed";
+  export req, r.id as tagId;
+}
 
 # tests/tag-crud/02-replace.test.tstr
-req.body = { name: "test-tag-replaced" };
-req.put("/v4/tags/{{tagId}}") ? 2xx | "replace failed";
+req, tagId --> {
+  req.body = { name: "test-tag-replaced" };
+  req.put("/v4/tags/{{tagId}}") ? 2xx | "replace failed";
+}
 
 # tests/tag-crud/03-add-item.test.tstr
-req.body = { itemId: "abc-123" };
-req.post("/v4/tags/{{tagId}}/items") ? 2xx | "add-item failed";
+req, tagId --> {
+  req.body = { itemId: "abc-123" };
+  req.post("/v4/tags/{{tagId}}/items") ? 2xx | "add-item failed";
+}
 
 # tests/tag-crud/04-cleanup.cleanup.tstr
-req.delete("/v4/tags/{{tagId}}") ? 204 | "cleanup failed";
+req, tagId --> {
+  req.delete("/v4/tags/{{tagId}}") ? 204 | "cleanup failed";
+}
 ```
 
-No fake gate variables. Order is the filename order. Setup's `return` broadcasts `req` and `tagId` to every subsequent file in the dir.
+No fake gate variables. Order is the filename order. Setup's `export` broadcasts `req` and `tagId` to every subsequent file in the dir.
 
 ### Per-service libs
 
 ```
 lib/
   orgService/
-    setup.tstr                   # return { req: { urlPrefix: ${orgService.baseUrl}, ... } };
-    createOrg.lib.tstr           # name --> ...uses req from sibling setup... return { id: r.id };
+    setup.tstr                   # --> { ...; export req; }
+    createOrg.lib.tstr           # name --> ...uses req from sibling setup... export r.id as id;
   tagService/
     setup.tstr                   # different req
     createTag.lib.tstr
@@ -615,25 +632,28 @@ Tracked here for visibility; none are blockers:
 
 ## File form
 
-Every file is a function: a mandatory input header, a braced body, and an
-optional `return`.
+Every file is a function: a mandatory input header, a braced body, and
+`export` for whatever it publishes.
 
 ```
 a, b --> {
   ... statements ...
-  return x, r.id as id, payIntentId;
+  export x, r.id as id, payIntentId;
 }
 ```
 
 - **Input header is required.** `a, b -->` declares the ambient values the file
   consumes; a file that takes none still writes a bare `-->`.
 - **Body is braced.** `{ ... }` wraps the statements.
-- **`return` publishes named bindings.** A comma list of `expr [as name]`. A
-  bare identifier self-names (`return payIntentId`); anything computed needs an
-  alias (`return r.id as id` — `return r.id` alone is an error). For a
+- **`export` publishes named bindings.** A comma list of `expr [as name]`. A
+  bare identifier self-names (`export payIntentId`); anything computed needs an
+  alias (`export r.id as id` — `export r.id` alone is an error). For a
   setup/test these names broadcast into ambient scope; for a lib they're the
-  returned object. A lone `return { ... };` returns the object as-is, for nested
-  shapes.
+  returned object. A lone `export { ... };` publishes the object's fields, for
+  nested shapes. `export` doesn't halt and may appear more than once.
+- **`return` is control flow, not output.** At a file's top level `return;` is
+  void — it just halts execution; `return <value>` there is an error (use
+  `export`). A *value* `return` belongs inside a lambda (the block's yield).
 
 > Note: the block-collect arrow inside lambdas (`map({ x --> ... <-- v; })`) is a
 > separate construct and is unchanged. The legacy `_in.X` object is still seeded

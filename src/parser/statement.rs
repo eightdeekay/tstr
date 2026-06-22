@@ -90,45 +90,35 @@ fn disabled_stmt(input: &mut &str) -> ModalResult<Statement> {
     Ok(Statement::Disabled { reason })
 }
 
-/// Parse the optional `as <name>` alias that follows a return item. `as` is a
+/// Parse the optional `as <name>` alias that follows an export item. `as` is a
 /// keyword only here, and only when followed by whitespace — `asThing` stays a
 /// plain identifier.
 fn as_alias(input: &mut &str) -> ModalResult<String> {
     "as".parse_next(input)?;
     if !input.chars().next().map_or(false, |c| c.is_whitespace()) {
-        return Err(winnow::error::ErrMode::Backtrack(
-            winnow::error::ContextError::new(),
-        ));
+        return Err(backtrack());
     }
     ws.parse_next(input)?;
     let name = identifier.parse_next(input)?;
     Ok(name.to_string())
 }
 
-/// Parse `return a, b, expr as name, ...;` or bare `return;`.
+/// Parse `export a, b, expr as name, ...;` — publish named bindings into the
+/// file's exports (ambient broadcast). Non-terminating; may appear repeatedly.
 ///
-/// Each item is `expr [as name]`. A bare identifier self-names (`return foo`
-/// exports `foo`); anything computed needs an alias (`return r.id as id`) — a
+/// Each item is `expr [as name]`. A bare identifier self-names (`export foo`
+/// publishes `foo`); anything computed needs an alias (`export r.id as id`) — a
 /// non-identifier without `as` is an error. The list desugars to an object
-/// literal `{ name: expr, ... }`, which the evaluator already splats into the
-/// file's exports. A single bare object literal (`return { ... };`) passes
-/// through unchanged — that's the escape hatch for nested return shapes.
-fn return_stmt(input: &mut &str) -> ModalResult<Statement> {
-    "return".parse_next(input)?;
-    // Must be followed by whitespace or ';' — otherwise this is a bare
-    // identifier starting with "return..." (e.g., `returnValue = ...`).
-    let next = input.chars().next().unwrap_or(';');
-    if next != ';' && !next.is_whitespace() {
-        return Err(winnow::error::ErrMode::Backtrack(
-            winnow::error::ContextError::new(),
-        ));
+/// literal `{ name: expr, ... }`, which the evaluator merges into the exports.
+/// A lone bare object literal (`export { ... };`) merges as-is (nested shapes).
+fn export_stmt(input: &mut &str) -> ModalResult<Statement> {
+    "export".parse_next(input)?;
+    // Must be followed by whitespace — otherwise this is a bare identifier
+    // starting with "export..." (e.g., `exportCount = ...`).
+    if !input.chars().next().map_or(false, |c| c.is_whitespace()) {
+        return Err(backtrack());
     }
     ws.parse_next(input)?;
-    // Bare `return;` -> Return { value: None }
-    if input.starts_with(';') {
-        ';'.parse_next(input)?;
-        return Ok(Statement::Return { value: None });
-    }
 
     // Parse the comma-separated item list: `expr [as name]`.
     let mut items: Vec<(Option<String>, Expr)> = Vec::new();
@@ -147,10 +137,10 @@ fn return_stmt(input: &mut &str) -> ModalResult<Statement> {
     }
     ';'.parse_next(input)?;
 
-    // A lone bare object literal returns as-is (nested shapes / escape hatch).
+    // A lone bare object literal exports its fields as-is (nested shapes).
     if items.len() == 1 && items[0].0.is_none() && matches!(items[0].1, Expr::JsonObject(_)) {
         let (_, value) = items.pop().unwrap();
-        return Ok(Statement::Return { value: Some(value) });
+        return Ok(Statement::Export { value });
     }
 
     // Otherwise build an object from the named items.
@@ -160,16 +150,34 @@ fn return_stmt(input: &mut &str) -> ModalResult<Statement> {
             Some(n) => n,
             None => match &e {
                 Expr::Identifier(n) => n.clone(),
-                _ => {
-                    return Err(winnow::error::ErrMode::Backtrack(
-                        winnow::error::ContextError::new(),
-                    ));
-                }
+                _ => return Err(backtrack()),
             },
         };
         pairs.push((name, e));
     }
-    Ok(Statement::Return { value: Some(Expr::JsonObject(pairs)) })
+    Ok(Statement::Export { value: Expr::JsonObject(pairs) })
+}
+
+/// Parse `return expr;` or bare `return;`. A single value that terminates
+/// execution — the lib call's result, a lambda block's yield, or an early
+/// exit. (Publishing to ambient scope is `export`, not `return`.)
+fn return_stmt(input: &mut &str) -> ModalResult<Statement> {
+    "return".parse_next(input)?;
+    // Must be followed by whitespace or ';' — otherwise this is a bare
+    // identifier starting with "return..." (e.g., `returnValue = ...`).
+    let next = input.chars().next().unwrap_or(';');
+    if next != ';' && !next.is_whitespace() {
+        return Err(backtrack());
+    }
+    ws.parse_next(input)?;
+    if input.starts_with(';') {
+        ';'.parse_next(input)?;
+        return Ok(Statement::Return { value: None });
+    }
+    let value = expr.parse_next(input)?;
+    ws.parse_next(input)?;
+    ';'.parse_next(input)?;
+    Ok(Statement::Return { value: Some(value) })
 }
 
 /// Shorthand for a backtracking parse error (lets `alt` try the next branch).
@@ -524,6 +532,7 @@ fn statement_inner(input: &mut &str, source: &str) -> ModalResult<Statement> {
         |i: &mut &str| if_stmt(i, source),
         |i: &mut &str| retry_stmt(i, source),
         disabled_stmt,
+        export_stmt,
         return_stmt,
         js_block_stmt,
         matrix_stmt,

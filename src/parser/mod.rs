@@ -115,14 +115,21 @@ pub fn parse_file(source: &str, filename: &str) -> Result<File, String> {
         return Err(format_parse_error_ctx(source, &stripped, *input, "unexpected content after end of file"));
     }
 
-    // Declared outputs = the names the file's `return` publishes. Derived from
-    // the last return so downstream skip/block messages can still name them
-    // (the old `<-- a, b` line is gone; `return a, b` carries this now).
-    let outputs: Vec<String> = body.iter().rev().find_map(|s| match s {
-        crate::ast::Statement::Return { value: Some(crate::ast::Expr::JsonObject(pairs)) } =>
-            Some(pairs.iter().map(|(k, _)| k.clone()).collect()),
+    // A top-level `return` is void — it only halts. Publishing is `export`.
+    // (Lambda yields live inside block expressions, not file.body, so they're
+    // unaffected.)
+    if body.iter().any(|s| matches!(s, crate::ast::Statement::Return { value: Some(_) })) {
+        return Err(format_parse_error_ctx(source, &stripped, *input,
+            "a top-level `return` takes no value — use `export` to publish, or `return;` to halt"));
+    }
+
+    // Declared outputs = the names the file's `export` statements publish.
+    // Downstream skip/block messages name these.
+    let outputs: Vec<String> = body.iter().filter_map(|s| match s {
+        crate::ast::Statement::Export { value: crate::ast::Expr::JsonObject(pairs) } =>
+            Some(pairs.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>()),
         _ => None,
-    }).unwrap_or_default();
+    }).flatten().collect();
 
     Ok(File {
         file_type,
@@ -224,7 +231,7 @@ mod tests {
             --> {
             r = req.post("/v4/groups") ? 2xx | "Failed";
             groupId = r.id;
-            return groupId;
+            export groupId;
             }
         "#;
         let file = parse_file(source, "create-group.test.tstr").unwrap();
@@ -242,7 +249,7 @@ mod tests {
             r = req.post("/v4/groups") ? 2xx | "Failed";
             r.name != null | "missing name";
             memberId = r.id;
-            return memberId;
+            export memberId;
             }
         "#;
         let file = parse_file(source, "add-member.test.tstr").unwrap();
@@ -258,7 +265,7 @@ mod tests {
             --> {
             testSiteId = "00000000-0000-0000-0000-000000000001";
             testAccountId = "00000000-0000-0000-0000-000000000002";
-            return testSiteId, testAccountId;
+            export testSiteId, testAccountId;
             }
         "#;
         let file = parse_file(source, "shared-values.const.tstr").unwrap();
@@ -275,7 +282,7 @@ mod tests {
             // This test creates a group
             r = req.post("/v4/groups") ? 2xx | "Failed";
             groupId = r.id; /* capture for downstream */
-            return groupId;
+            export groupId;
             }
         "#;
         let file = parse_file(source, "create-group.test.tstr").unwrap();

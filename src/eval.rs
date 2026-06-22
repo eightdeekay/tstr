@@ -667,15 +667,16 @@ fn invoke_lib(
     for (param, val) in params.iter().zip(args.into_iter()) {
         lib_scope.set(param.clone(), val);
     }
-    // Initialize _out for legacy output capture.
+    // `_out` accumulates the lib's `export` bindings — that object is the lib's
+    // value at the call site.
     lib_scope.set("_out".to_string(), Value::Object(HashMap::new()));
 
-    // Execute statements. A `return` halts execution and is the lib's value.
-    // Falls back to legacy _out / <-- harvesting if no `return` fires.
+    // Execute statements. A top-level `return;` is void — it just halts; the
+    // lib's value is its exports (collected below).
     for stmt in &lib.body {
         match exec_statement(stmt, &mut lib_scope)? {
             StmtResult::Ok => {}
-            StmtResult::Return(v) => return Ok(v),
+            StmtResult::Return(_) => break,
             StmtResult::AssertionFailed(f) => {
                 return Err(EvalError::new(format!("in lib '{}': {}", name, f.message)));
             }
@@ -687,7 +688,7 @@ fn invoke_lib(
         }
     }
 
-    // Legacy fallback: collect outputs from _out, narrow to declared outputs.
+    // The lib's value is its exports, narrowed to declared outputs if any.
     let out_obj = lib_scope.get("_out");
     if lib.outputs.is_empty() {
         Ok(out_obj)
@@ -1358,6 +1359,24 @@ pub fn exec_statement(stmt: &Statement, scope: &mut Scope) -> Result<StmtResult,
             }))
         }
 
+        Statement::Export { value } => {
+            // Merge the desugared bindings into `_out`, the export accumulator
+            // exec_file/invoke_lib harvest. Non-terminating, so repeated
+            // `export`s accumulate.
+            let exported = eval_expr(value, scope)?;
+            if let Value::Object(map) = exported {
+                let mut out = match scope.get("_out") {
+                    Value::Object(m) => m,
+                    _ => HashMap::new(),
+                };
+                for (k, v) in map {
+                    out.insert(k, v);
+                }
+                scope.set("_out".to_string(), Value::Object(out));
+            }
+            Ok(StmtResult::Ok)
+        }
+
         Statement::Return { value } => {
             let val = match value {
                 Some(expr) => eval_expr(expr, scope)?,
@@ -1590,18 +1609,15 @@ pub fn exec_file(
         });
     }
 
-    // Capture an explicit `return` if the file uses one (structural form).
-    // Falls back to legacy _out + <-- harvesting below if no return fires.
-    let mut returned: Option<Value> = None;
-
     for (i, stmt) in file.body.iter().enumerate() {
         match exec_statement(stmt, scope) {
             Ok(StmtResult::Ok) => {}
             Ok(StmtResult::MatrixDef(def)) => {
                 matrices.push(def);
             }
-            Ok(StmtResult::Return(v)) => {
-                returned = Some(v);
+            Ok(StmtResult::Return(_)) => {
+                // A top-level `return;` is void — it only halts execution.
+                // Publishing is `export` (harvested from `_out` below).
                 break;
             }
             Ok(StmtResult::AssertionFailed(mut f)) => {
@@ -1628,23 +1644,11 @@ pub fn exec_file(
         }
     }
 
-    // Collect exports: prefer an explicit `return { ... }` if one fired,
-    // otherwise harvest _out + legacy <-- declarations.
+    // Exports come from `export` statements, accumulated in `_out`.
     let mut exports = HashMap::new();
-    if let Some(Value::Object(map)) = returned {
-        for (k, v) in map {
+    if let Value::Object(out_map) = scope.get("_out") {
+        for (k, v) in out_map {
             exports.insert(k, v);
-        }
-    } else {
-        if let Value::Object(out_map) = scope.get("_out") {
-            for (k, v) in out_map {
-                exports.insert(k, v);
-            }
-        }
-        for var_name in &file.outputs {
-            if !exports.contains_key(var_name) {
-                exports.insert(var_name.clone(), scope.get(var_name));
-            }
         }
     }
 
@@ -2123,7 +2127,7 @@ mod tests {
 
     #[test]
     fn test_exec_exports() {
-        let source = "groupId = 123; groupName = \"Test\"; temp = 999; return groupId, groupName;";
+        let source = "groupId = 123; groupName = \"Test\"; temp = 999; export groupId, groupName;";
         let file = crate::parser::parse_file(&wrap_body(source), "test.tstr").unwrap();
         let mut scope = Scope::new();
         let result = exec_file(&file, "test", &mut scope).unwrap();

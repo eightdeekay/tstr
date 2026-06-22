@@ -12,5 +12,5 @@ headers, req --> {
   r.id != null | "missing group id";
   r.name == "Test Group" | "wrong name";
   groupId = r.id;
-  return groupId;
+  export groupId;
 }
