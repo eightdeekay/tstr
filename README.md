@@ -62,6 +62,15 @@ cascade down into the leaves. This makes "test group = leaf directory" an
 invariant (one slot per group, each leaf's tests sequential, leaves parallel).
 Putting a test in a non-leaf dir is a hard error at startup.
 
+**`setup`/`cleanup` in a leaf directory run as regular tests.** A leaf has
+nothing below it to scaffold, so a `.setup`/`.cleanup` there carries no special
+meaning: it's folded into the normal lex-ordered test sequence, counted as a
+test, with **no fail-fast cascade** (a failed leaf setup no longer skips the
+rest of the leaf). tstr warns when it does this. Scaffolding semantics —
+cascade-blocking, and being hidden from the slot display / summary table — apply
+only to `setup`/`cleanup` in **non-leaf** directories. To keep the old
+cascade-blocking behavior, move that scaffolding up to a non-leaf parent.
+
 **Two state-sharing mechanisms (picked deliberately):**
 
 - **Setup files: broadcast.** `export a, b` (named bindings) merges into ambient scope for subsequent files.

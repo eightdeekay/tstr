@@ -8,6 +8,14 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.4.1"></a>
+## [0.4.1] — 2026-06-22
+
+### Documentation
+- README now documents leaf `setup`/`cleanup` behavior (they run as regular
+  tests with no fail-fast cascade) and the non-leaf scaffolding display
+  exclusion — previously only in CHANGELOG/UPGRADING.
+
 <a id="v0.4.0"></a>
 ## [0.4.0] — 2026-06-22
 
