@@ -8,6 +8,19 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.4.3"></a>
+## [0.4.3] — 2026-06-23
+
+### Fixed
+- **Leaf-scoped runs now load libs from ancestor `lib/` subtrees.** Targeting a
+  single leaf (e.g. `tstr run commerce/payment`) pruned any sibling `lib/`
+  directory hanging off an ancestor before it was scanned, so a `createCharge`
+  call that resolved fine under `tstr run commerce` errored with "unknown lib"
+  under the leaf run. Discovery now keeps `lib/` subtrees along the target's
+  ancestor chain (harvesting only their `.lib.tstr` files), matching what the
+  lib resolution rule already promised. Sibling-*branch* libs (not on the
+  ancestor chain) stay correctly excluded.
+
 <a id="v0.4.2"></a>
 ## [0.4.2] — 2026-06-22
 

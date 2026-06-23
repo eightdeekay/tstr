@@ -125,7 +125,7 @@ fn dir_has_tstr_files(dir: &Path) -> bool {
 /// Returns a Suite representing the root directory, or errors if any files fail to parse.
 pub fn discover(root: &Path) -> Result<Suite, Vec<String>> {
     let mut errors = Vec::new();
-    let suite = discover_dir(root, &mut errors, None);
+    let suite = discover_dir(root, &mut errors, None, false);
 
     if errors.is_empty() {
         Ok(suite)
@@ -141,13 +141,13 @@ pub fn discover(root: &Path) -> Result<Suite, Vec<String>> {
 /// (needed for scope). Sibling directories outside the target are skipped.
 pub fn discover_lenient(root: &Path) -> (Suite, Vec<String>) {
     let mut errors = Vec::new();
-    let suite = discover_dir(root, &mut errors, None);
+    let suite = discover_dir(root, &mut errors, None, false);
     (suite, errors)
 }
 
 pub fn discover_lenient_scoped(root: &Path, target: Option<&Path>) -> (Suite, Vec<String>) {
     let mut errors = Vec::new();
-    let suite = discover_dir(root, &mut errors, target);
+    let suite = discover_dir(root, &mut errors, target, false);
     (suite, errors)
 }
 
@@ -202,7 +202,11 @@ fn collect_leaf_scaffolding(suite: &Suite, root: &Path, out: &mut Vec<String>) {
     }
 }
 
-fn discover_dir(dir: &Path, errors: &mut Vec<String>, target: Option<&Path>) -> Suite {
+/// `lib_only`: this dir is inside a `lib/` subtree that hangs off the target's
+/// ancestor chain. Such a subtree isn't *dominated* by the target, but its libs
+/// still resolve into the target's scope (see `FileIndex::visible_libs`), so we
+/// traverse it and keep only its `.lib.tstr` files.
+fn discover_dir(dir: &Path, errors: &mut Vec<String>, target: Option<&Path>, lib_only: bool) -> Suite {
     let mut entries = HashMap::new();
     let mut children = HashMap::new();
 
@@ -241,37 +245,62 @@ fn discover_dir(dir: &Path, errors: &mut Vec<String>, target: Option<&Path>) -> 
         let path = entry.path();
 
         if path.is_dir() {
-            // Skip directories that are completely outside the target scope
-            if let Some(t) = target {
-                let dominated = t.starts_with(&path) || path.starts_with(t);
-                if !dominated {
-                    continue;
-                }
-            }
             let dir_name = path.file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("")
                 .to_string();
-            let child_suite = discover_dir(&path, errors, target);
+
+            // Decide whether to descend, and in what mode.
+            let child_lib_only = if lib_only {
+                // Already inside an ancestor lib/ subtree — keep descending
+                // (libs can nest into organizational subdirs), still lib-only.
+                true
+            } else if let Some(t) = target {
+                let dominated = t.starts_with(&path) || path.starts_with(t);
+                if dominated {
+                    false
+                } else if (in_scope || is_ancestor) && dir_name == "lib" {
+                    // A `lib/` directory hanging off the target's own dir or an
+                    // ancestor. Not dominated by the target, but its libs are
+                    // visible to the target per the resolution rule, so descend
+                    // and harvest only the lib files.
+                    true
+                } else {
+                    // Truly outside the target scope — skip.
+                    continue;
+                }
+            } else {
+                false
+            };
+
+            let child_suite = discover_dir(&path, errors, target, child_lib_only);
             children.insert(dir_name, child_suite);
         } else if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
             if filename.ends_with(".tstr") {
-                // In ancestor dirs, keep everything that contributes to the
-                // target's scope — const + setup (ambient cascade) and lib
-                // (call resolution) — but skip the ancestor's own runnable
-                // tests/cleanups. The runner cascades these into the target's
-                // scope without executing ancestor tests.
-                if is_ancestor {
-                    let contributes_scope = filename.contains(".const.")
-                        || filename.contains(".setup.")
-                        || filename.contains(".lib.");
-                    if !contributes_scope {
+                // Inside an ancestor `lib/` subtree: only the lib files
+                // contribute to the target's scope; ignore anything else.
+                if lib_only {
+                    if !filename.contains(".lib.") {
                         continue;
                     }
-                }
-                // Outside target entirely — skip (shouldn't normally reach here)
-                if !in_scope && !is_ancestor {
-                    continue;
+                } else {
+                    // In ancestor dirs, keep everything that contributes to the
+                    // target's scope — const + setup (ambient cascade) and lib
+                    // (call resolution) — but skip the ancestor's own runnable
+                    // tests/cleanups. The runner cascades these into the target's
+                    // scope without executing ancestor tests.
+                    if is_ancestor {
+                        let contributes_scope = filename.contains(".const.")
+                            || filename.contains(".setup.")
+                            || filename.contains(".lib.");
+                        if !contributes_scope {
+                            continue;
+                        }
+                    }
+                    // Outside target entirely — skip (shouldn't normally reach here)
+                    if !in_scope && !is_ancestor {
+                        continue;
+                    }
                 }
 
                 match parse_test_file(&path, filename) {
@@ -433,6 +462,100 @@ mod tests {
         assert_eq!(create.file.inputs, vec!["req"]);
         assert_eq!(create.file.outputs, vec!["groupId"]);
         assert_eq!(create.file.body.len(), 3); // HTTP call + assignment + return
+    }
+
+    /// Recursively collect the stems of every `lib` file in a suite tree.
+    fn collect_lib_stems(suite: &Suite, out: &mut Vec<String>) {
+        for entry in suite.entries.values() {
+            if entry.file.file_type == FileType::Lib {
+                out.push(file_stem(
+                    entry.path.file_name().unwrap().to_str().unwrap(),
+                ).to_string());
+            }
+        }
+        for child in suite.children.values() {
+            collect_lib_stems(child, out);
+        }
+    }
+
+    /// Regression: targeting a leaf must still discover libs living in a `lib/`
+    /// subtree that hangs off an ancestor directory. The resolution rule
+    /// (`FileIndex::visible_libs`) promises those libs are visible to the leaf,
+    /// but scoped discovery used to prune the un-dominated sibling `lib/` branch
+    /// before it was ever scanned — so the call resolved under `tstr <parent>`
+    /// yet errored under `tstr <parent>/<leaf>`.
+    #[test]
+    fn scoped_discovery_keeps_ancestor_lib_subtree() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+
+        // Ancestor-level lib subtree: root/lib/charge.lib.tstr
+        fs::create_dir(root.join("lib")).unwrap();
+        fs::write(
+            root.join("lib/charge.lib.tstr"),
+            "amount --> { export amount as charged; }\n",
+        ).unwrap();
+
+        // The leaf we're going to target: root/payment/
+        fs::create_dir(root.join("payment")).unwrap();
+        fs::write(
+            root.join("payment/01-pay.test.tstr"),
+            "--> { r = charge(5); r.charged == 5 || \"nope\"; }\n",
+        ).unwrap();
+
+        let target = root.join("payment");
+        let (suite, errors) = discover_lenient_scoped(root, Some(&target));
+        assert!(errors.is_empty(), "unexpected parse errors: {:?}", errors);
+
+        // The ancestor lib must survive scoped discovery...
+        let mut libs = Vec::new();
+        collect_lib_stems(&suite, &mut libs);
+        assert!(
+            libs.contains(&"charge".to_string()),
+            "ancestor lib/ subtree was pruned by leaf-scoped discovery; found libs: {:?}",
+            libs,
+        );
+
+        // ...and resolve into the leaf's scope end-to-end.
+        let index = crate::scheduler::FileIndex::build(suite, root.to_path_buf());
+        let visible = index.visible_libs(&target);
+        assert!(
+            visible.contains_key("charge"),
+            "charge lib not visible from leaf scope; visible: {:?}",
+            visible.keys().collect::<Vec<_>>(),
+        );
+    }
+
+    /// The fix must not over-broaden: a `lib/` that lives in a *sibling* branch
+    /// (not on the target's ancestor chain) is still correctly excluded.
+    #[test]
+    fn scoped_discovery_excludes_sibling_branch_lib() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+
+        // root/other/lib/ is NOT an ancestor of root/payment — must stay pruned.
+        fs::create_dir_all(root.join("other/lib")).unwrap();
+        fs::write(
+            root.join("other/lib/secret.lib.tstr"),
+            "--> { export 1 as x; }\n",
+        ).unwrap();
+
+        fs::create_dir(root.join("payment")).unwrap();
+        fs::write(
+            root.join("payment/01-pay.test.tstr"),
+            "--> { true || \"x\"; }\n",
+        ).unwrap();
+
+        let target = root.join("payment");
+        let (suite, _errors) = discover_lenient_scoped(root, Some(&target));
+
+        let mut libs = Vec::new();
+        collect_lib_stems(&suite, &mut libs);
+        assert!(
+            !libs.contains(&"secret".to_string()),
+            "sibling-branch lib was wrongly pulled into leaf scope; found libs: {:?}",
+            libs,
+        );
     }
 
     #[test]

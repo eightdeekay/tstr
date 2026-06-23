@@ -9,3 +9,6 @@
 
 # Per-run log the runner writes to cwd
 tstr-last-run.log
+
+# Local-only Claude Code settings (keep the shared commands/ tracked)
+/.claude/settings.local.json
