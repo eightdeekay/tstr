@@ -153,7 +153,7 @@ fn collect_slot_totals(
         if entry.file.file_type == FileType::Const || is_scaffold(entry, is_leaf) {
             continue;
         }
-        let key = slot_key(&entry.path, display_root);
+        let key = slot_key(entry, display_root);
         *totals.entry(key).or_insert(0) += 1;
     }
     for child in dir.children.values() {
@@ -161,14 +161,20 @@ fn collect_slot_totals(
     }
 }
 
-/// Slot key for a file: the first path component below `display_root`, or
-/// "(root)" if the file sits directly in `display_root`. Matches output.rs's
-/// `tld_of` so register_directories and record_test agree on slot names.
-fn slot_key(path: &std::path::Path, display_root: &std::path::Path) -> String {
-    let rel = path.strip_prefix(display_root).unwrap_or(path);
+/// Slot key for a file: the first path component below `display_root` (a
+/// sub-suite gets one grouped slot), or — when the file sits **directly** in
+/// `display_root` — the file's own test name, so it gets its own row.
+///
+/// Test/fetch files are only ever directly in `display_root` when that target
+/// is a leaf (the leaf-only rule forbids them in scaffolding dirs), so this is
+/// exactly the "drilled into a single leaf → list each test" view. Sub-suites
+/// still collapse to one slot per immediate child. Both `compute_slot_totals`
+/// and `record_test` route through here, so the keys always agree.
+fn slot_key(entry: &TestEntry, display_root: &std::path::Path) -> String {
+    let rel = entry.path.strip_prefix(display_root).unwrap_or(&entry.path);
     match rel.components().next() {
         Some(c) if rel.components().count() > 1 => c.as_os_str().to_string_lossy().to_string(),
-        _ => "(root)".to_string(),
+        _ => entry.name.clone(),
     }
 }
 
@@ -399,7 +405,7 @@ fn report_file(
         scaffold,
     );
     if !scaffold {
-        printer.record_test(&slot_key(&entry.path, display_root), 0, result);
+        printer.record_test(&slot_key(entry, display_root), 0, result);
     }
     totals.record(result);
 }
@@ -628,6 +634,28 @@ mod tests {
         assert_eq!(slots.get("child"), Some(&1), "the leaf test sizes a 'child' slot");
         assert!(!slots.contains_key("(root)"), "non-leaf setup must not create a (root) slot");
         assert_eq!(slots.len(), 1, "only the leaf test is a display slot");
+    }
+
+    /// When the run target is a leaf (its test files sit directly in
+    /// display_root), each test gets its OWN slot keyed by its display name —
+    /// the "list each test individually" view — instead of collapsing into one
+    /// "(root)" bar.
+    #[test]
+    fn leaf_target_keys_a_slot_per_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("tstr.yaml"), "constants: {}\n").unwrap();
+        std::fs::write(root.join("01-create-product.test.tstr"), "--> { 1 == 1 | \"x\"; }\n").unwrap();
+        std::fs::write(root.join("02-verify-payment.test.tstr"), "--> { 1 == 1 | \"x\"; }\n").unwrap();
+
+        let suite = crate::discovery::discover(root).unwrap();
+        let slots = compute_slot_totals(&suite, root);
+
+        // One slot per test, labeled by display name — not a single "(root)".
+        assert_eq!(slots.get("01 Create Product"), Some(&1));
+        assert_eq!(slots.get("02 Verify Payment"), Some(&1));
+        assert!(!slots.contains_key("(root)"));
+        assert_eq!(slots.len(), 2);
     }
 
     #[test]

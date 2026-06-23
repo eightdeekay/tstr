@@ -1453,7 +1453,13 @@ fn write_slot_row(out: &mut Box<dyn Write + Send>, info: &SlotDrawInfo) {
 /// visible characters. Layout is `<dir>/<test>: <message>`, with the
 /// test/path part dim and the error message in red.
 fn format_panel_entry(dir_path: &str, test_name: &str, msg: &str, max_width: usize) -> String {
-    let raw = format!("{}/{}: {}", dir_path, test_name, msg);
+    // When the slot IS the test (leaf "one row per test" view), the slot key
+    // equals the test name — don't repeat it as a `<name>/<name>` prefix.
+    let raw = if dir_path.is_empty() || dir_path == test_name {
+        format!("{}: {}", test_name, msg)
+    } else {
+        format!("{}/{}: {}", dir_path, test_name, msg)
+    };
     let truncated = truncate_chars(&raw, max_width);
     if let Some(pos) = truncated.find(": ") {
         let (label, rest) = truncated.split_at(pos + 2);

@@ -8,6 +8,15 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.4.2"></a>
+## [0.4.2] — 2026-06-22
+
+### Changed
+- **Interactive display lists one row per test when the run target is a leaf**
+  (e.g. `tstr run commerce/payment/success`) — each row labeled by test name and
+  live-updating — instead of collapsing every test into a single `(root)` bar.
+  Broader runs still use the grouped per-directory bars.
+
 <a id="v0.4.1"></a>
 ## [0.4.1] — 2026-06-22
 
