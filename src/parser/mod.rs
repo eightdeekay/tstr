@@ -11,14 +11,30 @@ use crate::ast::*;
 use self::primitives::{var_list, ws, strip_comments};
 use self::statement::statements_with_lines;
 
-/// Parse the input line: `var1, var2 -->` or just `-->`
-/// Returns the list of input variable names (empty if just `-->`).
+/// Parse the input line: `var1, var2 -->`, a bare `-->`, or nothing at all.
+/// Returns the list of input variable names (empty if there's no param list).
+///
+/// The arrow is mandatory *when parameters are declared* (`a, b -->`) but
+/// optional when there are none — a no-input file may open straight into its
+/// `{ ... }` body. `--> { ... }` stays valid as an explicit synonym for the
+/// no-param case.
 fn input_line(input: &mut &str) -> ModalResult<Vec<String>> {
     let vars = opt(
         (var_list, ws).map(|(v, _)| v)
     ).parse_next(input)?;
-    "-->".parse_next(input)?;
-    Ok(vars.unwrap_or_default())
+    match vars {
+        // Params declared → the arrow is required: `a, b -->`.
+        Some(v) => {
+            "-->".parse_next(input)?;
+            Ok(v)
+        }
+        // No params → the arrow is optional. Consume it if present, but a bare
+        // `{ ... }` body is equally valid.
+        None => {
+            let _ = opt("-->").parse_next(input)?;
+            Ok(Vec::new())
+        }
+    }
 }
 
 /// Determine the FileType from a filename's middle extension.
@@ -83,11 +99,12 @@ pub fn parse_file(source: &str, filename: &str) -> Result<File, String> {
     // Skip leading whitespace
     let _ = ws.parse_next(input);
 
-    // Input header is mandatory under the function form: `a, b -->`, or a bare
-    // `-->` for a file that takes no inputs.
+    // Input header: `a, b -->` declares params, a bare `-->` (or nothing at
+    // all) means no params. The arrow is only required when params are present,
+    // so a failure here means params were declared without the trailing `-->`.
     let inputs = match input_line.parse_next(input) {
         Ok(vars) => vars,
-        Err(_) => return Err(format_parse_error_ctx(source, &stripped, *input, "expected input header ('a, b -->', or '-->' for none)")),
+        Err(_) => return Err(format_parse_error_ctx(source, &stripped, *input, "expected '-->' after input parameters")),
     };
 
     // The body is a braced block: `--> { ... }`.
@@ -214,6 +231,24 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_no_param_bare_brace() {
+        // A no-input file may skip the arrow and open straight into its body.
+        let source = r#"{ r = req.get("/v4/groups") ? 2xx | "Failed"; }"#;
+        let file = parse_file(source, "list-groups.test.tstr").unwrap();
+        assert_eq!(file.inputs, Vec::<String>::new());
+        assert_eq!(file.body.len(), 1);
+    }
+
+    #[test]
+    fn test_input_line_bare_brace() {
+        // No params, no arrow: input_line consumes nothing and yields no vars.
+        let mut input = "{ x = 1; }";
+        let result = input_line(&mut input).unwrap();
+        assert_eq!(result, Vec::<String>::new());
+        assert_eq!(input, "{ x = 1; }");
+    }
+
+    #[test]
     fn test_parse_file_with_inputs() {
         let source = r#"
             groupId --> {
@@ -306,11 +341,12 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_error_missing_header() {
-        // No `-->` header is now a hard error.
-        let source = r#"r = req.get("/v4/groups") ? 2xx | "Failed";"#;
+    fn test_parse_error_params_without_arrow() {
+        // Declaring params but omitting the `-->` is a hard error. (Here `r`
+        // reads as a param name, so the parser then demands the arrow.)
+        let source = r#"r, token = req.get("/v4/groups") ? 2xx | "Failed";"#;
         let err = parse_file(source, "bad.test.tstr").unwrap_err();
-        assert!(err.contains("input header"), "should demand a header, got: {}", err);
+        assert!(err.contains("-->"), "should demand the arrow, got: {}", err);
     }
 
     #[test]

@@ -643,8 +643,8 @@ Tracked here for visibility; none are blockers:
 
 ## File form
 
-Every file is a function: a mandatory input header, a braced body, and
-`export` for whatever it publishes.
+Every file is a function: an input header (when it takes parameters), a braced
+body, and `export` for whatever it publishes.
 
 ```
 a, b --> {
@@ -653,8 +653,19 @@ a, b --> {
 }
 ```
 
-- **Input header is required.** `a, b -->` declares the ambient values the file
-  consumes; a file that takes none still writes a bare `-->`.
+A file that takes no inputs skips the header and opens straight into its body:
+
+```
+{
+  ... statements ...
+  export x;
+}
+```
+
+- **Input header, only when there are params.** `a, b -->` declares the ambient
+  values the file consumes — the `-->` is required once you list params. A file
+  that takes none opens directly with `{ ... }`; the bare `--> { ... }` form is
+  still accepted as an explicit synonym.
 - **Body is braced.** `{ ... }` wraps the statements.
 - **`export` publishes named bindings.** A comma list of `expr [as name]`. A
   bare identifier self-names (`export payIntentId`); anything computed needs an

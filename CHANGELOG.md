@@ -8,6 +8,17 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.4.6"></a>
+## [0.4.6] — 2026-06-25
+
+### Changed
+- **No-input files can drop the `-->` and open straight into `{ ... }`.** The
+  input header arrow is now required only when a file actually declares params
+  (`a, b --> { ... }`). A file that takes no inputs can now be written as a bare
+  `{ ... }` body instead of the left-empty `--> { ... }`. The explicit
+  `--> { ... }` form still parses as a synonym, so existing suites are
+  unaffected.
+
 <a id="v0.4.5"></a>
 ## [0.4.5] — 2026-06-25
 
