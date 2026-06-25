@@ -8,6 +8,17 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.4.5"></a>
+## [0.4.5] — 2026-06-25
+
+### Fixed
+- **No more spurious "pattern filtering not yet supported" warning on
+  directory-scoped runs.** A directory target (e.g. `tstr run commerce`) is
+  scoped via `target_dir` during discovery, but it also produced a redundant
+  glob pattern that tripped the not-yet-implemented warning. The warning now
+  fires only for a genuine glob target (no `target_dir`), where the run really
+  is unfiltered.
+
 <a id="v0.4.4"></a>
 ## [0.4.4] — 2026-06-23
 

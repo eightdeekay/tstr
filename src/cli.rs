@@ -275,8 +275,10 @@ fn run_command(
     }
 
     // Pattern filtering for structural runner is not yet implemented; warn
-    // when one is supplied and run everything.
-    if pattern.is_some() {
+    // when one is supplied and run everything. A directory target also yields a
+    // pattern, but it's scoped via target_dir during discovery — so only warn
+    // for a genuine glob (no target_dir), not the directory-scope case.
+    if pattern.is_some() && target_dir.is_none() {
         eprintln!("warning: pattern filtering not yet supported; running entire suite");
     }
     let _ = stop_on_error; // not yet wired through structural runner
