@@ -148,9 +148,12 @@ fn collect_slot_totals(
 ) {
     let is_leaf = dir.children.is_empty();
     for entry in dir.entries.values() {
-        // Consts are loads, not tests; scaffolding (non-leaf setup/cleanup)
-        // never claims a slot. Both stay out of the bar sizing.
-        if entry.file.file_type == FileType::Const || is_scaffold(entry, is_leaf) {
+        // Consts are loads and libs are callable definitions — neither is a
+        // test. Scaffolding (non-leaf setup/cleanup) never claims a slot.
+        // None of them factor into the bar sizing.
+        if matches!(entry.file.file_type, FileType::Const | FileType::Lib)
+            || is_scaffold(entry, is_leaf)
+        {
             continue;
         }
         let key = slot_key(entry, display_root);

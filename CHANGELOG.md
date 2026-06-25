@@ -8,6 +8,22 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.4.4"></a>
+## [0.4.4] — 2026-06-23
+
+Follow-up to 0.4.3, which made `lib/` subtrees discoverable on leaf-scoped runs.
+
+### Changed
+- **`lib/` files no longer claim a row in the slot display.** Now that lib
+  subtrees are discovered, the bar/slot sizing skips `lib` files (as it already
+  did for consts and non-leaf scaffolding) — libraries are callable definitions,
+  not tests, so they stay out of the run output.
+
+### Fixed
+- **A `.test.tstr` file inside a `lib/` directory is now rejected** with an error
+  instead of being silently discovered. Lib dirs hold callable definitions only;
+  runnable tests belong in a leaf.
+
 <a id="v0.4.3"></a>
 ## [0.4.3] — 2026-06-23
 

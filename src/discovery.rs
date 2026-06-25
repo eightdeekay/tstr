@@ -228,6 +228,12 @@ fn discover_dir(dir: &Path, errors: &mut Vec<String>, target: Option<&Path>, lib
         }
     };
 
+    // A directory named `lib` (or any subdir within a lib subtree) holds only
+    // callable library definitions. Runnable `.test.tstr` files don't belong
+    // here and are rejected outright rather than silently ignored.
+    let dir_is_lib =
+        lib_only || dir.file_name().and_then(|n| n.to_str()) == Some("lib");
+
     let read_dir = match fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(e) => {
@@ -277,6 +283,13 @@ fn discover_dir(dir: &Path, errors: &mut Vec<String>, target: Option<&Path>, lib
             children.insert(dir_name, child_suite);
         } else if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
             if filename.ends_with(".tstr") {
+                if dir_is_lib && filename.contains(".test.") {
+                    errors.push(format!(
+                        "{}: .test.tstr files are not allowed in a lib/ directory",
+                        path.display()
+                    ));
+                    continue;
+                }
                 // Inside an ancestor `lib/` subtree: only the lib files
                 // contribute to the target's scope; ignore anything else.
                 if lib_only {
@@ -555,6 +568,45 @@ mod tests {
             !libs.contains(&"secret".to_string()),
             "sibling-branch lib was wrongly pulled into leaf scope; found libs: {:?}",
             libs,
+        );
+    }
+
+    /// A `.test.tstr` file inside a `lib/` directory is rejected — lib dirs
+    /// hold callable definitions only, not runnable tests.
+    #[test]
+    fn lib_dir_rejects_test_files() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+
+        fs::create_dir(root.join("lib")).unwrap();
+        fs::write(
+            root.join("lib/charge.lib.tstr"),
+            "amount --> { export amount as charged; }\n",
+        ).unwrap();
+        // Illegal: a runnable test parked in the lib dir.
+        fs::write(
+            root.join("lib/sneaky.test.tstr"),
+            "--> { true || \"x\"; }\n",
+        ).unwrap();
+
+        let (suite, errors) = discover_lenient(root);
+
+        // The offending file is reported...
+        assert!(
+            errors.iter().any(|e| e.contains("sneaky.test.tstr")
+                && e.contains("not allowed in a lib/ directory")),
+            "expected a lib/ test-file rejection; got: {:?}",
+            errors,
+        );
+
+        // ...and never enters the suite, while the lib file still does.
+        let mut libs = Vec::new();
+        collect_lib_stems(&suite, &mut libs);
+        assert!(libs.contains(&"charge".to_string()), "lib file should survive: {:?}", libs);
+        let lib_suite = suite.children.get("lib").expect("lib child exists");
+        assert!(
+            !lib_suite.entries.contains_key("sneaky"),
+            "rejected test file leaked into the suite",
         );
     }
 

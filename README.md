@@ -390,6 +390,8 @@ When a test calls `createTag(...)`, the runner walks the caller's directory chai
 
 If no in-suite match, `--import` directories are checked in order. **Closest scope wins. Collisions at the same tier are an error.**
 
+A `lib/` directory holds callable definitions only. It never claims a row in the slot display, and a `*.test.tstr` file placed there is rejected — tests belong in a leaf, not the lib tree.
+
 ```
 my-project/
   tstr.yaml
