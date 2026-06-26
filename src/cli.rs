@@ -46,7 +46,7 @@ impl DisplayMode {
 pub enum Commands {
     /// Run tests
     Run {
-        /// Directory path or test pattern (default: current directory)
+        /// Directory to run — the suite root or a subdirectory (default: current directory)
         #[arg(default_value = ".")]
         target: String,
 
@@ -160,6 +160,29 @@ fn resolve_target(target: &str) -> (PathBuf, Option<String>, Option<PathBuf>) {
     }
 }
 
+/// Resolve a `run` target into (suite_root, optional scoped subdir).
+///
+/// `run` takes a **directory** — the suite root, or a subdirectory to scope the
+/// run to. A target that isn't an existing directory is a hard error: there is
+/// no name/glob filtering and no "run the whole suite anyway" fallback (those
+/// would silently walk an unrelated tree). The default target `.` is the cwd.
+fn resolve_run_target(target: &str) -> Result<(PathBuf, Option<PathBuf>), String> {
+    let path = Path::new(target);
+    if !path.exists() {
+        return Err(format!("no such directory: '{}'", target));
+    }
+    if !path.is_dir() {
+        return Err(format!(
+            "'{}' is not a directory — tstr run takes a directory, not a single file",
+            target
+        ));
+    }
+    let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let root = discovery::find_root(&abs);
+    let target_dir = if abs == root { None } else { Some(abs) };
+    Ok((root, target_dir))
+}
+
 fn run_command(
     target: &str,
     url: Option<String>,
@@ -192,8 +215,15 @@ fn run_command(
         }
     }
 
-    // Resolve target into root + optional pattern
-    let (root, pattern, target_dir) = resolve_target(target);
+    // Resolve target into root + optional scoped subdir. A non-directory target
+    // fails fast (no pattern filtering, no whole-suite fallback).
+    let (root, target_dir) = match resolve_run_target(target) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            process::exit(1);
+        }
+    };
 
     // Load layered config: ~/.config/tstr/config.yaml → <root>/tstr.yaml → --config
     let config = match Config::load_layered(Some(&root), config_override.as_deref()) {
@@ -206,8 +236,8 @@ fn run_command(
 
     if verbose {
         eprintln!("Suite root: {}", root.display());
-        if let Some(ref p) = pattern {
-            eprintln!("Filter: {}", p);
+        if let Some(ref d) = target_dir {
+            eprintln!("Scoped to: {}", d.display());
         }
         if !config.constants.is_empty() || !config.defaults.import.is_empty() {
             eprintln!("Config: {} constants, {} import dirs",
@@ -274,13 +304,6 @@ fn run_command(
         printer.log_parse_errors(&warnings);
     }
 
-    // Pattern filtering for structural runner is not yet implemented; warn
-    // when one is supplied and run everything. A directory target also yields a
-    // pattern, but it's scoped via target_dir during discovery — so only warn
-    // for a genuine glob (no target_dir), not the directory-scope case.
-    if pattern.is_some() && target_dir.is_none() {
-        eprintln!("warning: pattern filtering not yet supported; running entire suite");
-    }
     let _ = stop_on_error; // not yet wired through structural runner
 
     // Precompute the constants namespace from yaml. Wrapped in Arc so per-file
@@ -569,4 +592,35 @@ fn collect_entries(
 
 fn format_list(items: &[String]) -> String {
     if items.is_empty() { "—".to_string() } else { items.join(", ") }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_run_target_rejects_missing_path() {
+        // A non-existent target fails fast — no pattern fallback, no tree walk.
+        let err = resolve_run_target("definitely-not-a-dir-xyz").unwrap_err();
+        assert!(err.contains("no such directory"), "got: {}", err);
+    }
+
+    #[test]
+    fn resolve_run_target_rejects_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.test.tstr");
+        std::fs::write(&file, "{ x = 1; }\n").unwrap();
+        let err = resolve_run_target(file.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("not a directory"), "got: {}", err);
+    }
+
+    #[test]
+    fn resolve_run_target_accepts_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("tstr.yaml"), "constants: {}\n").unwrap();
+        let (root, scoped) = resolve_run_target(dir.path().to_str().unwrap()).unwrap();
+        // The dir is its own suite root (has tstr.yaml), so nothing is scoped.
+        assert_eq!(root, std::fs::canonicalize(dir.path()).unwrap());
+        assert!(scoped.is_none());
+    }
 }

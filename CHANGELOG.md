@@ -8,6 +8,28 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.5.1"></a>
+## [0.5.1] — 2026-06-26
+
+### Fixed
+- **`tstr run` with an invalid target no longer hangs.** A non-directory target
+  used to fall through to a "pattern" path that resolved the root to the current
+  working directory and walked the entire tree (e.g. running `tstr run asdf` from
+  a repo root above the suite). `run` now takes a **directory only** — a
+  non-existent or non-directory target fails immediately (`error: no such
+  directory: '…'`). There is no name/glob filtering and no single-file execution
+  for `run` (`tstr list` keeps its name-search pattern).
+- **Relative `@file` references resolve against the suite root**, not the process
+  working directory. A test that did `req.body = @notify/x.json;` only worked when
+  invoked from inside the suite; now it resolves correctly regardless of where
+  `tstr` is run from. Absolute paths are unchanged; the suite root is threaded
+  through the scope (not the process cwd), so it stays correct under the
+  concurrent runner.
+
+### Changed
+- Removed the dead "pattern filtering not yet supported; running entire suite"
+  warning from `run`.
+
 <a id="v0.5.0"></a>
 ## [0.5.0] — 2026-06-26
 

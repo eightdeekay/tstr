@@ -9,7 +9,7 @@ cargo build --release
 ln -s ~/dev/tstr/target/release/tstr ~/bin/tstr
 
 tstr run                          # run all tests (walks up to find tstr.yaml)
-tstr run notify                   # run tests under notify/  (filter TODO; runs all for now)
+tstr run notify                   # scope the run to the notify/ subdirectory
 tstr list                         # per-directory tables
 tstr list --type lib              # libraries instead of tests
 tstr list --disabled              # disabled tests + their reasons
@@ -607,7 +607,7 @@ providers' signing schemes, build the header yourself from `$.hmacSha256()`.
 ## CLI
 
 ```
-tstr run [target]                 # run tests under target (or cwd)
+tstr run [dir]                    # run the suite, or scope to a subdirectory (default: cwd)
 tstr list [target]                # per-directory tables of files visible
 tstr --config path/to/yaml ...    # explicit config (overrides project tstr.yaml)
 tstr --version
@@ -685,7 +685,10 @@ Tracked here for visibility; none are blockers:
 
 - **`--repeat N`** — not yet rewired through the structural runner. Single-run only for now.
 - **`--stop-on-error`** — accepted but not propagated.
-- **Pattern filtering** (`tstr run path/to/foo`) — not yet wired; structural runner runs the whole suite. Warns and continues if a pattern is given.
+- **`run` scoping is directory-only.** `tstr run path/to/sub` scopes the run to
+  that subdirectory; a non-directory target is an error. There is no name/glob
+  filtering and no single-file execution (by design — leaf tests aren't run in
+  isolation). `tstr list` still supports a name pattern for searching.
 - **Matrix fan-out** — was DAG-coupled; needs reimplementation for the structural model.
 - **`.const.tstr` integration with `${name}`** — currently const returns flow into ambient scope; strict `${name}`-only access for const files is a follow-up.
 - **Library call caching** — every call re-executes; opt-in memoization will land when the semantics are pinned down.

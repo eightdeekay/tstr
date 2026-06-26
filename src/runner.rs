@@ -533,7 +533,8 @@ fn exec_structural_file(
 
     let mut file_scope = eval::Scope::new()
         .with_constants(Arc::clone(&opts.constants))
-        .with_libs(visible_libs);
+        .with_libs(visible_libs)
+        .with_base_dir(index.root.clone());
 
     // Seed ambient vars into the scope (bare-name access).
     for (k, v) in ambient {

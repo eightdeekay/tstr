@@ -58,6 +58,10 @@ pub struct Scope {
     /// FileIndex according to the lib resolution rule (dir chain + lib/ subtrees).
     /// Looked up by `Expr::LibCall` and `Expr::MethodCall` (UFCS).
     libs: std::sync::Arc<HashMap<String, std::sync::Arc<crate::ast::File>>>,
+    /// Suite root, used to resolve relative `@file` references. Threaded through
+    /// the scope (not the process cwd) so resolution is location-independent and
+    /// safe under the concurrent runner. `None` falls back to cwd-relative.
+    base_dir: Option<std::sync::Arc<std::path::PathBuf>>,
     logs: RefCell<Vec<String>>,
     last_endpoint: RefCell<Option<String>>,
 }
@@ -69,6 +73,7 @@ impl Clone for Scope {
             sources: self.sources.clone(),
             constants: std::sync::Arc::clone(&self.constants),
             libs: std::sync::Arc::clone(&self.libs),
+            base_dir: self.base_dir.clone(),
             logs: RefCell::new(self.logs.borrow().clone()),
             last_endpoint: RefCell::new(self.last_endpoint.borrow().clone()),
         }
@@ -82,6 +87,7 @@ impl Scope {
             sources: HashMap::new(),
             constants: std::sync::Arc::new(HashMap::new()),
             libs: std::sync::Arc::new(HashMap::new()),
+            base_dir: None,
             logs: RefCell::new(Vec::new()),
             last_endpoint: RefCell::new(None),
         }
@@ -93,9 +99,21 @@ impl Scope {
             sources: HashMap::new(),
             constants: std::sync::Arc::new(HashMap::new()),
             libs: std::sync::Arc::new(HashMap::new()),
+            base_dir: None,
             logs: RefCell::new(Vec::new()),
             last_endpoint: RefCell::new(None),
         }
+    }
+
+    /// Attach the suite root used to resolve relative `@file` references.
+    pub fn with_base_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.base_dir = Some(std::sync::Arc::new(dir));
+        self
+    }
+
+    /// The suite root for resolving relative `@file` references, if set.
+    pub fn base_dir(&self) -> Option<&std::path::Path> {
+        self.base_dir.as_deref().map(|p| p.as_path())
     }
 
     /// Attach a constants namespace (yaml constants + future .const.tstr returns).
@@ -211,7 +229,7 @@ pub fn eval_expr(expr: &Expr, scope: &Scope) -> Result<Value, EvalError> {
         }
 
         Expr::FileRef(path) => {
-            load_file_ref(path)
+            load_file_ref(path, scope.base_dir())
         }
 
         Expr::Interpolated(name) => Ok(scope.get(name)),
@@ -662,6 +680,9 @@ fn invoke_lib(
     let mut lib_scope = Scope::new()
         .with_constants(std::sync::Arc::clone(&caller_scope.constants))
         .with_libs(std::sync::Arc::clone(&caller_scope.libs));
+    // `@file` references resolve against the same suite root in a lib as at the
+    // call site (root-relative, not lib-relative).
+    lib_scope.base_dir = caller_scope.base_dir.clone();
 
     // Bind params to argument values.
     for (param, val) in params.iter().zip(args.into_iter()) {
@@ -1053,9 +1074,16 @@ fn generate_random_string(len: usize) -> String {
     result
 }
 
-/// Load a file reference. JSON files are parsed into objects, everything else is a string.
-fn load_file_ref(path: &str) -> Result<Value, EvalError> {
-    let content = std::fs::read_to_string(path)
+/// Load a file reference. JSON files are parsed into objects, everything else is
+/// a string. A **relative** `@path` resolves against `base_dir` (the suite root),
+/// so references are independent of the process's working directory; an absolute
+/// path is used as-is. With no `base_dir`, falls back to cwd-relative.
+fn load_file_ref(path: &str, base_dir: Option<&std::path::Path>) -> Result<Value, EvalError> {
+    let resolved = match base_dir {
+        Some(dir) if std::path::Path::new(path).is_relative() => dir.join(path),
+        _ => std::path::PathBuf::from(path),
+    };
+    let content = std::fs::read_to_string(&resolved)
         .map_err(|e| EvalError::new(format!("cannot load @{}: {}", path, e)))?;
 
     if path.ends_with(".json") {
@@ -2240,6 +2268,26 @@ mod tests {
         assert!(result.disabled);
         // x was never assigned because we short-circuited before the loop.
         assert_eq!(scope.get("x"), Value::Null);
+    }
+
+    #[test]
+    fn test_load_file_ref_resolves_relative_to_base_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/data.json"), r#"{"k": "v"}"#).unwrap();
+
+        // A relative @path resolves against base_dir (the suite root), not cwd.
+        let v = load_file_ref("sub/data.json", Some(root)).unwrap();
+        assert_eq!(v.get_field("k"), Value::String("v".to_string()));
+
+        // Without a base_dir the same relative path is cwd-relative and not found.
+        assert!(load_file_ref("sub/data.json", None).is_err());
+
+        // An absolute path ignores base_dir entirely.
+        let abs = root.join("sub/data.json");
+        let v2 = load_file_ref(abs.to_str().unwrap(), Some(std::path::Path::new("/nonexistent"))).unwrap();
+        assert_eq!(v2.get_field("k"), Value::String("v".to_string()));
     }
 
     #[test]
