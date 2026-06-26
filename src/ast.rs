@@ -3,6 +3,9 @@
 #[derive(Debug, PartialEq, Clone)]
 pub struct File {
     pub file_type: FileType,
+    /// Header-region metadata block (`key: value` lines above the function
+    /// block). See `Metadata`.
+    pub metadata: Metadata,
     pub inputs: Vec<String>,
     pub body: Vec<Statement>,
     pub outputs: Vec<String>,
@@ -12,17 +15,42 @@ pub struct File {
 }
 
 impl File {
-    /// If this file carries a `disabled "reason"` marker, return the reason.
-    /// Scans the body (the marker is idiomatically first, but the runner
-    /// short-circuits regardless of position, so we don't require it to be).
-    /// This is the single source of truth consulted by both the runner
-    /// (to skip execution) and `tstr list --disabled` (to enumerate).
+    /// If this file is turned off via `disabled:`, return the reason. Single
+    /// source of truth for both the runner (to skip execution) and
+    /// `tstr list --disabled`.
     pub fn disabled_reason(&self) -> Option<&str> {
-        self.body.iter().find_map(|stmt| match stmt {
-            Statement::Disabled { reason } => Some(reason.as_str()),
-            _ => None,
-        })
+        self.metadata.disabled.as_deref()
     }
+}
+
+/// The header-region metadata block — `key: value` lines that sit above the
+/// function block (param header + braced body). Static, file-level config;
+/// HTTP-header-like, no sigil, value = rest-of-line (trimmed, unquoted).
+/// See TODO.md "File metadata block" and the README "Metadata block" section.
+#[derive(Debug, PartialEq, Clone, Default)]
+pub struct Metadata {
+    /// `requires:` — minimum tstr version requirement, raw (e.g. `">= 0.5.3"`).
+    pub requires: Option<String>,
+    /// `disabled:` — reason the file is turned off. Unconditional "don't run,
+    /// fix postponed"; the runner short-circuits before any statement executes
+    /// and reports a distinct DISABLED status.
+    pub disabled: Option<String>,
+    /// `blast-radius:` — how far this file's collateral extends, forward, within
+    /// its leaf.
+    pub blast_radius: Option<BlastRadius>,
+}
+
+/// The span a `disabled:`/failed file's collateral skip covers. Forward-only,
+/// leaf-local. See TODO.md for the full semantics.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum BlastRadius {
+    /// `N` — the next N tests in the leaf (saturates at remaining).
+    Count(u32),
+    /// `all` / `*` — every remaining test in the leaf.
+    All,
+    /// `<=PREFIX` — through the file whose name matches filename-prefix `PREFIX`.
+    /// Parsed now; runtime not yet wired (future addition per the spec).
+    Through(String),
 }
 
 /// Determined by the middle extension: create-group.test.tstr, values.const.tstr, etc.
@@ -79,15 +107,6 @@ pub enum Statement {
         then_lines: Vec<usize>,
         else_body: Vec<Statement>,
         else_lines: Vec<usize>,
-    },
-    /// `disabled "reason"` — intentionally turn this whole file off.
-    /// Unlike `if` (which conditionally runs part of a file), this is an
-    /// unconditional "don't run, fix postponed" marker with a mandatory
-    /// reason. The runner short-circuits the file before any statement
-    /// executes (so position in the body is irrelevant) and reports it as
-    /// a distinct DISABLED status rather than a plain skip.
-    Disabled {
-        reason: String,
     },
     /// `eval { ... }` or `js:{ ... }`
     JsBlock {

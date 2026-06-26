@@ -1308,11 +1308,6 @@ pub fn exec_statement(stmt: &Statement, scope: &mut Scope) -> Result<StmtResult,
             }
         }
 
-        // The `disabled "reason"` marker is handled at the file level
-        // (exec_file short-circuits before any statement runs), so reaching
-        // it here means it sat in a body we executed anyway — treat as inert.
-        Statement::Disabled { .. } => Ok(StmtResult::Ok),
-
         Statement::HttpCall { target, method, url, request_obj, status_check } => {
             match crate::http::execute_http_call(method, url, request_obj, status_check, scope) {
                 Ok(body) => {
@@ -1535,10 +1530,15 @@ pub struct FileResult {
     /// Whether the file was skipped (`disabled`, or an upstream/dependency
     /// cascade set by the runner — never by the file's own execution).
     pub skipped: bool,
-    /// Whether the file was intentionally turned off via a `disabled "reason"`
+    /// Whether the file was intentionally turned off via a `disabled:` metadata
     /// marker. A disabled file is always also `skipped` (so it never counts as
     /// a pass), but is reported as a distinct DISABLED status.
     pub disabled: bool,
+    /// Whether the file was skipped because the running binary doesn't satisfy
+    /// its `requires:` constraint. Like `disabled`, an incompatible file is
+    /// always also `skipped`, but is reported as a distinct INCOMPATIBLE status.
+    /// `skip_reason` carries `needs <req>, have <current>`.
+    pub incompatible: bool,
     /// Why the file was skipped (for log output). For `disabled`, this carries
     /// the mandatory reason from the marker.
     pub skip_reason: Option<String>,
@@ -1597,6 +1597,7 @@ pub fn exec_file(
             name: name.to_string(),
             skipped: true,
             disabled: true,
+            incompatible: false,
             skip_reason: Some(reason.to_string()),
             inputs,
             failures: Vec::new(),
@@ -1607,6 +1608,37 @@ pub fn exec_file(
             is_const,
             matrices: Vec::new(),
         });
+    }
+
+    // Version gate: if the file declares a `requires:` the running binary can't
+    // satisfy, skip it as INCOMPATIBLE rather than running it and reporting
+    // confusing failures. A new test on an old binary should bail loudly, not
+    // explode. (The constraint was validated at parse time, so re-parse is
+    // expected to succeed; an unexpected error degrades to "don't gate".)
+    if let Some(req_str) = &file.metadata.requires {
+        if let Ok(req) = crate::version::parse_requirement(req_str) {
+            if !req.is_satisfied_by_current() {
+                return Ok(FileResult {
+                    name: name.to_string(),
+                    skipped: true,
+                    disabled: false,
+                    incompatible: true,
+                    skip_reason: Some(format!(
+                        "needs {}, have {}",
+                        req_str.trim(),
+                        crate::version::current()
+                    )),
+                    inputs,
+                    failures: Vec::new(),
+                    endpoint: None,
+                    exports: HashMap::new(),
+                    logs: scope.take_logs(),
+                    elapsed: start.elapsed(),
+                    is_const,
+                    matrices: Vec::new(),
+                });
+            }
+        }
     }
 
     for (i, stmt) in file.body.iter().enumerate() {
@@ -1662,6 +1694,7 @@ pub fn exec_file(
         // earlier; the runner sets `skipped` for blocked/missing-input cascades.
         skipped: false,
         disabled: false,
+        incompatible: false,
         skip_reason: None,
         inputs,
         failures,
@@ -2155,11 +2188,11 @@ mod tests {
 
     #[test]
     fn test_exec_disabled_short_circuits() {
-        // The disabled marker must turn the whole file off — even a guaranteed
-        // assertion failure after it must not run, and the file must report as
+        // The `disabled:` metadata marker must turn the whole file off — even a
+        // guaranteed assertion failure must not run, and the file must report as
         // disabled (a distinct flavor of skip) carrying the reason.
-        let source = r#"disabled "I-123: fix postponed"; false | "this must not fire";"#;
-        let file = crate::parser::parse_file(&wrap_body(source), "test.tstr").unwrap();
+        let source = format!("disabled: I-123: fix postponed\n{}", wrap_body(r#"false | "this must not fire";"#));
+        let file = crate::parser::parse_file(&source, "test.tstr").unwrap();
         let mut scope = Scope::new();
         let result = exec_file(&file, "test", &mut scope).unwrap();
         assert!(result.disabled);
@@ -2169,11 +2202,39 @@ mod tests {
     }
 
     #[test]
-    fn test_exec_disabled_ignores_marker_position() {
-        // Even if the marker isn't first, the file is off and the earlier
-        // statement's HTTP/side effects never run.
-        let source = r#"x = 1; disabled "off";"#;
-        let file = crate::parser::parse_file(&wrap_body(source), "test.tstr").unwrap();
+    fn test_exec_requires_incompatible_skips() {
+        // A `requires:` the running binary can't satisfy turns the file off as
+        // INCOMPATIBLE — a distinct flavor of skip — without running anything.
+        let source = format!("requires: >= 999.0.0\n{}", wrap_body(r#"false | "must not fire";"#));
+        let file = crate::parser::parse_file(&source, "test.tstr").unwrap();
+        let mut scope = Scope::new();
+        let result = exec_file(&file, "test", &mut scope).unwrap();
+        assert!(result.incompatible);
+        assert!(result.skipped);
+        assert!(!result.disabled);
+        assert!(result.failures.is_empty(), "incompatible file must not run assertions");
+        let reason = result.skip_reason.as_deref().unwrap_or("");
+        assert!(reason.contains("needs >= 999.0.0"), "reason: {}", reason);
+    }
+
+    #[test]
+    fn test_exec_requires_satisfied_runs() {
+        // A satisfiable `requires:` is inert — the file runs normally.
+        let source = format!("requires: >= 0.0.1\n{}", wrap_body(r#"1 == 1 | "ok";"#));
+        let file = crate::parser::parse_file(&source, "test.tstr").unwrap();
+        let mut scope = Scope::new();
+        let result = exec_file(&file, "test", &mut scope).unwrap();
+        assert!(!result.incompatible);
+        assert!(!result.skipped);
+        assert!(result.failures.is_empty());
+    }
+
+    #[test]
+    fn test_exec_disabled_skips_body() {
+        // A `disabled:` file short-circuits before the body runs, so its
+        // statements' side effects (assignments, HTTP calls) never happen.
+        let source = format!("disabled: off\n{}", wrap_body("x = 1;"));
+        let file = crate::parser::parse_file(&source, "test.tstr").unwrap();
         let mut scope = Scope::new();
         let result = exec_file(&file, "test", &mut scope).unwrap();
         assert!(result.disabled);

@@ -9,3 +9,4 @@ pub mod runner;
 pub mod output;
 pub mod filter;
 pub mod config;
+pub mod version;

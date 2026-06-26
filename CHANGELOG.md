@@ -8,6 +8,42 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.5.0"></a>
+## [0.5.0] — 2026-06-26
+
+Files gain a **metadata block** — `key: value` directives above the function
+block, like HTTP headers. The `disabled` marker moves there from the body, which
+is a breaking change.
+
+→ **Migration:** [UPGRADING.md § 0.5.0](UPGRADING.md#v0.5.0)
+
+### ⚠️ Breaking
+- **The body-statement `disabled "reason";` marker is removed.** Turn a file off
+  with a `disabled:` line in the metadata block instead (reason unquoted). Run
+  `scripts/migrate-disabled.py` over your suite to convert automatically.
+  `disabled` is now an ordinary identifier everywhere in the body.
+
+### Added
+- **Metadata block.** Optional `key: value` directives above the function block
+  (fixed order: metadata → param header → braced body). No sigil; the value is
+  the rest of the line, unquoted. Unknown keys are a hard error.
+- **`requires:`** — a minimum tstr version (`>= 0.5.3`, bare version means `>=`).
+  A binary that doesn't satisfy it reports the file **INCOMPATIBLE** (a distinct
+  status — `needs >= 0.5.3, have 0.5.0`) and skips it, rather than failing
+  cryptically.
+- **`disabled:`** — the file-off marker, now in metadata. Mandatory reason, no
+  quotes; reported as **DISABLED** as before.
+- **`blast-radius:`** — skip the downstream collateral a disabled/failed file
+  owns (the side-effect dependents the input-cascade can't see). Leaf-local,
+  forward-only. Forms: `N` (next N tests), `all`/`*` (the rest of the leaf), and
+  `<=PREFIX` (through the first file whose name starts with `PREFIX`, inclusive).
+  Collateral shows as `SKIP  blast-radius from <culprit>`.
+
+### Changed
+- **`disabled` is no longer a keyword.** With the marker gone from the body, it
+  parses as a plain identifier (`disabled = false;`, `disabledCount`, etc.)
+  without the old quoted-reason special case.
+
 <a id="v0.4.6"></a>
 ## [0.4.6] — 2026-06-25
 

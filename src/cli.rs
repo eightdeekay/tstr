@@ -106,7 +106,7 @@ pub enum Commands {
         #[arg(long)]
         flat: bool,
 
-        /// List only files turned off via a `disabled "reason"` marker,
+        /// List only files turned off via a `disabled:` metadata marker,
         /// in a table showing each one's reason. Ignores --type/--flat.
         #[arg(long)]
         disabled: bool,
@@ -471,7 +471,7 @@ fn list_grouped(
     );
 }
 
-/// `tstr list --disabled` — enumerate every file carrying a `disabled "reason"`
+/// `tstr list --disabled` — enumerate every file carrying a `disabled:` metadata
 /// marker as a Test|Reason table. Reads the marker statically from the parsed
 /// AST (via File::disabled_reason); nothing is executed.
 fn list_disabled(suite: &discovery::Suite, root: &Path, pattern: Option<&str>) {
@@ -501,7 +501,7 @@ fn list_disabled(suite: &discovery::Suite, root: &Path, pattern: Option<&str>) {
 }
 
 /// Walk the suite tree collecting (relative_path_with_stem, reason) for every
-/// file with a `disabled "reason"` marker.
+/// file with a `disabled:` metadata marker.
 fn collect_disabled(suite: &discovery::Suite, root: &Path, out: &mut Vec<(String, String)>) {
     let rel_dir = suite.path.strip_prefix(root).unwrap_or(&suite.path);
     for (stem, entry) in &suite.entries {

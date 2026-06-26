@@ -3,6 +3,54 @@
 Migration steps for releases that need action on existing suites. Each section
 cross-links to the full change list in [CHANGELOG.md](CHANGELOG.md).
 
+<a id="v0.5.0"></a>
+## 0.5.0 — `disabled` moves to the metadata block
+
+→ **Full change list:** [CHANGELOG § 0.5.0](CHANGELOG.md#v0.5.0)
+
+The body-statement `disabled "reason";` marker is gone. A file is now turned off
+with a `disabled:` line in the header-region metadata block — above the function
+block, alongside `requires:` and `blast-radius:`. The reason is the rest of the
+line, unquoted.
+
+```
+# before
+a, b --> {
+  x = 1;
+  disabled "I-123: fix pending";
+}
+
+# after
+disabled: I-123: fix pending
+a, b --> {
+  x = 1;
+}
+```
+
+Why: `disabled` was a body statement whose position was explicitly irrelevant —
+file-level config masquerading as code, and a context-sensitive keyword that only
+meant "off" when followed by a quoted string. Moving it to metadata makes it
+unambiguous, drops the mandatory quotes, and frees `disabled` to be an ordinary
+identifier everywhere in the body.
+
+### Automated (recommended)
+
+Run the codemod over your suite:
+
+```bash
+find path/to/suite -name '*.tstr' -exec python3 scripts/migrate-disabled.py {} +
+```
+
+It hoists each body `disabled "reason";` to a `disabled:` metadata line at the
+top of the file (unescaping any `\"` in the reason). Files already using the
+metadata form, or with no marker, are skipped — so re-running is safe. Review the
+diff and commit.
+
+### Manual
+
+Delete the `disabled "reason";` line from the body and add `disabled: reason` as
+the first line of the file (no quotes).
+
 <a id="v0.4.0"></a>
 ## 0.4.0 — function form, `export` / `return` split
 

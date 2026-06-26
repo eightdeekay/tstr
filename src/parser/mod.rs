@@ -6,10 +6,118 @@ pub mod statement;
 use winnow::prelude::*;
 use winnow::error::ModalResult;
 use winnow::combinator::opt;
+use winnow::token::take_while;
 
 use crate::ast::*;
 use self::primitives::{var_list, ws, strip_comments};
 use self::statement::statements_with_lines;
+
+/// The metadata keys we recognize. Anything else is a hard error (a typo'd
+/// directive that silently no-ops defeats the point of the feature).
+const META_KEYS: &[&str] = &["requires", "disabled", "blast-radius"];
+
+/// Parse a metadata key token followed by its colon: `blast-radius :`. Keys
+/// allow dashes (unlike identifiers). Backtracks cleanly if there's no `:` — so
+/// a param header (`a, b -->`) or a body-opening `{` falls through to the
+/// normal header parse rather than being mistaken for metadata.
+fn meta_key<'a>(input: &mut &'a str) -> ModalResult<&'a str> {
+    let key = take_while(1.., |c: char| c.is_alphanumeric() || c == '-' || c == '_')
+        .parse_next(input)?;
+    let _ = ws.parse_next(input);
+    ':'.parse_next(input)?;
+    Ok(key)
+}
+
+/// Consume the rest of the current physical line (up to, but not including, the
+/// newline). The metadata value is line-oriented — everything after the colon.
+fn rest_of_line<'a>(input: &mut &'a str) -> &'a str {
+    let end = input.find('\n').unwrap_or(input.len());
+    let line = &input[..end];
+    *input = &input[end..];
+    line
+}
+
+/// Parse the header-region metadata block: zero or more `key: value` lines that
+/// precede the function header. `value` is the rest of the line, trimmed and
+/// unquoted. Stops at the first line that isn't a `key:` directive — i.e. the
+/// param header or the body's `{`. Unknown keys and malformed values are hard
+/// errors (with source-line context).
+fn metadata_block(input: &mut &str, source: &str, stripped: &str) -> Result<Metadata, String> {
+    let mut meta = Metadata::default();
+    loop {
+        let _ = ws.parse_next(input);
+        // Checkpoint so a non-metadata line (the header / body) is left intact
+        // for the next parse stage, and so error context points at the key.
+        let at = *input;
+        let key = match meta_key.parse_next(input) {
+            Ok(k) => k,
+            Err(_) => {
+                *input = at;
+                break;
+            }
+        };
+        let value = rest_of_line(input).trim().to_string();
+        apply_meta(&mut meta, key, &value)
+            .map_err(|msg| format_parse_error_ctx(source, stripped, at, &msg))?;
+    }
+    Ok(meta)
+}
+
+/// Fold one parsed `key: value` directive into the accumulating `Metadata`.
+/// Returns a bare message on error; the caller wraps it with line context.
+fn apply_meta(meta: &mut Metadata, key: &str, value: &str) -> Result<(), String> {
+    match key {
+        "requires" => {
+            if value.is_empty() {
+                return Err("`requires:` needs a version requirement (e.g. `>= 0.5.3`)".into());
+            }
+            // Validate the constraint now so a typo (`requires: soonish`) fails at
+            // parse time with line context, not silently at run time. We keep the
+            // raw string; the runner re-parses it to gate execution.
+            crate::version::parse_requirement(value)?;
+            meta.requires = Some(value.to_string());
+        }
+        "disabled" => {
+            if value.is_empty() {
+                return Err("`disabled:` needs a reason".into());
+            }
+            meta.disabled = Some(value.to_string());
+        }
+        "blast-radius" => {
+            meta.blast_radius = Some(parse_blast_radius(value)?);
+        }
+        other => {
+            return Err(format!(
+                "unknown metadata key '{}' (known: {})",
+                other,
+                META_KEYS.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Parse a `blast-radius:` value into its span form: a bare count (`3`), the
+/// whole-leaf sentinels (`all` / `*`), or a filename-prefix endpoint (`<=PREFIX`).
+fn parse_blast_radius(value: &str) -> Result<BlastRadius, String> {
+    let v = value.trim();
+    if v.eq_ignore_ascii_case("all") || v == "*" {
+        Ok(BlastRadius::All)
+    } else if let Some(prefix) = v.strip_prefix("<=") {
+        let prefix = prefix.trim();
+        if prefix.is_empty() {
+            return Err("`blast-radius: <=` needs a filename prefix (e.g. `<=05`)".into());
+        }
+        Ok(BlastRadius::Through(prefix.to_string()))
+    } else {
+        v.parse::<u32>().map(BlastRadius::Count).map_err(|_| {
+            format!(
+                "`blast-radius` must be a count, `all`, `*`, or `<=prefix` — got '{}'",
+                v
+            )
+        })
+    }
+}
 
 /// Parse the input line: `var1, var2 -->`, a bare `-->`, or nothing at all.
 /// Returns the list of input variable names (empty if there's no param list).
@@ -99,6 +207,10 @@ pub fn parse_file(source: &str, filename: &str) -> Result<File, String> {
     // Skip leading whitespace
     let _ = ws.parse_next(input);
 
+    // Header-region metadata block (`requires:`, `disabled:`, `blast-radius:`).
+    // Sits above the function header; consumes nothing if there's none.
+    let metadata = metadata_block(input, source, &stripped)?;
+
     // Input header: `a, b -->` declares params, a bare `-->` (or nothing at
     // all) means no params. The arrow is only required when params are present,
     // so a failure here means params were declared without the trailing `-->`.
@@ -150,6 +262,7 @@ pub fn parse_file(source: &str, filename: &str) -> Result<File, String> {
 
     Ok(File {
         file_type,
+        metadata,
         inputs,
         body,
         outputs,
@@ -322,6 +435,109 @@ mod tests {
         "#;
         let file = parse_file(source, "create-group.test.tstr").unwrap();
         assert_eq!(file.body.len(), 3);
+    }
+
+    // --- metadata block tests ---
+
+    #[test]
+    fn test_no_metadata_is_default() {
+        let file = parse_file("{ x = 1; }", "t.test.tstr").unwrap();
+        assert_eq!(file.metadata, Metadata::default());
+    }
+
+    #[test]
+    fn test_parse_metadata_all_keys() {
+        let source = r#"
+            requires: >= 0.5.3
+            disabled: I-55555 something bad to fix
+            blast-radius: 2
+
+            a, b --> {
+            r = req.get("/v4/groups") ? 2xx | "Failed";
+            }
+        "#;
+        let file = parse_file(source, "check.test.tstr").unwrap();
+        assert_eq!(file.metadata.requires.as_deref(), Some(">= 0.5.3"));
+        assert_eq!(file.metadata.disabled.as_deref(), Some("I-55555 something bad to fix"));
+        assert_eq!(file.metadata.blast_radius, Some(BlastRadius::Count(2)));
+        // Metadata sits above the header — params and body still parse normally.
+        assert_eq!(file.inputs, vec!["a", "b"]);
+        assert_eq!(file.body.len(), 1);
+    }
+
+    #[test]
+    fn test_metadata_above_bare_brace() {
+        // Metadata + no-param file: opens straight into `{ ... }`.
+        let source = "requires: >= 0.5.3\n{ x = 1; }";
+        let file = parse_file(source, "t.test.tstr").unwrap();
+        assert_eq!(file.metadata.requires.as_deref(), Some(">= 0.5.3"));
+        assert_eq!(file.inputs, Vec::<String>::new());
+        assert_eq!(file.body.len(), 1);
+    }
+
+    #[test]
+    fn test_metadata_value_is_rest_of_line_unquoted() {
+        // The reason is the whole line after the colon — embedded colons and
+        // spaces are kept verbatim, no quotes needed.
+        let file = parse_file("disabled: I-9: blocked on upstream\n{ x = 1; }", "t.test.tstr").unwrap();
+        assert_eq!(file.metadata.disabled.as_deref(), Some("I-9: blocked on upstream"));
+    }
+
+    #[test]
+    fn test_metadata_disabled_feeds_disabled_reason() {
+        // The metadata form is wired through File::disabled_reason().
+        let file = parse_file("disabled: fix pending\n{ false | \"nope\"; }", "t.test.tstr").unwrap();
+        assert_eq!(file.disabled_reason(), Some("fix pending"));
+    }
+
+    #[test]
+    fn test_blast_radius_forms() {
+        let cases = [
+            ("3", BlastRadius::Count(3)),
+            ("all", BlastRadius::All),
+            ("*", BlastRadius::All),
+            ("<=05", BlastRadius::Through("05".to_string())),
+            ("<= create-org", BlastRadius::Through("create-org".to_string())),
+        ];
+        for (val, expected) in cases {
+            let src = format!("blast-radius: {}\n{{ x = 1; }}", val);
+            let file = parse_file(&src, "t.test.tstr").unwrap();
+            assert_eq!(file.metadata.blast_radius, Some(expected), "value: {}", val);
+        }
+    }
+
+    #[test]
+    fn test_metadata_unknown_key_errors() {
+        let err = parse_file("requires: >= 0.5.3\nfoo: bar\n{ x = 1; }", "t.test.tstr").unwrap_err();
+        assert!(err.contains("unknown metadata key 'foo'"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_metadata_empty_disabled_reason_errors() {
+        let err = parse_file("disabled:\n{ x = 1; }", "t.test.tstr").unwrap_err();
+        assert!(err.contains("disabled"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_metadata_bad_requires_errors_at_parse() {
+        // A malformed version constraint is caught at parse time, not deferred.
+        let err = parse_file("requires: soonish\n{ x = 1; }", "t.test.tstr").unwrap_err();
+        assert!(err.contains("requires"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_metadata_bad_blast_radius_errors() {
+        let err = parse_file("blast-radius: soon\n{ x = 1; }", "t.test.tstr").unwrap_err();
+        assert!(err.contains("blast-radius"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_param_header_not_mistaken_for_metadata() {
+        // `orgId -->` has no colon, so it must fall through to the header parse,
+        // not be eaten as a metadata line.
+        let file = parse_file("orgId --> { x = 1; }", "t.test.tstr").unwrap();
+        assert_eq!(file.inputs, vec!["orgId"]);
+        assert_eq!(file.metadata, Metadata::default());
     }
 
     // --- error message tests ---

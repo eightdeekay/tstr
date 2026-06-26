@@ -238,26 +238,76 @@ does **not** mark the file skipped, so it never cascades to sibling files.
 > file, which cascaded and skipped every test in the group. `if` scopes the
 > conditional to just the statements that need it.
 
-### `disabled`
+### Metadata block
+
+Static, file-level directives live in a **metadata block** above the function
+block — `key: value` lines, like HTTP headers. No sigil; the value is the rest
+of the line, unquoted. Order is fixed: **metadata → optional param header →
+braced body.** Unknown keys are a hard error (a typo shouldn't silently no-op).
 
 ```
-disabled "I-123: API returns groupId not id, fix pending";
+requires: >= 0.5.3
+disabled: I-123: API returns groupId not id, fix pending
+blast-radius: 2
+
+a, b --> {
+  ...
+}
 ```
 
-Turns the **whole file off** — a known-broken test whose fix is postponed.
-Unlike `if` (which conditionally runs *part* of a file), `disabled` is
-unconditional, turns off the *whole* file, and carries a **mandatory
-reason**. The runner short-circuits before any statement executes — so the
-marker's position in the file is irrelevant, and no HTTP calls or assertions
-fire — and reports the file as a distinct **DISABLED** status (cyan), not a
-plain skip. `disabled` stays usable as an ordinary identifier everywhere it
-isn't followed by a quoted reason (`disabledCount = 0;` still parses).
+#### `requires:` — minimum tstr version
 
-List every disabled file and its reason without running anything:
+```
+requires: >= 0.5.3
+```
+
+A version constraint (`>=`, `>`, `=`, `<=`, `<`; a bare version means `>=`). If
+the running binary doesn't satisfy it, the file is reported **INCOMPATIBLE**
+(`needs >= 0.5.3, have 0.4.6`) and skipped — **not** a hard error, so a newer
+test on an older binary bails loudly instead of failing cryptically.
+
+#### `disabled:` — turn the whole file off
+
+```
+disabled: I-123: fix pending
+```
+
+A known-broken file whose fix is postponed. Unlike `if` (which conditionally
+runs *part* of a file), `disabled:` is unconditional and carries a **mandatory
+reason**. The runner short-circuits before any statement executes — no HTTP
+calls or assertions fire — and reports a distinct **DISABLED** status (cyan),
+not a plain skip. List every disabled file and its reason without running:
 
 ```bash
 tstr list --disabled
 ```
+
+#### `blast-radius:` — skip downstream collateral
+
+```
+blast-radius: 2
+```
+
+Declares how much *collateral* this file owns. When a file is `disabled:` **or**
+fails at runtime, its blast radius turns off the next tests in the leaf — the
+ones that depend on its **side effects** (a resource it created), which the
+input-cascade can't see because they declare no missing input. Collateral shows
+as `SKIP  blast-radius from <culprit>`, traceable to the cause.
+
+- `disabled:` + `blast-radius: N` → skip self **+** the next N tests.
+- a runtime **failure** + `blast-radius: N` → self reports **FAIL**, the next N **SKIP**.
+
+It's leaf-local and forward-only — it never reaches into child directories
+(which run concurrently) and cleanups still run. Value forms:
+
+| Form | Meaning |
+|------|---------|
+| `N` | the next N tests (saturates at the leaf's remaining count) |
+| `all` / `*` | every remaining test in the leaf |
+| `<=PREFIX` | through the first file whose name starts with `PREFIX`, inclusive (e.g. `<=05`, `<=create-org`) |
+
+This works because a leaf runs its tests **sequentially, in filename order** —
+so "the next N" is always well-defined and hasn't started yet.
 
 ## HTTP Requests
 
@@ -586,7 +636,7 @@ parallel speedup when one occurred.
 |---|---|
 | `--type ROLES` | comma-separated: `test`, `setup`, `cleanup`, `const`, `fetch`, `exporter`, `lib`, `all` (default: `test,setup,cleanup,const,fetch` — i.e. everything except `exporter` and `lib`) |
 | `--flat` | one path per line (for piping) |
-| `--disabled` | list only files turned off via a `disabled "reason"` marker, with each one's reason (ignores `--type`/`--flat`) |
+| `--disabled` | list only files turned off via a `disabled:` metadata marker, with each one's reason (ignores `--type`/`--flat`) |
 
 Example `list` output:
 
@@ -676,6 +726,18 @@ A file that takes no inputs skips the header and opens straight into its body:
 - **`return` is control flow, not output.** At a file's top level `return;` is
   void — it just halts execution; `return <value>` there is an error (use
   `export`). A *value* `return` belongs inside a lambda (the block's yield).
+- **Metadata sits above the block.** Optional `key: value` directives
+  (`requires:`, `disabled:`, `blast-radius:`) precede the param header — see
+  [Metadata block](#metadata-block).
+
+```
+disabled: I-123: fix pending
+blast-radius: 1
+
+a, b --> {
+  ... statements ...
+}
+```
 
 > Note: the block-collect arrow inside lambdas (`map({ x --> ... <-- v; })`) is a
 > separate construct and is unchanged. The legacy `_in.X` object is still seeded

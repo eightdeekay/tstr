@@ -66,30 +66,6 @@ fn if_stmt(input: &mut &str, source: &str) -> ModalResult<Statement> {
     Ok(Statement::If { condition, then_body, then_lines, else_body, else_lines })
 }
 
-/// Parse `disabled "reason";` — an unconditional file-off marker. The reason
-/// is mandatory (no anonymous disables). Backtracks if `disabled` is being
-/// used as an ordinary identifier (`disabledFlag = ...`, `disabled = x`, etc.)
-/// so it stays a usable variable name everywhere except this statement form.
-fn disabled_stmt(input: &mut &str) -> ModalResult<Statement> {
-    "disabled".parse_next(input)?;
-    // Must be followed by whitespace, else this is an identifier that merely
-    // starts with "disabled" (e.g. `disabledCount`). Backtrack to let the
-    // identifier/assignment parsers handle it.
-    let next = input.chars().next().unwrap_or('=');
-    if !next.is_whitespace() {
-        return Err(winnow::error::ErrMode::Backtrack(
-            winnow::error::ContextError::new(),
-        ));
-    }
-    ws.parse_next(input)?;
-    // A quoted reason string is required. If it's not here (e.g. `disabled = x`),
-    // quoted_string fails -> Backtrack -> alt rewinds to ident_statement.
-    let reason = quoted_string.map(String::from).parse_next(input)?;
-    ws.parse_next(input)?;
-    ';'.parse_next(input)?;
-    Ok(Statement::Disabled { reason })
-}
-
 /// Parse the optional `as <name>` alias that follows an export item. `as` is a
 /// keyword only here, and only when followed by whitespace — `asThing` stays a
 /// plain identifier.
@@ -531,7 +507,6 @@ fn statement_inner(input: &mut &str, source: &str) -> ModalResult<Statement> {
         // branches keep their plain `fn(&mut &str)` signature.
         |i: &mut &str| if_stmt(i, source),
         |i: &mut &str| retry_stmt(i, source),
-        disabled_stmt,
         export_stmt,
         return_stmt,
         js_block_stmt,
@@ -736,18 +711,10 @@ mod tests {
     }
 
     #[test]
-    fn test_disabled_stmt() {
-        let mut input = r#"disabled "I-123: auth refactor pending";"#;
-        let result = statement(&mut input).unwrap();
-        assert_eq!(result, Statement::Disabled {
-            reason: "I-123: auth refactor pending".to_string(),
-        });
-    }
-
-    #[test]
-    fn test_disabled_as_identifier_still_works() {
-        // `disabled` without a quoted reason is just an ordinary identifier:
-        // assignment target, field access, etc. must still parse.
+    fn test_disabled_is_an_ordinary_identifier() {
+        // The file-off marker now lives in the metadata block (`disabled:`), so
+        // `disabled` carries no special meaning in the body — it's a plain
+        // identifier: assignment target, field access, etc.
         let mut input = "disabledCount = 5;";
         let result = statement(&mut input).unwrap();
         assert!(matches!(result, Statement::Assignment { .. }));
@@ -755,15 +722,6 @@ mod tests {
         let mut input2 = "disabled = false;";
         let result2 = statement(&mut input2).unwrap();
         assert!(matches!(result2, Statement::Assignment { .. }));
-    }
-
-    #[test]
-    fn test_disabled_requires_reason() {
-        // No reason -> not a Disabled statement (falls through; bare `disabled;`
-        // becomes an expr statement that eval rejects as an undefined identifier).
-        let mut input = "disabled;";
-        let result = statement(&mut input).unwrap();
-        assert!(!matches!(result, Statement::Disabled { .. }));
     }
 
     #[test]

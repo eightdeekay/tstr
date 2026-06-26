@@ -11,6 +11,7 @@ const RED: &str = "\x1b[31m";
 const YELLOW: &str = "\x1b[33m";
 const DIM: &str = "\x1b[2m";
 const CYAN: &str = "\x1b[36m";
+const MAGENTA: &str = "\x1b[35m";
 const RESET: &str = "\x1b[0m";
 
 #[derive(Clone, Copy, PartialEq)]
@@ -216,7 +217,7 @@ enum Indicator {
     Pass,
     Fail,
     Skip,
-    /// Intentionally turned off via `disabled "reason"`. Rendered distinctly
+    /// Intentionally turned off via `disabled:`. Rendered distinctly
     /// from a conditional `Skip` so postponed-fix tests stay visible.
     Disabled,
 }
@@ -300,6 +301,8 @@ impl Printer {
         if let Some(ref mut f) = *log {
             let label = if result.disabled {
                 "DISABLED"
+            } else if result.incompatible {
+                "INCOMPATIBLE"
             } else if result.skipped {
                 "SKIP"
             } else if result.failures.is_empty() {
@@ -869,6 +872,12 @@ impl Printer {
             if self.mode != OutputMode::Quiet {
                 let reason = result.skip_reason.as_deref().unwrap_or("");
                 let _ = writeln!(out, "{}{CYAN}  DISABLED{RESET}  {}  {DIM}{}{RESET}",
+                    indent, result.name, reason);
+            }
+        } else if result.incompatible {
+            if self.mode != OutputMode::Quiet {
+                let reason = result.skip_reason.as_deref().unwrap_or("");
+                let _ = writeln!(out, "{}{MAGENTA}  INCOMPATIBLE{RESET}  {}  {DIM}{}{RESET}",
                     indent, result.name, reason);
             }
         } else if result.skipped {
