@@ -111,6 +111,13 @@ pub enum Commands {
         #[arg(long)]
         disabled: bool,
     },
+
+    /// Remove all run logs (the `logs/` dir and `tstr-last-run.log`) under the suite root
+    Clean {
+        /// Directory inside the suite (default: current directory)
+        #[arg(default_value = ".")]
+        target: String,
+    },
 }
 
 pub fn run(cli: Cli) {
@@ -128,6 +135,25 @@ pub fn run(cli: Cli) {
         Commands::List { target, ty, flat, disabled } => {
             list_command(&target, &ty, flat, disabled);
         }
+        Commands::Clean { target } => {
+            clean_command(&target);
+        }
+    }
+}
+
+/// `tstr clean` — remove the `logs/` directory and the `tstr-last-run.log`
+/// symlink under the suite root. The auto-prune on each run usually makes this
+/// unnecessary, but it's here to reclaim space or reset the run counter.
+fn clean_command(target: &str) {
+    let path = Path::new(target);
+    let start = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let root = discovery::find_root(&start);
+
+    let removed = crate::output::clean_run_logs(&root);
+    if removed == 0 {
+        println!("No run logs to clean under {}", root.display());
+    } else {
+        println!("Cleaned {} run log(s) under {}", removed, root.display());
     }
 }
 
@@ -299,7 +325,7 @@ fn run_command(
         OutputMode::Normal
     };
     let printer = Arc::new(Printer::new(mode, display.to_bar_style()));
-    printer.init_failure_log(&root);
+    printer.init_failure_log(&root, config.log_retention());
     if !warnings.is_empty() {
         printer.log_parse_errors(&warnings);
     }

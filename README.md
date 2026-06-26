@@ -89,6 +89,8 @@ defaults:
     - /opt/corp/tstr-libs
   display: bars
 
+log_retention: 10        # per-run logs to keep under <root>/logs/ (0 = keep all; default 10)
+
 constants:
   apiVersion: v4
   orgService:
@@ -609,6 +611,7 @@ providers' signing schemes, build the header yourself from `$.hmacSha256()`.
 ```
 tstr run [dir]                    # run the suite, or scope to a subdirectory (default: cwd)
 tstr list [target]                # per-directory tables of files visible
+tstr clean [dir]                  # remove the logs/ dir + tstr-last-run.log under the suite root
 tstr --config path/to/yaml ...    # explicit config (overrides project tstr.yaml)
 tstr --version
 ```
@@ -660,15 +663,23 @@ profile/sso-user/crud/tests
 
 ## Run Log
 
-`tstr-last-run.log` (in cwd) captures **every** test run, regardless of pass/fail and verbosity. Per-test entries include:
+Each run writes a numbered log under **`<suite-root>/logs/tstr-<NNNN>.log`** (not
+the current directory — so logs never litter wherever you happened to invoke
+`tstr`). A **`tstr-last-run.log`** symlink in the suite root always points at the
+most recent run. Every run is captured **regardless of pass/fail and verbosity**.
+Per-test entries include:
 
-- PASS / FAIL / SKIP label, test name, source path
+- PASS / FAIL / SKIP / DISABLED / INCOMPATIBLE label, test name, source path
 - HTTP endpoint that was called
 - All assertion failures (and runtime errors, with prior failures preserved)
 - A table of ambient variables in scope at file start: source, name, value (truncated)
 - `$.log()` messages
 
-The log holds only the most recent run — it's overwritten (truncated) at the start of every run.
+History is kept so you can compare runs (handy for intermittent failures). The
+`logs/` directory is auto-pruned to the most recent **10** runs by default — set
+`log_retention:` in `tstr.yaml` to change it (`0` keeps everything). A
+`logs/.gitignore` is created automatically so run logs aren't committed. `tstr
+clean` removes the whole `logs/` directory and the symlink.
 
 ## Failure Output
 

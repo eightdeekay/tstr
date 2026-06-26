@@ -14,6 +14,78 @@ const CYAN: &str = "\x1b[36m";
 const MAGENTA: &str = "\x1b[35m";
 const RESET: &str = "\x1b[0m";
 
+/// Every `tstr-<NNNN>.log` file in `dir`, as (number, path).
+fn existing_log_numbers(dir: &std::path::Path) -> Vec<(u64, std::path::PathBuf)> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if let Some(num) = name
+                .strip_prefix("tstr-")
+                .and_then(|s| s.strip_suffix(".log"))
+                .and_then(|n| n.parse::<u64>().ok())
+            {
+                out.push((num, e.path()));
+            }
+        }
+    }
+    out
+}
+
+/// The number for the next run: one past the highest existing log. Pruning only
+/// removes the lowest numbers, so the max is always the latest kept run.
+fn next_log_number(dir: &std::path::Path) -> u64 {
+    existing_log_numbers(dir).iter().map(|(n, _)| *n).max().unwrap_or(0) + 1
+}
+
+/// Point `<root>/tstr-last-run.log` at this run's log (relative target, so the
+/// link survives the suite being moved). No-op on platforms without symlinks.
+fn update_last_run_symlink(root: &std::path::Path, file_name: &str) {
+    let link = root.join("tstr-last-run.log");
+    let _ = std::fs::remove_file(&link); // replace any prior link/file
+    let target = std::path::Path::new("logs").join(file_name);
+    #[cfg(unix)]
+    {
+        let _ = std::os::unix::fs::symlink(&target, &link);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = &target; // no symlink support; leave only the numbered file
+    }
+}
+
+/// Delete all but the most recent `keep` run logs (by number).
+fn prune_logs(dir: &std::path::Path, keep: usize) {
+    let mut nums = existing_log_numbers(dir);
+    if nums.len() <= keep {
+        return;
+    }
+    nums.sort_by_key(|(n, _)| *n);
+    let remove = nums.len() - keep;
+    for (_, path) in nums.into_iter().take(remove) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Remove tstr's run-log artifacts under `root`: every `tstr-<NNNN>.log`, the
+/// `logs/.gitignore` we manage, and the `tstr-last-run.log` symlink — then the
+/// `logs/` dir itself, but only if it's left empty. Any non-tstr files in
+/// `logs/` are preserved. Returns how many numbered log files were removed.
+pub fn clean_run_logs(root: &std::path::Path) -> usize {
+    let logs_dir = root.join("logs");
+    let mut removed = 0;
+    for (_, path) in existing_log_numbers(&logs_dir) {
+        if std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    let _ = std::fs::remove_file(logs_dir.join(".gitignore"));
+    let _ = std::fs::remove_file(root.join("tstr-last-run.log"));
+    let _ = std::fs::remove_dir(&logs_dir); // succeeds only if now empty
+    removed
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum OutputMode {
     Interactive,
@@ -282,12 +354,34 @@ impl Printer {
             || self.matrix.lock().map(|s| s.initialized).unwrap_or(false)
     }
 
-    pub fn init_failure_log(&self, _root: &std::path::Path) {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let log_path = cwd.join("tstr-last-run.log");
+    /// Open this run's log under `<root>/logs/tstr-<NNNN>.log`, point the
+    /// `<root>/tstr-last-run.log` symlink at it, and prune to the most recent
+    /// `retention` runs (`0` = keep all). Logs go under the *suite root*, not the
+    /// process cwd, so they never litter wherever the command happened to run.
+    pub fn init_failure_log(&self, root: &std::path::Path, retention: usize) {
+        let logs_dir = root.join("logs");
+        if std::fs::create_dir_all(&logs_dir).is_err() {
+            return; // can't create the logs dir — run without a log file
+        }
+        // Keep run logs out of version control if the suite is under git.
+        let gitignore = logs_dir.join(".gitignore");
+        if !gitignore.exists() {
+            let _ = std::fs::write(&gitignore, "*\n");
+        }
+
+        // Next run number = highest existing + 1. Pruning removes the lowest
+        // numbers, so the max is always the latest kept run — no reuse, no
+        // separate counter needed.
+        let next = next_log_number(&logs_dir);
+        let file_name = format!("tstr-{:04}.log", next);
+        let log_path = logs_dir.join(&file_name);
         if let Ok(file) = std::fs::File::create(&log_path) {
             *self.failure_log.lock().unwrap() = Some(Box::new(file));
             *self.failure_log_path.lock().unwrap() = Some(log_path.to_string_lossy().to_string());
+            update_last_run_symlink(root, &file_name);
+            if retention > 0 {
+                prune_logs(&logs_dir, retention);
+            }
         }
     }
 
@@ -394,15 +488,6 @@ impl Printer {
     }
 
     /// Clean up the log file if there were no failures.
-    pub fn cleanup_log_on_success(&self) {
-        let count = *self.failure_count.lock().unwrap();
-        if count == 0 {
-            if let Some(ref path) = *self.failure_log_path.lock().unwrap() {
-                let _ = std::fs::remove_file(path);
-            }
-        }
-    }
-
     /// Register directories for interactive mode. Eagerly pre-assigns one
     /// slot per directory (sorted), capping at the terminal-height fit.
     /// Anything that doesn't fit is folded into a single "(and X more
@@ -1630,5 +1715,43 @@ fn write_summary_table(
         let src_str = src.as_deref().unwrap_or("?");
         let _ = writeln!(f, "  {:<sw$}  {:<nw$}  {}",
             src_str, name, truncate_value(value), sw = src_w, nw = name_w);
+    }
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+
+    #[test]
+    fn next_log_number_is_one_past_the_highest() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        assert_eq!(next_log_number(p), 1, "empty dir starts at 1");
+        std::fs::write(p.join("tstr-0001.log"), "").unwrap();
+        std::fs::write(p.join("tstr-0007.log"), "").unwrap();
+        std::fs::write(p.join(".gitignore"), "*\n").unwrap(); // non-log files ignored
+        assert_eq!(next_log_number(p), 8, "max(1,7) + 1");
+    }
+
+    #[test]
+    fn prune_keeps_the_most_recent_n() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        for n in 1..=5 {
+            std::fs::write(p.join(format!("tstr-{:04}.log", n)), "").unwrap();
+        }
+        prune_logs(p, 2);
+        let mut kept: Vec<u64> = existing_log_numbers(p).into_iter().map(|(n, _)| n).collect();
+        kept.sort();
+        assert_eq!(kept, vec![4, 5], "only the two highest-numbered logs survive");
+    }
+
+    #[test]
+    fn prune_is_a_noop_under_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        std::fs::write(p.join("tstr-0001.log"), "").unwrap();
+        prune_logs(p, 10);
+        assert_eq!(existing_log_numbers(p).len(), 1);
     }
 }

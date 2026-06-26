@@ -8,6 +8,29 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.5.2"></a>
+## [0.5.2] — 2026-06-26
+
+### Changed
+- **Run logs moved to `<suite-root>/logs/tstr-<NNNN>.log`.** They no longer drop
+  a `tstr-last-run.log` in whatever directory you happened to run from. Each run
+  gets its own zero-padded, incrementing numbered file, and a
+  `tstr-last-run.log` **symlink** in the suite root points at the most recent.
+  History is kept so you can compare runs (handy for intermittent failures).
+
+### Added
+- **Auto-prune of run logs.** `logs/` is pruned to the most recent **10** runs by
+  default; set `log_retention:` in `tstr.yaml` to change it (`0` keeps all). A
+  `logs/.gitignore` is written automatically so run logs aren't committed.
+- **`tstr clean [dir]`** — removes tstr's run-log artifacts (`tstr-*.log`, the
+  managed `.gitignore`, and the symlink) under the suite root. Surgical: it
+  preserves any non-tstr files and won't delete a non-empty `logs/` directory.
+
+### Fixed
+- A root-level `logs/` directory is now skipped by discovery, so it can't turn
+  the suite root into a non-leaf (which would otherwise trip the "tests live only
+  in leaf directories" rule on every run after the first).
+
 <a id="v0.5.1"></a>
 ## [0.5.1] — 2026-06-26
 

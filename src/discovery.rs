@@ -125,7 +125,7 @@ fn dir_has_tstr_files(dir: &Path) -> bool {
 /// Returns a Suite representing the root directory, or errors if any files fail to parse.
 pub fn discover(root: &Path) -> Result<Suite, Vec<String>> {
     let mut errors = Vec::new();
-    let suite = discover_dir(root, &mut errors, None, false);
+    let suite = discover_dir(root, &mut errors, None, false, true);
 
     if errors.is_empty() {
         Ok(suite)
@@ -141,13 +141,13 @@ pub fn discover(root: &Path) -> Result<Suite, Vec<String>> {
 /// (needed for scope). Sibling directories outside the target are skipped.
 pub fn discover_lenient(root: &Path) -> (Suite, Vec<String>) {
     let mut errors = Vec::new();
-    let suite = discover_dir(root, &mut errors, None, false);
+    let suite = discover_dir(root, &mut errors, None, false, true);
     (suite, errors)
 }
 
 pub fn discover_lenient_scoped(root: &Path, target: Option<&Path>) -> (Suite, Vec<String>) {
     let mut errors = Vec::new();
-    let suite = discover_dir(root, &mut errors, target, false);
+    let suite = discover_dir(root, &mut errors, target, false, true);
     (suite, errors)
 }
 
@@ -206,7 +206,7 @@ fn collect_leaf_scaffolding(suite: &Suite, root: &Path, out: &mut Vec<String>) {
 /// ancestor chain. Such a subtree isn't *dominated* by the target, but its libs
 /// still resolve into the target's scope (see `FileIndex::visible_libs`), so we
 /// traverse it and keep only its `.lib.tstr` files.
-fn discover_dir(dir: &Path, errors: &mut Vec<String>, target: Option<&Path>, lib_only: bool) -> Suite {
+fn discover_dir(dir: &Path, errors: &mut Vec<String>, target: Option<&Path>, lib_only: bool, is_root: bool) -> Suite {
     let mut entries = HashMap::new();
     let mut children = HashMap::new();
 
@@ -256,6 +256,14 @@ fn discover_dir(dir: &Path, errors: &mut Vec<String>, target: Option<&Path>, lib
                 .unwrap_or("")
                 .to_string();
 
+            // tstr's own run-log directory (`<root>/logs/`) is output, not part
+            // of the suite. Skip it so it doesn't turn the root into a non-leaf
+            // (which would trip the "tests live only in leaf dirs" rule) or get
+            // walked as a test directory.
+            if is_root && dir_name == "logs" {
+                continue;
+            }
+
             // Decide whether to descend, and in what mode.
             let child_lib_only = if lib_only {
                 // Already inside an ancestor lib/ subtree — keep descending
@@ -279,7 +287,7 @@ fn discover_dir(dir: &Path, errors: &mut Vec<String>, target: Option<&Path>, lib
                 false
             };
 
-            let child_suite = discover_dir(&path, errors, target, child_lib_only);
+            let child_suite = discover_dir(&path, errors, target, child_lib_only, false);
             children.insert(dir_name, child_suite);
         } else if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
             if filename.ends_with(".tstr") {
@@ -382,6 +390,24 @@ mod tests {
         ).unwrap();
 
         dir
+    }
+
+    #[test]
+    fn test_root_logs_dir_is_ignored() {
+        // tstr's own `logs/` under the suite root must not become a child suite —
+        // otherwise the root stops being a leaf and its tests trip the leaf rule.
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::write(root.join("01-a.test.tstr"), "{ 1 == 1 | \"ok\"; }\n").unwrap();
+        fs::create_dir(root.join("logs")).unwrap();
+        fs::write(root.join("logs/tstr-0001.log"), "old run\n").unwrap();
+
+        let (suite, _warnings) = discover_lenient(root);
+        assert!(suite.is_leaf(), "root must stay a leaf — logs/ should be skipped");
+        assert!(!suite.children.contains_key("logs"), "logs/ must not be a child suite");
+        assert!(suite.entries.contains_key("01-a"), "the actual test is still discovered");
+        // And the leaf-only-tests rule is satisfied (no violations).
+        assert!(check_leaf_only_tests(&suite, root).is_empty());
     }
 
     #[test]

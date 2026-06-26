@@ -20,7 +20,14 @@ pub struct Config {
     pub defaults: Defaults,
     #[serde(default)]
     pub constants: HashMap<String, serde_yaml::Value>,
+    /// How many per-run log files to keep under `<root>/logs/` (oldest pruned
+    /// after each run). Defaults to 10; `0` disables pruning (keep everything).
+    #[serde(default)]
+    pub log_retention: Option<usize>,
 }
+
+/// Default number of per-run log files kept under `<root>/logs/`.
+pub const DEFAULT_LOG_RETENTION: usize = 10;
 
 /// CLI flag defaults. Any flag tstr accepts may be defaulted here.
 /// Only fields needed by Slice 1 are present; future slices add more.
@@ -88,9 +95,17 @@ impl Config {
         if other.defaults.display.is_some() {
             self.defaults.display = other.defaults.display;
         }
+        if other.log_retention.is_some() {
+            self.log_retention = other.log_retention;
+        }
         for (k, v) in other.constants {
             self.constants.insert(k, v);
         }
+    }
+
+    /// Per-run log files to keep under `<root>/logs/`. `0` means keep all.
+    pub fn log_retention(&self) -> usize {
+        self.log_retention.unwrap_or(DEFAULT_LOG_RETENTION)
     }
 }
 
@@ -572,6 +587,7 @@ constants:
                 display: Some("auto".to_string()),
             },
             constants: HashMap::new(),
+            log_retention: None,
         };
         let b = Config {
             defaults: Defaults {
@@ -579,9 +595,11 @@ constants:
                 display: Some("bars".to_string()),
             },
             constants: HashMap::new(),
+            log_retention: Some(25),
         };
         a.merge(b);
         assert_eq!(a.defaults.import, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
         assert_eq!(a.defaults.display.as_deref(), Some("bars"));
+        assert_eq!(a.log_retention(), 25, "scalar override wins on merge");
     }
 }
