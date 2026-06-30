@@ -8,6 +8,18 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.6.3"></a>
+## [0.6.3] — 2026-06-30
+
+### Fixed
+- **Sequential `--repeat` now resets the interactive slot display each
+  iteration.** The first pass filled the bars; every later pass wrote past the
+  full bar and the status counter ran past its denominator (`Tests: 0/2
+  Passed: 6`). Each iteration now clears the boxes back to pending, zeroes the
+  live counters and the error panel, and re-fills — with an `Iter k/N` marker on
+  the status line so you can see which pass is running. Single runs (no
+  `--repeat`) are visually unchanged. Piped / `-q` output was never affected.
+
 <a id="v0.6.2"></a>
 ## [0.6.2] — 2026-06-30
 

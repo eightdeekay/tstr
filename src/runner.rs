@@ -143,8 +143,15 @@ pub fn run_repeated_sequential(
     opts: &RunOptions,
     printer: &Arc<Printer>,
 ) -> RunTotals {
+    // Show an `Iter k/N` marker on the slot display, and reset the boxes to
+    // all-pending before each pass after the first so every iteration animates
+    // fresh (no-ops outside Interactive mode).
+    printer.set_total_iterations(repeat);
     let mut totals = RunTotals::new();
-    for _ in 0..repeat {
+    for i in 0..repeat {
+        if i > 0 {
+            printer.reset_for_iteration(i + 1);
+        }
         totals.merge(run_structural(suite, index, cli_overrides, opts, printer));
     }
     totals

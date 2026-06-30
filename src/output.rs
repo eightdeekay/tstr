@@ -179,6 +179,10 @@ struct InteractiveState {
     /// Rolling buffer of recent failure messages, capped at panel_size.
     /// Each entry is the formatted "dir/name: message" line ready to draw.
     error_log: Vec<String>,
+    /// Current `--repeat` iteration (1-based) and the total. `total_iterations
+    /// == 1` means no `--repeat`, so the "Iter k/N" status marker is hidden.
+    iteration: usize,
+    total_iterations: usize,
     initialized: bool,
 }
 
@@ -280,6 +284,8 @@ struct StatusInfo {
     passed: usize,
     failed: usize,
     skipped: usize,
+    iteration: usize,
+    total_iterations: usize,
     lines_below_footer: usize,
 }
 
@@ -316,6 +322,8 @@ impl InteractiveState {
             panel_size: 0,
             panel_width: 0,
             error_log: Vec::new(),
+            iteration: 1,
+            total_iterations: 1,
             initialized: false,
         }
     }
@@ -618,8 +626,8 @@ impl Printer {
         }
 
         // Combined status line (was header + footer).
-        let _ = writeln!(out, "{DIM}Tests: 0/{}  Passed: 0  Failed: 0  Skipped: 0{RESET}",
-            state.total_tests);
+        let _ = writeln!(out, "{}{DIM}Tests: 0/{}  Passed: 0  Failed: 0  Skipped: 0{RESET}",
+            iter_marker(state.iteration, state.total_iterations), state.total_tests);
 
         // Errors panel (separator + N reserved lines, all initially blank).
         if panel_size > 0 {
@@ -749,6 +757,8 @@ impl Printer {
             passed: state.total_passed,
             failed: state.total_failed,
             skipped: state.total_skipped,
+            iteration: state.iteration,
+            total_iterations: state.total_iterations,
             lines_below_footer: Self::lines_below_footer(state),
         }
     }
@@ -783,8 +793,10 @@ impl Printer {
         let pass_color = if info.passed > 0 { GREEN } else { "" };
         let fail_color = if info.failed > 0 { RED } else { "" };
         let skip_color = if info.skipped > 0 { YELLOW } else { "" };
+        let iter = iter_marker(info.iteration, info.total_iterations);
         let _ = write!(out,
-            "{DIM}Tests: {}/{}{RESET}  {}Passed: {}{RESET}  {}Failed: {}{RESET}  {}Skipped: {}{RESET}",
+            "{}{DIM}Tests: {}/{}{RESET}  {}Passed: {}{RESET}  {}Failed: {}{RESET}  {}Skipped: {}{RESET}",
+            iter,
             info.completed, info.total,
             pass_color, info.passed,
             fail_color, info.failed,
@@ -850,6 +862,58 @@ impl Printer {
             if !state.initialized {
                 return;
             }
+            let slots: Vec<SlotDrawInfo> = (0..state.num_slots)
+                .map(|i| self.gather_slot_draw_info(&state, i))
+                .collect();
+            let status = self.gather_status_info(&state);
+            let panel = self.gather_panel_snapshot(&state);
+            (slots, status, panel)
+        };
+        for info in &slot_infos {
+            self.draw_slot(info);
+        }
+        self.draw_status(status_info);
+        self.draw_errors(&panel_snapshot);
+    }
+
+    /// Tell the slot display how many `--repeat` iterations are coming, so the
+    /// status line can show an `Iter k/N` marker. Call once before the run; a
+    /// value of 1 (the default) keeps the marker hidden.
+    pub fn set_total_iterations(&self, n: usize) {
+        if self.mode != OutputMode::Interactive {
+            return;
+        }
+        self.interactive.lock().unwrap().total_iterations = n;
+    }
+
+    /// Reset the slot display for the next sequential `--repeat` iteration:
+    /// every slot back to all-pending, live counters and the error panel
+    /// zeroed, the `Iter k/N` marker bumped — then redraw in place. The next
+    /// iteration's `record_test` calls re-fill the boxes from scratch, so each
+    /// pass animates fresh instead of writing past a full bar.
+    pub fn reset_for_iteration(&self, iteration: usize) {
+        if self.mode != OutputMode::Interactive {
+            return;
+        }
+        let (slot_infos, status_info, panel_snapshot) = {
+            let mut state = self.interactive.lock().unwrap();
+            if !state.initialized {
+                return;
+            }
+            for slot in &mut state.slots {
+                for ind in &mut slot.indicators {
+                    *ind = Indicator::Pending;
+                }
+                slot.completed = 0;
+            }
+            state.total_passed = 0;
+            state.total_failed = 0;
+            state.total_skipped = 0;
+            state.remaining_dirs = state.total_dirs;
+            state.remaining_tests = state.total_tests;
+            state.error_log.clear();
+            state.iteration = iteration;
+
             let slots: Vec<SlotDrawInfo> = (0..state.num_slots)
                 .map(|i| self.gather_slot_draw_info(&state, i))
                 .collect();
@@ -1447,6 +1511,16 @@ impl Printer {
 /// outcome (any fail → red, else any skip → yellow, else green). Buckets
 /// with no completed tests render as a dim shaded block. After the bar, a
 /// trailing "  N/T" counter shows aggregate progress.
+/// The `Iter k/N  ` prefix shown on the status line during `--repeat`. Empty
+/// when there's only one iteration (no `--repeat`), so normal runs are unchanged.
+fn iter_marker(iteration: usize, total_iterations: usize) -> String {
+    if total_iterations > 1 {
+        format!("{DIM}Iter {}/{}{RESET}  ", iteration, total_iterations)
+    } else {
+        String::new()
+    }
+}
+
 fn write_slot_row(out: &mut Box<dyn Write + Send>, info: &SlotDrawInfo) {
     let path = match info.path.as_deref() {
         Some(p) => p,
