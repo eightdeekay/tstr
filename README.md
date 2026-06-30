@@ -675,7 +675,7 @@ profile/sso-user/crud
 
 ## Output Modes
 
-- **Interactive** (default in terminal) — one slot row per top-level directory (or per child of the target when scoped). Per-test glyphs (`✓✗-·`) when there's room, or a colored bucketed bar otherwise — gradient hue from green (all pass) through yellow (skip-leaning) to red (all fail). `--display=bars` forces bars on short rows.
+- **Interactive** (default in terminal) — one slot row per top-level directory (or per child of the target when scoped). Per-test glyphs (`✓✗-·`) when there's room, or a colored bucketed bar otherwise — gradient hue from green (all pass) through yellow (skip-leaning) to red (all fail). `--display=bars` forces bars on short rows. Under sequential `--repeat`, the slots reset to all-pending at the start of each pass (so every iteration animates fresh) and the status line carries an `Iter k/N` marker.
 - **Normal** (piped / non-interactive) — one streamed line per file: PASS / FAIL / SKIP / DISABLED / INCOMPATIBLE, plus LOAD when a `const` file loads.
 - **Verbose** — streaming + timing, scope changes, log output.
 - **Quiet** (`-q`) — only summary and failures.

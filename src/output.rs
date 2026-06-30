@@ -625,9 +625,19 @@ impl Printer {
                 hidden);
         }
 
-        // Combined status line (was header + footer).
-        let _ = writeln!(out, "{}{DIM}Tests: 0/{}  Passed: 0  Failed: 0  Skipped: 0{RESET}",
-            iter_marker(state.iteration, state.total_iterations), state.total_tests);
+        // Combined status line (was header + footer). Same renderer as the live
+        // updates, so the initial line can never drift from them.
+        let init_status = StatusInfo {
+            completed: 0,
+            total: state.total_tests,
+            passed: 0,
+            failed: 0,
+            skipped: 0,
+            iteration: state.iteration,
+            total_iterations: state.total_iterations,
+            lines_below_footer: 0,
+        };
+        let _ = writeln!(out, "{}", render_status_line(&init_status));
 
         // Errors panel (separator + N reserved lines, all initially blank).
         if panel_size > 0 {
@@ -790,17 +800,7 @@ impl Printer {
         let mut out = self.out.lock().unwrap();
         let lines_from_bottom = 1 + info.lines_below_footer;
         let _ = write!(out, "\x1b[{}A\r\x1b[2K", lines_from_bottom);
-        let pass_color = if info.passed > 0 { GREEN } else { "" };
-        let fail_color = if info.failed > 0 { RED } else { "" };
-        let skip_color = if info.skipped > 0 { YELLOW } else { "" };
-        let iter = iter_marker(info.iteration, info.total_iterations);
-        let _ = write!(out,
-            "{}{DIM}Tests: {}/{}{RESET}  {}Passed: {}{RESET}  {}Failed: {}{RESET}  {}Skipped: {}{RESET}",
-            iter,
-            info.completed, info.total,
-            pass_color, info.passed,
-            fail_color, info.failed,
-            skip_color, info.skipped);
+        let _ = write!(out, "{}", render_status_line(&info));
         let _ = write!(out, "\n");
         if lines_from_bottom > 1 {
             let _ = write!(out, "\x1b[{}B", lines_from_bottom - 1);
@@ -1522,15 +1522,25 @@ fn iter_marker(iteration: usize, total_iterations: usize) -> String {
 }
 
 fn write_slot_row(out: &mut Box<dyn Write + Send>, info: &SlotDrawInfo) {
+    let _ = write!(out, "{}", render_slot_row(info));
+}
+
+/// Pure renderer for one slot row — the bar/glyph region plus the trailing
+/// `done/total` counter. Returns the full line as a `String` (ANSI colors
+/// included) with no cursor movement, so it's unit-testable without a terminal.
+fn render_slot_row(info: &SlotDrawInfo) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+
     let path = match info.path.as_deref() {
         Some(p) => p,
         None => {
-            let _ = write!(out, "{DIM}  (idle){RESET}");
-            return;
+            s.push_str(&format!("{DIM}  (idle){RESET}"));
+            return s;
         }
     };
 
-    let _ = write!(out, "{:<width$} [", path, width = info.col_width);
+    let _ = write!(s, "{:<width$} [", path, width = info.col_width);
 
     let use_glyphs = matches!(info.bar_style, BarStyle::Auto) && info.count <= info.bar_width;
     if use_glyphs {
@@ -1538,11 +1548,11 @@ fn write_slot_row(out: &mut Box<dyn Write + Send>, info: &SlotDrawInfo) {
         // dir's bar should read as full, not 70%-full with a dim tail.
         for ind in &info.indicators {
             match ind {
-                Indicator::Pending => { let _ = write!(out, "{DIM}·{RESET}"); }
-                Indicator::Pass => { let _ = write!(out, "{GREEN}✓{RESET}"); }
-                Indicator::Fail => { let _ = write!(out, "{RED}✗{RESET}"); }
-                Indicator::Skip => { let _ = write!(out, "{YELLOW}-{RESET}"); }
-                Indicator::Disabled => { let _ = write!(out, "{CYAN}▢{RESET}"); }
+                Indicator::Pending => { let _ = write!(s, "{DIM}·{RESET}"); }
+                Indicator::Pass => { let _ = write!(s, "{GREEN}✓{RESET}"); }
+                Indicator::Fail => { let _ = write!(s, "{RED}✗{RESET}"); }
+                Indicator::Skip => { let _ = write!(s, "{YELLOW}-{RESET}"); }
+                Indicator::Disabled => { let _ = write!(s, "{CYAN}▢{RESET}"); }
             }
         }
     } else {
@@ -1567,7 +1577,7 @@ fn write_slot_row(out: &mut Box<dyn Write + Send>, info: &SlotDrawInfo) {
                     ((ch + 1) * count) / bar_w
                 };
                 if start >= end {
-                    let _ = write!(out, "{DIM}░{RESET}");
+                    let _ = write!(s, "{DIM}░{RESET}");
                     continue;
                 }
                 let bucket = &info.indicators[start..end];
@@ -1585,10 +1595,10 @@ fn write_slot_row(out: &mut Box<dyn Write + Send>, info: &SlotDrawInfo) {
                     }
                 }
                 if pending == bucket.len() {
-                    let _ = write!(out, "{DIM}░{RESET}");
+                    let _ = write!(s, "{DIM}░{RESET}");
                 } else {
                     let color = bucket_color(pass, fail, skip);
-                    let _ = write!(out, "{}█{RESET}", color);
+                    let _ = write!(s, "{}█{RESET}", color);
                 }
             }
         } else {
@@ -1597,11 +1607,11 @@ fn write_slot_row(out: &mut Box<dyn Write + Send>, info: &SlotDrawInfo) {
                 let test_idx = (ch * count) / bar_w;
                 let ind = info.indicators.get(test_idx).copied().unwrap_or(Indicator::Pending);
                 match ind {
-                    Indicator::Pending => { let _ = write!(out, "{DIM}░{RESET}"); }
-                    Indicator::Pass => { let _ = write!(out, "{GREEN}█{RESET}"); }
-                    Indicator::Fail => { let _ = write!(out, "{RED}█{RESET}"); }
-                    Indicator::Skip => { let _ = write!(out, "{YELLOW}█{RESET}"); }
-                    Indicator::Disabled => { let _ = write!(out, "{CYAN}█{RESET}"); }
+                    Indicator::Pending => { let _ = write!(s, "{DIM}░{RESET}"); }
+                    Indicator::Pass => { let _ = write!(s, "{GREEN}█{RESET}"); }
+                    Indicator::Fail => { let _ = write!(s, "{RED}█{RESET}"); }
+                    Indicator::Skip => { let _ = write!(s, "{YELLOW}█{RESET}"); }
+                    Indicator::Disabled => { let _ = write!(s, "{CYAN}█{RESET}"); }
                 }
             }
         }
@@ -1611,10 +1621,29 @@ fn write_slot_row(out: &mut Box<dyn Write + Send>, info: &SlotDrawInfo) {
     let completed: usize = info.indicators.iter()
         .filter(|i| !matches!(i, Indicator::Pending))
         .count();
-    let _ = write!(out, "] {DIM}{}/{}{RESET}", completed, info.count);
+    let _ = write!(s, "] {DIM}{}/{}{RESET}", completed, info.count);
     // Failures are routed to the dedicated errors panel below the
     // footer — keeping them off the row prevents the line-wrap that
     // corrupts the cursor-driven redraw.
+    s
+}
+
+/// Pure renderer for the status line — the `Iter k/N` marker (when repeating)
+/// plus the `Tests/Passed/Failed/Skipped` tallies. No cursor movement, so it's
+/// unit-testable. Both `draw_status` and the initial draw route through here, so
+/// there's a single source of truth for the line's shape.
+fn render_status_line(info: &StatusInfo) -> String {
+    let pass_color = if info.passed > 0 { GREEN } else { "" };
+    let fail_color = if info.failed > 0 { RED } else { "" };
+    let skip_color = if info.skipped > 0 { YELLOW } else { "" };
+    format!(
+        "{}{DIM}Tests: {}/{}{RESET}  {}Passed: {}{RESET}  {}Failed: {}{RESET}  {}Skipped: {}{RESET}",
+        iter_marker(info.iteration, info.total_iterations),
+        info.completed, info.total,
+        pass_color, info.passed,
+        fail_color, info.failed,
+        skip_color, info.skipped,
+    )
 }
 
 /// Format one entry for the errors panel, sized to fit `max_width`
@@ -1827,5 +1856,133 @@ mod log_tests {
         std::fs::write(p.join("tstr-0001.log"), "").unwrap();
         prune_logs(p, 10);
         assert_eq!(existing_log_numbers(p).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+
+    /// Strip the simple `\x1b[…m` color codes we emit so assertions can compare
+    /// against the visible text. (We only ever emit SGR `m` sequences.)
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for n in chars.by_ref() {
+                    if n == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    fn slot(indicators: Vec<Indicator>, count: usize, bar_width: usize, style: BarStyle) -> SlotDrawInfo {
+        SlotDrawInfo {
+            slot_idx: 0,
+            num_slots: 1,
+            col_width: 4, // "crud" is 4 wide, so no extra pad
+            bar_width,
+            overflow_lines: 0,
+            lines_below_footer: 0,
+            bar_style: style,
+            path: Some("crud".to_string()),
+            count,
+            indicators,
+        }
+    }
+
+    fn rendered(info: &SlotDrawInfo) -> String {
+        strip_ansi(&render_slot_row(info))
+    }
+
+    #[test]
+    fn idle_slot_renders_idle() {
+        let mut info = slot(vec![], 0, 10, BarStyle::Auto);
+        info.path = None;
+        assert_eq!(rendered(&info).trim(), "(idle)");
+    }
+
+    #[test]
+    fn glyph_row_all_pass() {
+        use Indicator::*;
+        let info = slot(vec![Pass, Pass, Pass], 3, 10, BarStyle::Auto);
+        // 1:1 glyphs (count <= bar_width, Auto), counter shows 3/3 done.
+        assert_eq!(rendered(&info), "crud [✓✓✓] 3/3");
+    }
+
+    #[test]
+    fn glyph_row_mixed_outcomes_and_counter() {
+        use Indicator::*;
+        // One of each. Counter counts every non-pending cell (4 of 5).
+        let info = slot(vec![Pending, Pass, Fail, Skip, Disabled], 5, 10, BarStyle::Auto);
+        assert_eq!(rendered(&info), "crud [·✓✗-▢] 4/5");
+    }
+
+    #[test]
+    fn bars_style_forces_blocks_even_when_glyphs_would_fit() {
+        use Indicator::*;
+        // BarStyle::Bars → block bar, not glyphs, stretched to full bar_width.
+        let info = slot(vec![Pass, Pass, Pass], 3, 10, BarStyle::Bars);
+        assert_eq!(rendered(&info), "crud [██████████] 3/3");
+    }
+
+    #[test]
+    fn bucketed_when_count_exceeds_bar_width() {
+        use Indicator::*;
+        // 20 tests into a 5-wide bar → 5 bucketed block chars, counter 20/20.
+        let info = slot(vec![Pass; 20], 20, 5, BarStyle::Auto);
+        assert_eq!(rendered(&info), "crud [█████] 20/20");
+    }
+
+    #[test]
+    fn all_pending_bucket_renders_empty_block() {
+        use Indicator::*;
+        // A wholly-pending bucketed bar shows the dim ░ placeholder, 0 done.
+        let info = slot(vec![Pending; 20], 20, 5, BarStyle::Auto);
+        assert_eq!(rendered(&info), "crud [░░░░░] 0/20");
+    }
+
+    #[test]
+    fn wide_bar_for_concurrent_repeat_shape() {
+        use Indicator::*;
+        // Previews the concurrent-repeat layout: a slot sized tests*repeat
+        // (here 5 tests * 2 = 10) renders one glyph per cell and counts them all.
+        let info = slot(vec![Pass; 10], 10, 10, BarStyle::Auto);
+        assert_eq!(rendered(&info), "crud [✓✓✓✓✓✓✓✓✓✓] 10/10");
+    }
+
+    fn status(
+        completed: usize, total: usize, passed: usize, failed: usize, skipped: usize,
+        iteration: usize, total_iterations: usize,
+    ) -> StatusInfo {
+        StatusInfo { completed, total, passed, failed, skipped, iteration, total_iterations, lines_below_footer: 0 }
+    }
+
+    #[test]
+    fn status_line_has_no_iter_marker_for_a_single_run() {
+        let line = strip_ansi(&render_status_line(&status(2, 5, 2, 0, 0, 1, 1)));
+        assert!(!line.contains("Iter"), "single run should have no Iter marker: {:?}", line);
+        assert_eq!(line, "Tests: 2/5  Passed: 2  Failed: 0  Skipped: 0");
+    }
+
+    #[test]
+    fn status_line_shows_iter_marker_when_repeating() {
+        let line = strip_ansi(&render_status_line(&status(1, 2, 1, 0, 0, 2, 3)));
+        assert_eq!(line, "Iter 2/3  Tests: 1/2  Passed: 1  Failed: 0  Skipped: 0");
+    }
+
+    #[test]
+    fn status_line_reports_each_tally() {
+        let line = strip_ansi(&render_status_line(&status(4, 6, 3, 1, 0, 1, 1)));
+        assert!(line.contains("Tests: 4/6"));
+        assert!(line.contains("Passed: 3"));
+        assert!(line.contains("Failed: 1"));
+        assert!(line.contains("Skipped: 0"));
     }
 }

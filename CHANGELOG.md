@@ -8,6 +8,22 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.6.4"></a>
+## [0.6.4] — 2026-06-30
+
+### Changed
+- **Slot-display rendering is now pure and unit-tested.** The bar/glyph row and
+  the status line were extracted into `render_slot_row` / `render_status_line`
+  (returning `String`); `write_slot_row`, `draw_status`, and the initial draw all
+  route through them, so the live display and its tests share one source of truth.
+  No visible change. Adds 10 tests covering glyph rows, bucketed bars, forced
+  bars mode, all-pending placeholders, the `tests × repeat` wide layout, and the
+  `Iter k/N` marker — the first real coverage of the progress display.
+
+### Docs
+- README: documented that sequential `--repeat` resets the slot display each
+  pass and shows an `Iter k/N` marker (the 0.6.3 behavior).
+
 <a id="v0.6.3"></a>
 ## [0.6.3] — 2026-06-30
 
