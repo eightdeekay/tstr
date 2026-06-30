@@ -8,6 +8,26 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.6.2"></a>
+## [0.6.2] — 2026-06-30
+
+`--repeat N` is implemented — it used to warn ("not yet supported") and run once.
+
+### Added
+- **`--repeat N`** runs the whole suite N times, accumulating totals across
+  iterations (the summary shows `(N iterations x M tests)`). Its main use is
+  surfacing flaky/intermittent failures.
+- **`--repeat-mode <sequential|concurrent>`** chooses how the iterations run:
+  - `sequential` (default) — one pass after another. Safe; never races a suite
+    against copies of itself.
+  - `concurrent` — N independent passes at once (via rayon). Requires a suite
+    that tolerates copies of itself (no colliding fixed-name resources). Output
+    drops to summary-only, since per-test slots/streaming can't represent N
+    overlapping runs.
+- **`defaults.repeat_mode`** in `tstr.yaml` — a suite declares its own repeat
+  safety. Precedence: `--repeat-mode` flag → suite config → `sequential`. An
+  unrecognized config value warns and falls back to sequential.
+
 <a id="v0.6.1"></a>
 ## [0.6.1] — 2026-06-30
 

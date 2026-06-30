@@ -42,6 +42,28 @@ impl DisplayMode {
     }
 }
 
+/// How `--repeat N` runs the suite.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RepeatMode {
+    /// Run the suite N times, one pass after another (safe default).
+    Sequential,
+    /// Run N independent passes at once — requires a suite that tolerates
+    /// concurrent copies of itself (no colliding fixed-name resources).
+    Concurrent,
+}
+
+impl RepeatMode {
+    /// Parse the `repeat_mode:` config string. Unrecognized values yield `None`
+    /// (the caller warns and falls back).
+    fn from_config(s: &str) -> Option<RepeatMode> {
+        match s.trim().to_lowercase().as_str() {
+            "sequential" | "seq" => Some(RepeatMode::Sequential),
+            "concurrent" | "parallel" => Some(RepeatMode::Concurrent),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub enum Commands {
     /// Run tests
@@ -62,9 +84,15 @@ pub enum Commands {
         #[arg(long)]
         stop_on_error: bool,
 
-        /// Run the entire suite N times concurrently
+        /// Run the entire suite N times (see --repeat-mode for how)
         #[arg(long, default_value = "1", value_name = "N")]
         repeat: usize,
+
+        /// How --repeat runs: `sequential` (one pass after another) or
+        /// `concurrent` (N overlapping passes). Overrides the suite's
+        /// `defaults.repeat_mode`; unset falls back to it, then to sequential.
+        #[arg(long, value_enum, value_name = "MODE")]
+        repeat_mode: Option<RepeatMode>,
 
         /// HTTP request timeout in seconds (per-request). 0 disables the timeout.
         #[arg(long, default_value = "60", value_name = "SECONDS")]
@@ -123,14 +151,14 @@ pub enum Commands {
 pub fn run(cli: Cli) {
     let config_override = cli.config.clone();
     match cli.command {
-        Commands::Run { target, url, set, stop_on_error, repeat, timeout, verbose, quiet, display, jobs } => {
+        Commands::Run { target, url, set, stop_on_error, repeat, repeat_mode, timeout, verbose, quiet, display, jobs } => {
             crate::http::set_timeout(timeout);
             // Size the global rayon pool before any parallel work. Default
             // (jobs == 0) leaves rayon's CPU-count default in place.
             if jobs > 0 {
                 let _ = rayon::ThreadPoolBuilder::new().num_threads(jobs).build_global();
             }
-            run_command(&target, url, set, stop_on_error, repeat, verbose, quiet, display, config_override);
+            run_command(&target, url, set, stop_on_error, repeat, repeat_mode, verbose, quiet, display, config_override);
         }
         Commands::List { target, ty, flat, disabled } => {
             list_command(&target, &ty, flat, disabled);
@@ -215,6 +243,7 @@ fn run_command(
     set_vars: Vec<String>,
     stop_on_error: bool,
     repeat: usize,
+    repeat_mode: Option<RepeatMode>,
     verbose: bool,
     quiet: bool,
     display: DisplayMode,
@@ -315,15 +344,34 @@ fn run_command(
         process::exit(1);
     }
 
+    // Resolve how --repeat runs: CLI flag wins, else the suite's config, else
+    // sequential. An unrecognized config value warns and falls back.
+    let effective_repeat_mode = repeat_mode.or_else(|| {
+        config.defaults.repeat_mode.as_deref().and_then(|s| {
+            let parsed = RepeatMode::from_config(s);
+            if parsed.is_none() {
+                eprintln!("warning: unknown repeat_mode '{}' in config \
+                    (use sequential|concurrent); using sequential", s);
+            }
+            parsed
+        })
+    }).unwrap_or(RepeatMode::Sequential);
+    let concurrent_repeat = repeat > 1 && effective_repeat_mode == RepeatMode::Concurrent;
+
     let mode = if quiet {
         OutputMode::Quiet
+    } else if concurrent_repeat {
+        // N overlapping passes can't be represented by per-test slots/streaming
+        // (the lines would interleave) — fall back to summary-only. -q is implied;
+        // -v still surfaces streamed failures.
+        if verbose { OutputMode::Verbose } else { OutputMode::Quiet }
     } else if verbose {
         OutputMode::Verbose
     } else if is_tty {
         OutputMode::Interactive
     } else if repeat > 1 {
-        // Non-interactive --repeat: don't stream per-test FAIL/PASS for every
-        // iteration (would be N times the noise). Quiet by default; -v overrides.
+        // Non-interactive sequential --repeat: don't stream per-test FAIL/PASS for
+        // every iteration (would be N times the noise). Quiet by default; -v overrides.
         OutputMode::Quiet
     } else {
         OutputMode::Normal
@@ -355,11 +403,14 @@ fn run_command(
         constants,
     };
 
-    if repeat != 1 {
-        eprintln!("warning: --repeat is not yet supported; running once");
-    }
     let run_start = std::time::Instant::now();
-    let totals = runner::run_structural(&suite_for_structural, &index, &overrides, &opts, &printer);
+    let totals = if repeat == 1 {
+        runner::run_structural(&suite_for_structural, &index, &overrides, &opts, &printer)
+    } else if concurrent_repeat {
+        runner::run_repeated_concurrent(repeat, &suite_for_structural, &index, &overrides, &opts, &printer)
+    } else {
+        runner::run_repeated_sequential(repeat, &suite_for_structural, &index, &overrides, &opts, &printer)
+    };
     printer.set_wall_clock(run_start.elapsed());
 
     // Append the variable summary block(s) to the log

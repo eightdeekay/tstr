@@ -37,6 +37,11 @@ pub struct Defaults {
     pub import: Vec<PathBuf>,
     #[serde(default)]
     pub display: Option<String>,
+    /// How `--repeat N` runs the suite: `sequential` (one pass after another) or
+    /// `concurrent` (N overlapping passes). A suite declares its own safety here;
+    /// `--repeat-mode` on the CLI overrides it. Unset → sequential.
+    #[serde(default)]
+    pub repeat_mode: Option<String>,
 }
 
 impl Config {
@@ -94,6 +99,9 @@ impl Config {
         self.defaults.import.extend(other.defaults.import);
         if other.defaults.display.is_some() {
             self.defaults.display = other.defaults.display;
+        }
+        if other.defaults.repeat_mode.is_some() {
+            self.defaults.repeat_mode = other.defaults.repeat_mode;
         }
         if other.log_retention.is_some() {
             self.log_retention = other.log_retention;
@@ -585,6 +593,7 @@ constants:
             defaults: Defaults {
                 import: vec![PathBuf::from("/a")],
                 display: Some("auto".to_string()),
+                repeat_mode: None,
             },
             constants: HashMap::new(),
             log_retention: None,
@@ -593,6 +602,7 @@ constants:
             defaults: Defaults {
                 import: vec![PathBuf::from("/b")],
                 display: Some("bars".to_string()),
+                repeat_mode: Some("concurrent".to_string()),
             },
             constants: HashMap::new(),
             log_retention: Some(25),
@@ -600,6 +610,8 @@ constants:
         a.merge(b);
         assert_eq!(a.defaults.import, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
         assert_eq!(a.defaults.display.as_deref(), Some("bars"));
+        assert_eq!(a.defaults.repeat_mode.as_deref(), Some("concurrent"),
+            "repeat_mode scalar override wins on merge");
         assert_eq!(a.log_retention(), 25, "scalar override wins on merge");
     }
 }

@@ -130,6 +130,51 @@ pub fn run_structural(
     totals
 }
 
+/// Run the whole suite `repeat` times, one pass after another, summing the
+/// per-iteration totals. Each iteration is an independent pass (setups re-run,
+/// resources get re-created) — the same as invoking `tstr` N times in a row.
+/// This is the safe default: it can't race a suite against copies of itself.
+/// Its value is surfacing flaky/intermittent failures.
+pub fn run_repeated_sequential(
+    repeat: usize,
+    suite: &Suite,
+    index: &FileIndex,
+    cli_overrides: &HashMap<String, Value>,
+    opts: &RunOptions,
+    printer: &Arc<Printer>,
+) -> RunTotals {
+    let mut totals = RunTotals::new();
+    for _ in 0..repeat {
+        totals.merge(run_structural(suite, index, cli_overrides, opts, printer));
+    }
+    totals
+}
+
+/// Run the whole suite `repeat` times **concurrently** — N independent passes
+/// at once, fanned out over rayon (nesting cleanly under each pass's own
+/// per-directory parallelism). The suite must tolerate copies of itself running
+/// in parallel: no fixed-name resources that collide (two passes both creating
+/// `test-tag`), no teardown that yanks another pass's data. A suite that can't
+/// should run sequentially. Output is summary-only — per-test slots/streaming
+/// can't sensibly represent N overlapping runs (the caller forces Quiet).
+pub fn run_repeated_concurrent(
+    repeat: usize,
+    suite: &Suite,
+    index: &FileIndex,
+    cli_overrides: &HashMap<String, Value>,
+    opts: &RunOptions,
+    printer: &Arc<Printer>,
+) -> RunTotals {
+    use rayon::prelude::*;
+    (0..repeat)
+        .into_par_iter()
+        .map(|_| run_structural(suite, index, cli_overrides, opts, printer))
+        .reduce(RunTotals::new, |mut a, b| {
+            a.merge(b);
+            a
+        })
+}
+
 /// Count non-const files per display slot (immediate child of `display_root`,
 /// or "(root)" for files directly under it). Sizes the slot progress bars.
 fn compute_slot_totals(

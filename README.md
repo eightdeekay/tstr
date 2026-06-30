@@ -88,6 +88,8 @@ defaults:
     - ~/.tstr/shared-libs
     - /opt/corp/tstr-libs
   display: bars
+  repeat_mode: concurrent # how `--repeat N` runs: sequential (default) or concurrent.
+                          # Declares the suite's own safety; --repeat-mode overrides it.
 
 log_retention: 10        # per-run logs to keep under <root>/logs/ (0 = keep all; default 10)
 
@@ -629,6 +631,8 @@ tstr --version
 |---|---|
 | `--url <base>` | shorthand for `--set urlPrefix=<base>` |
 | `--set 'KEY=VALUE'` | set an ambient variable (repeatable) |
+| `--repeat <N>` | run the whole suite N times (default `1`). Totals accumulate across iterations; the summary shows `(N iterations x M tests)`. |
+| `--repeat-mode <sequential\|concurrent>` | how `--repeat` runs. `sequential` (default) does one pass after another — safe, good for flushing out flaky failures. `concurrent` runs N overlapping passes at once (requires a suite that tolerates copies of itself; output drops to summary-only). Overrides the suite's `defaults.repeat_mode`. |
 | `--display auto\|bars` | slot-display style (`bars` forces colored bucketed bar) |
 | `--timeout <SECONDS>` | per-request HTTP timeout (default: `60`). `0` disables the timeout. |
 | `-j` / `--jobs <N>` | max concurrent worker threads (default: CPU count). HTTP work is I/O-bound — each blocking request parks a worker — so a value well above CPU count often raises throughput. `-j 1` forces serial. |
@@ -712,7 +716,6 @@ clean` removes the whole `logs/` directory and the symlink.
 
 Tracked here for visibility; none are blockers:
 
-- **`--repeat N`** — not yet rewired through the structural runner. Single-run only for now.
 - **`--stop-on-error`** — accepted but not propagated.
 - **`run` scoping is directory-only.** `tstr run path/to/sub` scopes the run to
   that subdirectory; a non-directory target is an error. There is no name/glob
