@@ -29,7 +29,7 @@ tstr list --disabled              # disabled tests + their reasons
 
 **Execution rules:**
 
-- Phases run in order across the whole suite: const → setup → test → cleanup
+- Within each directory, phases run in order: const → setup → test → cleanup. It's not one global sweep — a directory's children run in parallel *between* its setup and its tests, so a child's tests can run while the parent sits between phases.
 - Within a phase + within a directory: files run in **lex order**
 - Within a directory: sequential (no in-dir parallelism)
 - Across sibling directories: parallel (rayon work-stealing pool; `-j N` or `RAYON_NUM_THREADS` to tune)
@@ -672,7 +672,7 @@ profile/sso-user/crud
 ## Output Modes
 
 - **Interactive** (default in terminal) — one slot row per top-level directory (or per child of the target when scoped). Per-test glyphs (`✓✗-·`) when there's room, or a colored bucketed bar otherwise — gradient hue from green (all pass) through yellow (skip-leaning) to red (all fail). `--display=bars` forces bars on short rows.
-- **Normal** (`-v` or piped) — streaming PASS/FAIL/SKIP per test.
+- **Normal** (piped / non-interactive) — one streamed line per file: PASS / FAIL / SKIP / DISABLED / INCOMPATIBLE, plus LOAD when a `const` file loads.
 - **Verbose** — streaming + timing, scope changes, log output.
 - **Quiet** (`-q`) — only summary and failures.
 
@@ -689,6 +689,9 @@ Per-test entries include:
 - All assertion failures (and runtime errors, with prior failures preserved)
 - A table of ambient variables in scope at file start: source, name, value (truncated)
 - `$.log()` messages
+
+`const` loads aren't tests, so they get no log entry (they stream as `LOAD`, but
+the run log records only `test`/`setup`/`cleanup` outcomes).
 
 History is kept so you can compare runs (handy for intermittent failures). The
 `logs/` directory is auto-pruned to the most recent **10** runs by default — set

@@ -8,6 +8,21 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.6.1"></a>
+## [0.6.1] — 2026-06-30
+
+### Fixed
+- **README accuracy pass (docs only).** Three descriptions now match the runner:
+  - Phases run in order **per directory**, not as one global sweep — a
+    directory's children run in parallel *between* its setup and its tests, so a
+    child's tests can run while the parent sits between phases. ("Phases run in
+    order across the whole suite" was misleading.)
+  - Streaming output (Normal mode) emits the full label set —
+    `PASS` / `FAIL` / `SKIP` / `DISABLED` / `INCOMPATIBLE`, plus `LOAD` when a
+    `const` file loads — not just `PASS`/`FAIL`/`SKIP`.
+  - `const` loads stream as `LOAD` but get **no run-log entry**; the log records
+    only `test`/`setup`/`cleanup` outcomes.
+
 <a id="v0.6.0"></a>
 ## [0.6.0] — 2026-06-30
 
