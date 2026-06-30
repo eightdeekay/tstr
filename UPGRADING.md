@@ -3,6 +3,58 @@
 Migration steps for releases that need action on existing suites. Each section
 cross-links to the full change list in [CHANGELOG.md](CHANGELOG.md).
 
+<a id="v0.6.0"></a>
+## 0.6.0 — `setup`/`cleanup` are scaffolding-only (not allowed in a leaf)
+
+→ **Full change list:** [CHANGELOG § 0.6.0](CHANGELOG.md#v0.6.0)
+
+A `.setup.tstr` / `.cleanup.tstr` file in a **leaf** directory (one with no
+subdirectories) is now rejected at startup. Setup/cleanup scaffold the
+directories *below* them, and a leaf has nothing below it. In 0.4.0 a leaf
+setup/cleanup was tolerated — run as a regular test with a warning — and that
+shim is now gone.
+
+### Two ways to migrate
+
+1. **Move the setup/cleanup up to a non-leaf parent.** The parent's setup
+   cascades into the leaf below it, and its cleanup runs afterward. This is the
+   right move when the setup/cleanup really is shared scaffolding:
+
+```
+# before — leaf holds setup + tests + cleanup
+tag-crud/
+  00-create.setup.tstr
+  01-replace.test.tstr
+  99-cleanup.cleanup.tstr
+
+# after — setup/cleanup scaffold the cases/ leaf
+tag-crud/
+  00-create.setup.tstr
+  99-cleanup.cleanup.tstr
+  cases/
+    01-replace.test.tstr
+```
+
+2. **Rename it to `.test`** if it was never really scaffolding — just a step that
+   happened to be tagged setup/cleanup. It then runs as an ordinary test in the
+   leaf.
+
+### Automated (recommended)
+
+Run the codemod over your suite. For each leaf dir that has a setup/cleanup
+**and** tests, it moves the `*.test.tstr` / `*.fetch.tstr` files down into a
+`cases/` subdirectory — leaving the setup/cleanup behind in what is now a
+non-leaf parent:
+
+```bash
+python3 scripts/migrate-leaf-scaffolding.py path/to/suite
+```
+
+A leaf that holds setup/cleanup but **no** tests can't be migrated mechanically
+(there's nothing for it to scaffold) — the script lists those for you to handle
+by hand (move them up, or delete them). Re-running is safe: once a dir has the
+`cases/` child it's no longer a leaf, so it's skipped. Review the diff and commit.
+
 <a id="v0.5.0"></a>
 ## 0.5.0 — `disabled` moves to the metadata block
 
@@ -108,4 +160,5 @@ If you'd rather not script it, per file:
   regular tests with **no fail-fast cascade** — a failed leaf setup no longer
   skips the rest of the leaf. You'll get a one-line warning naming them. If you
   want the old cascade-blocking, move that scaffolding to a non-leaf parent
-  directory.
+  directory. *(Superseded in [0.6.0](#v0.6.0): leaf setup/cleanup are no longer
+  tolerated at all — they're rejected at startup.)*

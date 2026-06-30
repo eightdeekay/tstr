@@ -1,6 +1,6 @@
 --> {
   // Load a JSON file and access its fields
-  template = @examples/demo/fixtures/group.json;
+  template = @fixtures/group.json;
   template.name == "Test Group" | "wrong template name";
   template.active == true | "should be active";
 

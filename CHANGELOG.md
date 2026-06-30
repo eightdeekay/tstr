@@ -8,6 +8,37 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.6.0"></a>
+## [0.6.0] — 2026-06-30
+
+`setup`/`cleanup` are now scaffolding-only — a `.setup.tstr` or `.cleanup.tstr`
+in a leaf directory is rejected at startup instead of being run as a regular
+test. This removes the leaf-tolerance shim added in 0.4.0.
+
+→ **Migration:** [UPGRADING.md § 0.6.0](UPGRADING.md#v0.6.0)
+
+### ⚠️ Breaking
+- **`.setup.tstr` / `.cleanup.tstr` in a leaf directory is now a hard error.**
+  Setup/cleanup scaffold the directories *below* them, so they only belong in a
+  non-leaf dir. Previously they were tolerated at a leaf (run as regular tests
+  with a warning); now `tstr run` exits with an error listing the offending
+  files. Move them to a non-leaf parent (whose setup cascades into the leaf), or
+  rename them to `.test` if they're really tests. Run
+  `scripts/migrate-leaf-scaffolding.py` to migrate mechanically.
+
+### Changed
+- The directory-role rule is now symmetric and fully enforced: `test`/`fetch`
+  live only in leaf dirs, `setup`/`cleanup` only in non-leaf dirs, `const`/`lib`
+  anywhere. README's "Mental Model" rewritten to match; the obsolete leaf-fold
+  path is gone from the runner.
+
+### Fixed
+- `examples/demo` runs again. A `fixtures/` data dir had made the example a
+  non-leaf directory holding tests (tripping the leaf-only-tests rule); its tests
+  now live in a `cases/` leaf, the producer/consumer pair is ordered, the
+  `@fixtures/...` reference is suite-root-relative, and a `tstr.yaml` marks the
+  root.
+
 <a id="v0.5.2"></a>
 ## [0.5.2] — 2026-06-26
 

@@ -301,14 +301,18 @@ fn run_command(
         process::exit(1);
     }
 
-    // Setup/cleanup in a leaf directory have no scaffolding role there — the
-    // runner treats them as regular tests. Warn, but run.
-    let leaf_scaffolding = discovery::check_leaf_scaffolding(&suite, &root);
-    if !leaf_scaffolding.is_empty() {
-        eprintln!("warning: setup/cleanup scripts are treated as regular tests at the leaf level");
-        for v in &leaf_scaffolding {
+    // Structural rule: setup/cleanup scaffold the directories below them, so
+    // they belong in a non-leaf dir. A leaf has nothing to scaffold — reject.
+    let leaf_setup_cleanup = discovery::check_leaf_setup_cleanup(&suite, &root);
+    if !leaf_setup_cleanup.is_empty() {
+        eprintln!("error: .setup.tstr / .cleanup.tstr files are not allowed in leaf directories");
+        eprintln!("       (setup/cleanup scaffold the directories below them — they belong in a");
+        eprintln!("       non-leaf parent. Move them up, or rename to .test if they're tests.)");
+        eprintln!("       Offending files:");
+        for v in &leaf_setup_cleanup {
             eprintln!("         {}", v);
         }
+        process::exit(1);
     }
 
     let mode = if quiet {

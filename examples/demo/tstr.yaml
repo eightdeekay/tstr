@@ -1,0 +1,4 @@
+# Marks this directory as a self-contained tstr suite root.
+# `config.const.tstr` cascades into the `cases/` leaf; relative `@file`
+# references (e.g. `@fixtures/group.json`) resolve against this directory.
+constants: {}

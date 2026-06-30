@@ -177,18 +177,18 @@ fn collect_leaf_violations(suite: &Suite, root: &Path, out: &mut Vec<String>) {
 }
 
 /// Find `.setup.tstr` / `.cleanup.tstr` files sitting in a **leaf** directory.
-/// A leaf has nothing below it for a setup to establish or a cleanup to tear
-/// down across, so the type tag carries no special meaning there — the runner
-/// folds these into the regular test sequence. Returns suite-root-relative
-/// paths so the caller can warn about it (empty = nothing to warn).
-pub fn check_leaf_scaffolding(suite: &Suite, root: &Path) -> Vec<String> {
+/// Setup/cleanup are scaffolding: they establish or tear down scope for the
+/// directories *below* them. A leaf has nothing below it, so they have no role
+/// there and are rejected. Returns suite-root-relative paths so the caller can
+/// report them (empty = nothing wrong).
+pub fn check_leaf_setup_cleanup(suite: &Suite, root: &Path) -> Vec<String> {
     let mut found = Vec::new();
-    collect_leaf_scaffolding(suite, root, &mut found);
+    collect_leaf_setup_cleanup(suite, root, &mut found);
     found.sort();
     found
 }
 
-fn collect_leaf_scaffolding(suite: &Suite, root: &Path, out: &mut Vec<String>) {
+fn collect_leaf_setup_cleanup(suite: &Suite, root: &Path, out: &mut Vec<String>) {
     if suite.is_leaf() {
         for entry in suite.entries.values() {
             if matches!(entry.file.file_type, FileType::Setup | FileType::Cleanup) {
@@ -198,7 +198,7 @@ fn collect_leaf_scaffolding(suite: &Suite, root: &Path, out: &mut Vec<String>) {
         }
     }
     for child in suite.children.values() {
-        collect_leaf_scaffolding(child, root, out);
+        collect_leaf_setup_cleanup(child, root, out);
     }
 }
 
@@ -489,6 +489,37 @@ mod tests {
         assert_eq!(violations.len(), 1);
         assert!(violations[0].contains("oops.test.tstr"),
             "expected the non-leaf test to be flagged, got: {:?}", violations);
+    }
+
+    #[test]
+    fn leaf_setup_cleanup_is_flagged() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        // A leaf dir (no children) holding a setup and a cleanup — both disallowed.
+        fs::write(root.join("00-init.setup.tstr"), "--> { x = 1; export x; }\n").unwrap();
+        fs::write(root.join("01-run.test.tstr"), "--> { true || \"x\"; }\n").unwrap();
+        fs::write(root.join("99-done.cleanup.tstr"), "--> { true || \"x\"; }\n").unwrap();
+
+        let suite = discover(root).unwrap();
+        let flagged = check_leaf_setup_cleanup(&suite, root);
+        assert_eq!(flagged.len(), 2, "both setup and cleanup flagged: {:?}", flagged);
+        assert!(flagged.iter().any(|f| f.contains("00-init.setup.tstr")));
+        assert!(flagged.iter().any(|f| f.contains("99-done.cleanup.tstr")));
+    }
+
+    #[test]
+    fn non_leaf_setup_cleanup_not_flagged() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        // Setup/cleanup in a non-leaf (scaffolding) dir are fine — they scaffold
+        // the leaf below.
+        fs::write(root.join("00-init.setup.tstr"), "--> { x = 1; export x; }\n").unwrap();
+        fs::write(root.join("99-done.cleanup.tstr"), "--> { true || \"x\"; }\n").unwrap();
+        fs::create_dir(root.join("cases")).unwrap();
+        fs::write(root.join("cases/01-run.test.tstr"), "--> { true || \"x\"; }\n").unwrap();
+
+        let suite = discover(root).unwrap();
+        assert!(check_leaf_setup_cleanup(&suite, root).is_empty());
     }
 
     #[test]

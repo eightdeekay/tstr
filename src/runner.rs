@@ -231,15 +231,9 @@ fn run_dir_structural(
         .filter(|e| e.file.file_type == FileType::Cleanup)
         .collect();
 
-    // Leaf rule: a directory with no child suites has nothing below it for a
-    // setup to establish or a cleanup to tear down across, so the type tag
-    // carries no special meaning. Fold `.setup`/`.cleanup` into the regular
-    // test sequence — lex-ordered with the tests, counted as tests, and no
-    // fail-fast cascade. (cli.rs warns the author this is happening.)
-    if is_leaf {
-        tests.append(&mut setups);
-        tests.append(&mut cleanups);
-    }
+    // Setup/cleanup are scaffolding and only ever appear in non-leaf dirs (a
+    // leaf one is rejected at startup, see cli.rs), so there's no leaf-folding:
+    // every dir runs const → setup → (children) → test → cleanup uniformly.
 
     let lex_key = |e: &&TestEntry| e.path.file_name()
         .map(|n| n.to_os_string())
@@ -480,10 +474,11 @@ fn skipped_result(entry: &TestEntry, reason: &str) -> FileResult {
     }
 }
 
-/// A file is display *scaffolding* when it's a setup/cleanup in a non-leaf
-/// directory — infrastructure that establishes or tears down scope for the
-/// leaves below it, not a test in its own right. Leaf setup/cleanup are folded
-/// into the test sequence (see `run_dir_structural`) and are NOT scaffolding.
+/// A file is display *scaffolding* when it's a setup/cleanup — infrastructure
+/// that establishes or tears down scope for the leaves below it, not a test in
+/// its own right. Setup/cleanup are only allowed in non-leaf dirs (a leaf one is
+/// rejected at startup), so `dir_is_leaf` is always false in practice; it's kept
+/// as a defensive guard.
 fn is_scaffold(entry: &TestEntry, dir_is_leaf: bool) -> bool {
     !dir_is_leaf && matches!(entry.file.file_type, FileType::Setup | FileType::Cleanup)
 }
@@ -688,39 +683,6 @@ mod tests {
         assert_eq!(totals.failed, 0);
     }
 
-    /// At a leaf, `.setup`/`.cleanup` are treated as regular tests: they run in
-    /// lex order, count toward totals, and — crucially — a failing one does
-    /// NOT cascade-block later files (that fail-fast is reserved for setups in
-    /// scaffolding/non-leaf dirs). Here `01` is a setup that fails its
-    /// assertion; `02` must still run, not skip.
-    #[test]
-    fn leaf_setup_failure_does_not_block_later_tests() {
-        use crate::output::{BarStyle, OutputMode, Printer};
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::write(root.join("tstr.yaml"), "constants: {}\n").unwrap();
-        std::fs::write(root.join("01-make.setup.tstr"), "--> { 1 == 2 | \"boom\"; }\n").unwrap();
-        std::fs::write(root.join("02-after.test.tstr"), "--> { 1 == 1 | \"unreachable\"; }\n").unwrap();
-
-        let suite = crate::discovery::discover(root).unwrap();
-        let index = crate::scheduler::FileIndex::build(suite.clone(), root.to_path_buf());
-        let opts = RunOptions {
-            stop_on_error: false,
-            halt_flag: None,
-            display_root: None,
-            config: crate::config::Config::default(),
-            constants: Arc::new(HashMap::new()),
-        };
-        let printer = Arc::new(Printer::new(OutputMode::Quiet, BarStyle::Auto));
-
-        let totals = run_structural(&suite, &index, &HashMap::new(), &opts, &printer);
-
-        assert_eq!(totals.failed, 1, "the leaf setup's failed assertion counts as a failure");
-        assert_eq!(totals.passed, 1, "the later test still runs");
-        assert_eq!(totals.skipped, 0, "no cascade-block at a leaf");
-    }
-
     /// Run a discovered suite under default options, returning just the totals.
     fn run_totals_in(root: &std::path::Path) -> RunTotals {
         use crate::output::{BarStyle, OutputMode, Printer};
@@ -872,7 +834,8 @@ mod tests {
         assert!(is_scaffold(&s, false));
         assert!(is_scaffold(&c, false));
         assert!(!is_scaffold(&t, false));
-        // Leaf: nothing is scaffolding (setup/cleanup run as tests there).
+        // Leaf: setup/cleanup can't live here (rejected at startup); the guard
+        // returns false defensively.
         assert!(!is_scaffold(&s, true));
         assert!(!is_scaffold(&c, true));
         assert!(!is_scaffold(&t, true));

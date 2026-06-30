@@ -55,21 +55,21 @@ a dependent that declares `orgId -->` is skipped before it runs, so you rarely
 need to guard on it by hand. When you *do* want conditional behavior within a
 file, use `if` (see below).
 
-**Tests live in leaf directories only.** A `.test.tstr` (or `.fetch.tstr`) is
-allowed only in a directory that has no subdirectories. A directory with
-subdirectories is *scaffolding* — const/setup/cleanup/lib only — whose setups
-cascade down into the leaves. This makes "test group = leaf directory" an
-invariant (one slot per group, each leaf's tests sequential, leaves parallel).
-Putting a test in a non-leaf dir is a hard error at startup.
+**Tests live in leaf directories; scaffolding lives above them.** The directory
+hierarchy splits cleanly by role, and the split is enforced at startup:
 
-**`setup`/`cleanup` in a leaf directory run as regular tests.** A leaf has
-nothing below it to scaffold, so a `.setup`/`.cleanup` there carries no special
-meaning: it's folded into the normal lex-ordered test sequence, counted as a
-test, with **no fail-fast cascade** (a failed leaf setup no longer skips the
-rest of the leaf). tstr warns when it does this. Scaffolding semantics —
-cascade-blocking, and being hidden from the slot display / summary table — apply
-only to `setup`/`cleanup` in **non-leaf** directories. To keep the old
-cascade-blocking behavior, move that scaffolding up to a non-leaf parent.
+- A `.test.tstr` / `.fetch.tstr` is allowed **only in a leaf** (a directory with
+  no subdirectories). A test in a non-leaf dir is a hard error.
+- A `.setup.tstr` / `.cleanup.tstr` is allowed **only in a non-leaf** dir, where
+  it scaffolds the leaves below it — its setups cascade down, its cleanups tear
+  down afterward. A setup/cleanup in a leaf is a hard error (move it to a
+  non-leaf parent, or rename it to `.test` if it's really just a test).
+- `const` and `lib` files are allowed anywhere.
+
+This makes "test group = leaf directory" an invariant (one slot per group, each
+leaf's tests sequential, leaves parallel), and keeps `setup`/`cleanup`
+unambiguously in their scaffolding role: cascade-blocking when they fail, and
+hidden from the slot display / summary table.
 
 **Two state-sharing mechanisms (picked deliberately):**
 
@@ -480,8 +480,12 @@ r.status == "ok" | "unhealthy: {{r.status}}";
 
 ### Setup broadcast → ordered mutation chain
 
+`tag-crud/` scaffolds; the tests live in its `ops/` leaf. The setup runs first
+and broadcasts `req` and `tagId` down into the leaf, the tests run in filename
+order, and the cleanup tears down afterward.
+
 ```
-# tests/tag-crud/01-create.setup.tstr
+# tests/tag-crud/00-create.setup.tstr      (scaffolding — tag-crud is non-leaf)
 --> {
   req = { urlPrefix: ${orgService.baseUrl} };
   req.body = { name: "test-tag", type: "label" };
@@ -489,25 +493,27 @@ r.status == "ok" | "unhealthy: {{r.status}}";
   export req, r.id as tagId;
 }
 
-# tests/tag-crud/02-replace.test.tstr
+# tests/tag-crud/99-cleanup.cleanup.tstr    (scaffolding — runs after the leaf)
+req, tagId --> {
+  req.delete("/v4/tags/{{tagId}}") ? 204 | "cleanup failed";
+}
+
+# tests/tag-crud/ops/01-replace.test.tstr   (ops/ is the leaf)
 req, tagId --> {
   req.body = { name: "test-tag-replaced" };
   req.put("/v4/tags/{{tagId}}") ? 2xx | "replace failed";
 }
 
-# tests/tag-crud/03-add-item.test.tstr
+# tests/tag-crud/ops/02-add-item.test.tstr
 req, tagId --> {
   req.body = { itemId: "abc-123" };
   req.post("/v4/tags/{{tagId}}/items") ? 2xx | "add-item failed";
 }
-
-# tests/tag-crud/04-cleanup.cleanup.tstr
-req, tagId --> {
-  req.delete("/v4/tags/{{tagId}}") ? 204 | "cleanup failed";
-}
 ```
 
-No fake gate variables. Order is the filename order. Setup's `export` broadcasts `req` and `tagId` to every subsequent file in the dir.
+No fake gate variables. Order is the filename order. The setup's `export`
+broadcasts `req` and `tagId` into the `ops/` leaf below it, and the cleanup runs
+last regardless of how the tests fared.
 
 ### Per-service libs
 
@@ -522,8 +528,9 @@ lib/
 
 tests/
   profile/
-    01-setup.setup.tstr          # any project setup
-    02-test.test.tstr            # calls createOrg("alpha") — uses orgService's req, not profile's
+    01-setup.setup.tstr          # any project setup; cascades into cases/
+    cases/
+      01-test.test.tstr          # calls createOrg("alpha") — uses orgService's req, not profile's
 ```
 
 Each service's libs are self-contained — they see only their own scope cascade.
@@ -644,15 +651,23 @@ parallel speedup when one occurred.
 Example `list` output:
 
 ```
-profile/sso-user/crud/tests
-| name               | role    | params           | returns |
-|--------------------|---------|------------------|---------|
-| 01-cleanup         | setup   | —                | orgId   |
-| 02-create-sso-user | test    | orgId            | —       |
-| 03-list-sso-users  | test    | orgId            | —       |
-| 04-get-sso-user    | test    | orgId, userId    | —       |
-| 05-delete-sso-user | cleanup | orgId, userId    | —       |
+profile/sso-user
+| name        | role    | params        | returns |
+|-------------|---------|---------------|---------|
+| 00-login    | setup   | —             | orgId   |
+| 99-teardown | cleanup | orgId         | —       |
+
+profile/sso-user/crud
+| name               | role | params        | returns |
+|--------------------|------|---------------|---------|
+| 01-create-sso-user | test | orgId         | userId  |
+| 02-list-sso-users  | test | orgId         | —       |
+| 03-get-sso-user    | test | orgId, userId | —       |
+| 04-delete-sso-user | test | orgId, userId | —       |
 ```
+
+`sso-user/` scaffolds (its `setup`/`cleanup` cascade down); the tests live in the
+`crud/` leaf below it.
 
 ## Output Modes
 
