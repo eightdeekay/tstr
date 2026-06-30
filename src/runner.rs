@@ -173,13 +173,32 @@ pub fn run_repeated_concurrent(
     printer: &Arc<Printer>,
 ) -> RunTotals {
     use rayon::prelude::*;
-    (0..repeat)
+
+    // Pre-size the slot display so each dir's bar spans all `repeat` copies of
+    // its tests (`test_count * repeat` cells). Registering once up front means
+    // the N overlapping runs report into shared, correctly-sized slots; each
+    // run's own internal `register_directories` then early-returns (already
+    // initialized). No-op outside Interactive mode. Without the ×repeat sizing a
+    // slot would "complete" after the first run and later runs would overflow it.
+    let display_root = opts.display_root.clone().unwrap_or_else(|| index.root.clone());
+    let scaled: Vec<(String, usize)> = compute_slot_totals(suite, &display_root)
+        .into_iter()
+        .map(|(dir, count)| (dir, count * repeat))
+        .collect();
+    printer.register_directories(scaled);
+
+    let totals = (0..repeat)
         .into_par_iter()
         .map(|_| run_structural(suite, index, cli_overrides, opts, printer))
         .reduce(RunTotals::new, |mut a, b| {
             a.merge(b);
             a
-        })
+        });
+
+    // One last redraw so the final frame matches the fully-completed state,
+    // regardless of which concurrent run happened to draw last.
+    printer.finalize_slots();
+    totals
 }
 
 /// Count non-const files per display slot (immediate child of `display_root`,
@@ -749,6 +768,49 @@ mod tests {
         };
         let printer = Arc::new(Printer::new(OutputMode::Quiet, BarStyle::Auto));
         run_structural(&suite, &index, &HashMap::new(), &opts, &printer)
+    }
+
+    /// Build a Quiet-mode suite (no live display) with one passing and one
+    /// failing test, so a `--repeat` run yields a predictable pass/fail split.
+    fn one_pass_one_fail_suite(root: &std::path::Path) -> (Suite, FileIndex, RunOptions, Arc<Printer>) {
+        use crate::output::{BarStyle, OutputMode, Printer};
+        std::fs::write(root.join("tstr.yaml"), "constants: {}\n").unwrap();
+        std::fs::write(root.join("01-a.test.tstr"), "{ 1 == 1 | \"x\"; }\n").unwrap();
+        std::fs::write(root.join("02-b.test.tstr"), "{ 1 == 2 | \"boom\"; }\n").unwrap();
+        let suite = crate::discovery::discover(root).unwrap();
+        let index = crate::scheduler::FileIndex::build(suite.clone(), root.to_path_buf());
+        let opts = RunOptions {
+            stop_on_error: false,
+            halt_flag: None,
+            display_root: None,
+            config: crate::config::Config::default(),
+            constants: Arc::new(HashMap::new()),
+        };
+        let printer = Arc::new(Printer::new(OutputMode::Quiet, BarStyle::Auto));
+        (suite, index, opts, printer)
+    }
+
+    /// Concurrent `--repeat` runs the suite N times at once and sums the totals:
+    /// 1 pass + 1 fail per pass × 5 passes = 5 pass, 5 fail.
+    #[test]
+    fn concurrent_repeat_accumulates_totals_across_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (suite, index, opts, printer) = one_pass_one_fail_suite(dir.path());
+        let totals = run_repeated_concurrent(5, &suite, &index, &HashMap::new(), &opts, &printer);
+        assert_eq!(totals.passed, 5);
+        assert_eq!(totals.failed, 5);
+        assert_eq!(totals.skipped, 0);
+    }
+
+    /// Sequential `--repeat` sums the same way: 1 pass + 1 fail × 3 = 3 pass, 3 fail.
+    #[test]
+    fn sequential_repeat_accumulates_totals_across_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (suite, index, opts, printer) = one_pass_one_fail_suite(dir.path());
+        let totals = run_repeated_sequential(3, &suite, &index, &HashMap::new(), &opts, &printer);
+        assert_eq!(totals.passed, 3);
+        assert_eq!(totals.failed, 3);
+        assert_eq!(totals.skipped, 0);
     }
 
     /// A disabled test with `blast-radius: 2` turns off the next two tests as

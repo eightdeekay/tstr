@@ -8,6 +8,18 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.6.5"></a>
+## [0.6.5] — 2026-06-30
+
+### Added
+- **Concurrent `--repeat` now renders live wide bars** instead of falling back to
+  summary-only. In a terminal, each directory gets one bucketed bar sized to its
+  `tests × repeat` cells, filling as the N overlapping passes complete (forced to
+  bars mode — per-test glyphs wouldn't fit). The slots are pre-sized once up
+  front so the concurrent runs report into shared, correctly-sized bars. Off a
+  terminal (piped) it's still summary-only. Adds tests for the `tests × repeat`
+  wide layout and for repeat totals accumulating across passes (both modes).
+
 <a id="v0.6.4"></a>
 ## [0.6.4] — 2026-06-30
 

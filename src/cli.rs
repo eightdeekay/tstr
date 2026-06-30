@@ -360,13 +360,13 @@ fn run_command(
 
     let mode = if quiet {
         OutputMode::Quiet
-    } else if concurrent_repeat {
-        // N overlapping passes can't be represented by per-test slots/streaming
-        // (the lines would interleave) — fall back to summary-only. -q is implied;
-        // -v still surfaces streamed failures.
-        if verbose { OutputMode::Verbose } else { OutputMode::Quiet }
     } else if verbose {
         OutputMode::Verbose
+    } else if concurrent_repeat {
+        // N overlapping passes can't stream per-test (lines would interleave),
+        // but in a terminal they DO render as one wide bar per dir, sized to
+        // `tests × repeat`. Off a terminal there's no live display → summary-only.
+        if is_tty { OutputMode::Interactive } else { OutputMode::Quiet }
     } else if is_tty {
         OutputMode::Interactive
     } else if repeat > 1 {
@@ -376,7 +376,10 @@ fn run_command(
     } else {
         OutputMode::Normal
     };
-    let printer = Arc::new(Printer::new(mode, display.to_bar_style()));
+    // Concurrent repeat forces the bucketed bar — one row per dir spanning all
+    // its (tests × repeat) cells; per-test glyphs wouldn't fit or read sensibly.
+    let bar_style = if concurrent_repeat { BarStyle::Bars } else { display.to_bar_style() };
+    let printer = Arc::new(Printer::new(mode, bar_style));
     printer.init_failure_log(&root, config.log_retention());
     if !warnings.is_empty() {
         printer.log_parse_errors(&warnings);

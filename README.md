@@ -632,7 +632,7 @@ tstr --version
 | `--url <base>` | shorthand for `--set urlPrefix=<base>` |
 | `--set 'KEY=VALUE'` | set an ambient variable (repeatable) |
 | `--repeat <N>` | run the whole suite N times (default `1`). Totals accumulate across iterations; the summary shows `(N iterations x M tests)`. |
-| `--repeat-mode <sequential\|concurrent>` | how `--repeat` runs. `sequential` (default) does one pass after another — safe, good for flushing out flaky failures. `concurrent` runs N overlapping passes at once (requires a suite that tolerates copies of itself; output drops to summary-only). Overrides the suite's `defaults.repeat_mode`. |
+| `--repeat-mode <sequential\|concurrent>` | how `--repeat` runs. `sequential` (default) does one pass after another — safe, good for flushing out flaky failures. `concurrent` runs N overlapping passes at once (requires a suite that tolerates copies of itself). In a terminal, `concurrent` renders one bucketed bar per directory, each spanning that dir's `tests × repeat` cells and filling as the passes complete; piped / off-terminal it's summary-only. Overrides the suite's `defaults.repeat_mode`. |
 | `--display auto\|bars` | slot-display style (`bars` forces colored bucketed bar) |
 | `--timeout <SECONDS>` | per-request HTTP timeout (default: `60`). `0` disables the timeout. |
 | `-j` / `--jobs <N>` | max concurrent worker threads (default: CPU count). HTTP work is I/O-bound — each blocking request parks a worker — so a value well above CPU count often raises throughput. `-j 1` forces serial. |
@@ -675,7 +675,7 @@ profile/sso-user/crud
 
 ## Output Modes
 
-- **Interactive** (default in terminal) — one slot row per top-level directory (or per child of the target when scoped). Per-test glyphs (`✓✗-·`) when there's room, or a colored bucketed bar otherwise — gradient hue from green (all pass) through yellow (skip-leaning) to red (all fail). `--display=bars` forces bars on short rows. Under sequential `--repeat`, the slots reset to all-pending at the start of each pass (so every iteration animates fresh) and the status line carries an `Iter k/N` marker.
+- **Interactive** (default in terminal) — one slot row per top-level directory (or per child of the target when scoped). Per-test glyphs (`✓✗-·`) when there's room, or a colored bucketed bar otherwise — gradient hue from green (all pass) through yellow (skip-leaning) to red (all fail). `--display=bars` forces bars on short rows. Under sequential `--repeat`, the slots reset to all-pending at the start of each pass (so every iteration animates fresh) and the status line carries an `Iter k/N` marker. Under concurrent `--repeat`, each directory is a single bucketed bar spanning all its `tests × repeat` cells, filling as the overlapping passes complete.
 - **Normal** (piped / non-interactive) — one streamed line per file: PASS / FAIL / SKIP / DISABLED / INCOMPATIBLE, plus LOAD when a `const` file loads.
 - **Verbose** — streaming + timing, scope changes, log output.
 - **Quiet** (`-q`) — only summary and failures.
