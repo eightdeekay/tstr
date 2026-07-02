@@ -1,6 +1,6 @@
 [package]
 name = "tstr"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 license = "MIT"
 description = "CLI HTTP API test runner with a custom DSL"
@@ -39,8 +39,11 @@ base64 = "0.22.1"
 rskafka = { version = "=0.6.0", optional = true, default-features = false, features = ["compression-gzip", "compression-snappy"] }
 
 [features]
-# Opt-in Kafka produce/consume support. Off by default so the stock build stays
-# lean and dependency-light. Build/test with `--features kafka`.
+# Kafka produce/consume support. ON by default — the primary use case needs
+# `$.kafka` in the on-PATH binary, and the release build shouldn't have to
+# remember a flag. For a lean build without the rskafka/rsasl deps and the Rust
+# ≥1.85 (edition 2024) floor they impose, use `cargo build --no-default-features`.
+default = ["kafka"]
 kafka = ["dep:rskafka"]
 
 [dev-dependencies]

@@ -8,6 +8,18 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.7.1"></a>
+## [0.7.1] — 2026-07-02
+
+### Changed
+- **The `kafka` feature is now on by default.** `cargo build` / `cargo install`
+  (and the release build behind `/release`) now include Kafka support, so the
+  on-PATH `tstr` carries `$.kafka` without a special build flag — previously a
+  default release build silently omitted it, surfacing as
+  `unknown built-in function '$.kafka()'` at runtime. The default build now
+  inherits the rskafka dependency set and the Rust ≥1.85 (edition 2024) floor;
+  for a lean build without Kafka, use `cargo build --no-default-features`.
+
 <a id="v0.7.0"></a>
 ## [0.7.0] — 2026-07-02
 

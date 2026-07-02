@@ -408,8 +408,9 @@ with the attempt count and elapsed time.
 
 ## Kafka
 
-*Requires the `kafka` build feature — `cargo build --features kafka`. Plaintext
-brokers only (no TLS/SASL yet).*
+*Built by default. For a lean build without Kafka (dropping the rskafka deps and
+the Rust ≥1.85 floor), use `cargo build --no-default-features`. Plaintext brokers
+only (no TLS/SASL yet).*
 
 For flows that emit Kafka messages, tstr can assert on what a service produced —
 and send messages to drive a flow. Because Kafka is a durable **log**, you don't
