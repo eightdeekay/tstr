@@ -8,6 +8,16 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.6.7"></a>
+## [0.6.7] — 2026-07-02
+
+### Documentation
+- **Kafka broker-address configuration.** The README's Kafka section now covers
+  keeping the broker address out of individual tests — in `tstr.yaml` constants
+  referenced via `$.kafka(${kafka.bootstrap})` / `$.kafka("{{kafka.bootstrap}}")`,
+  or built once in a parent `setup.tstr` and `export`ed to cascade — mirroring
+  how HTTP suites handle `urlPrefix`. Docs-only; no code change from 0.6.6.
+
 <a id="v0.6.6"></a>
 ## [0.6.6] — 2026-07-02
 

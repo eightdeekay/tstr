@@ -435,6 +435,28 @@ msg.body.status == "confirmed"                 | "wrong status";
 broker.produce("orders.commands", { type: "cancel", orderId: r.id });
 ```
 
+**Broker address.** The examples hardcode `"localhost:9092"` for readability;
+in a real suite keep it out of individual tests — the same way `urlPrefix` lives
+in config, not in every HTTP call. Put it in `tstr.yaml` constants:
+
+```yaml
+# tstr.yaml
+constants:
+  kafka:
+    bootstrap: "broker.internal:9092"
+```
+
+and reference the constant when opening the broker:
+
+```
+broker = $.kafka(${kafka.bootstrap});      // bare-expression constant form
+broker = $.kafka("{{kafka.bootstrap}}");   // or the in-string form
+```
+
+Or build it once in a parent `setup.tstr` and `export broker;` — a broker is a
+plain value and opens no connection until the first `produce`/`since`/`find`, so
+one handle cascades to every test in the tree.
+
 **Operations:**
 
 | Call | Returns |
