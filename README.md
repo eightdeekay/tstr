@@ -406,6 +406,73 @@ retry(max: 10, interval: 500ms, timeout: 30s) {
 Failures inside a retry report at the failing assertion's own line, annotated
 with the attempt count and elapsed time.
 
+## Kafka
+
+*Requires the `kafka` build feature — `cargo build --features kafka`. Plaintext
+brokers only (no TLS/SASL yet).*
+
+For flows that emit Kafka messages, tstr can assert on what a service produced —
+and produce messages to drive a flow. Because Kafka is a durable **log**, you
+don't subscribe ahead of time: you **mark the topic's position before the
+action**, fire the action, then seek back to the mark and scan forward for the
+message you expect.
+
+```
+order-event.test.tstr
+
+broker = $.kafka("localhost:9092");
+
+// mark the window BEFORE the action that emits the message
+cur = broker.since("orders.events");
+
+r = req.post("/v4/orders") ? 2xx | "create failed";
+
+// full-body regex + bounded wait; returns the message, or null on timeout
+msg = cur.find("\"orderId\":\"{{r.id}}\"", 30s) | "no kafka event for order";
+msg.body.status == "confirmed"                 | "wrong status";
+
+// producing is one call — returns the delivery ack
+broker.produce("orders.commands", { type: "cancel", orderId: r.id });
+```
+
+**Operations:**
+
+| Call | Returns |
+|---|---|
+| `$.kafka(bootstrap)` | a broker handle (no connection opened until first use) |
+| `broker.since(topic)` | a cursor marking the topic's current end offsets |
+| `cursor.find(regex, timeout)` | first message after the mark whose raw payload matches `regex`, or `null` on timeout |
+| `broker.produce(topic, value [, key])` | `{ partition, offset }` delivery ack |
+
+**The message** `find` returns mirrors an HTTP response:
+
+| Field | |
+|---|---|
+| `body` | payload parsed with the same sniffing as a response body (JSON / ndjson / SSE / text) |
+| `raw` | the untouched payload string — what the regex matched against |
+| `format` | `"json"` / `"ndjson"` / `"sse"` / `"text"` |
+| `key` · `partition` · `offset` · `timestamp` · `headers` | record metadata |
+
+**Semantics:**
+
+- **Mark before the action.** `since` must run before whatever emits the
+  message — it snapshots the end offsets, and `find` reads forward from there,
+  so a message produced after the mark is caught while pre-existing ones are
+  skipped. A topic that doesn't exist yet marks as empty (and `find` reads it
+  from the start once it appears), so it's safe to mark before the downstream
+  service has created the topic.
+- **Full-body regex.** The pattern is tested against the whole payload string,
+  not a parsed field. `find` returns `null` on timeout, so `| "message"` fires
+  as an ordinary assertion — and it *is* the wait primitive, so it doesn't need
+  wrapping in `retry` (though it composes with one if you like).
+- **`timeout`** takes a bare duration literal (`30s`, `500ms`, `2m`) or a plain
+  number of milliseconds.
+- **Produce** serializes `value` like an HTTP body — strings raw, objects/arrays
+  as JSON, `null` as a tombstone — and always targets partition 0.
+
+Run the live Kafka tests against a throwaway broker with `scripts/kafka-it.sh`
+(spins up Redpanda in Docker, points the tests at it, tears it down).
+
 ## Library Functions
 
 Libraries are `*.lib.tstr` files: callable functions with explicit parameters.
@@ -610,6 +677,7 @@ providers' signing schemes, build the header yourself from `$.hmacSha256()`.
 
 ### Other Features
 
+- **Duration literals** — `30s`, `500ms`, `2m` evaluate to a number of milliseconds anywhere a number is expected (e.g. `cursor.find(regex, 30s)`). Units: `ms` / `s` / `m`.
 - **`@path`** — load file content: `template = @fixtures/group.json;` (JSON files auto-parsed)
 - **`{{interpolation}}`** — variable substitution in strings and URLs
 - **JSON construction** — `req.body = { name: "Test", count: 3 };`

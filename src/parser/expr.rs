@@ -26,8 +26,38 @@ fn number(input: &mut &str) -> ModalResult<Expr> {
         s.push('.');
         s.push_str(frac);
     }
-    let n: f64 = s.parse().unwrap();
+    let mut n: f64 = s.parse().unwrap();
+
+    // Optional duration-unit suffix turns the literal into milliseconds:
+    // `500ms` → 500, `30s` → 30000, `2m` → 120000. Consumed only when the unit
+    // is a whole word (not the head of a longer identifier like `30something`),
+    // so ordinary numbers are untouched. Lets `find(regex, 30s)` and any other
+    // expression accept a bare duration; `retry(...)` keeps its own parser.
+    if let Some(mult) = opt(duration_unit).parse_next(input)? {
+        n *= mult;
+    }
     Ok(Expr::Number(n))
+}
+
+/// A trailing `ms`/`s`/`m` duration unit, returning the millisecond multiplier.
+/// Backtracks (so `opt` un-consumes the unit) when what follows would continue
+/// an identifier — that means it wasn't a duration suffix at all. Longest unit
+/// first so `ms` wins over `m`.
+fn duration_unit(input: &mut &str) -> ModalResult<f64> {
+    let unit = alt(("ms", "s", "m")).parse_next(input)?;
+    if let Some(c) = input.chars().next() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            return Err(winnow::error::ErrMode::Backtrack(
+                winnow::error::ContextError::new(),
+            ));
+        }
+    }
+    Ok(match unit {
+        "ms" => 1.0,
+        "s" => 1_000.0,
+        "m" => 60_000.0,
+        _ => 1.0,
+    })
 }
 
 /// Parse a string literal: "content" (with escape support)
@@ -729,6 +759,26 @@ mod tests {
     fn test_negative_number() {
         let mut input = "-5";
         assert_eq!(expr(&mut input).unwrap(), Expr::Number(-5.0));
+    }
+
+    #[test]
+    fn test_duration_literals() {
+        // ms is the base unit; s/m scale up. All produce a plain Number(ms).
+        for (src, ms) in [("500ms", 500.0), ("30s", 30_000.0), ("2m", 120_000.0), ("1500ms", 1500.0)] {
+            let mut input = src;
+            assert_eq!(expr(&mut input).unwrap(), Expr::Number(ms), "for {src}");
+            assert!(input.is_empty(), "{src} should be fully consumed");
+        }
+    }
+
+    #[test]
+    fn test_duration_suffix_needs_word_boundary() {
+        // `30something` is NOT `30s` + `omething` — the unit only counts as a
+        // duration when it's a whole word, so this parses as the number 30 with
+        // `something` left over for the next parser.
+        let mut input = "30something";
+        assert_eq!(expr(&mut input).unwrap(), Expr::Number(30.0));
+        assert_eq!(input, "something");
     }
 
     #[test]

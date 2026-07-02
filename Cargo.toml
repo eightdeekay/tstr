@@ -1,6 +1,6 @@
 [package]
 name = "tstr"
-version = "0.6.5"
+version = "0.6.6"
 edition = "2021"
 license = "MIT"
 description = "CLI HTTP API test runner with a custom DSL"
@@ -13,8 +13,12 @@ winnow = "0.7"
 clap = { version = "=4.4.8", features = ["derive"] }
 reqwest = { version = "=0.11.18", default-features = false, features = ["json", "default-tls", "blocking"] }
 tokio = { version = "=1.32.0", features = ["full"] }
-serde_json = "=1.0.107"
-serde = { version = "=1.0.188", features = ["derive"] }
+# serde/serde_json loosened from exact pins to caret: the `kafka` feature pulls
+# rsasl (via rskafka), which requires serde ≥1.0.205 / serde_json ≥1.0.122.
+# Exact-pinning these two bought nothing and just re-triggers the conflict on
+# every transitive bump, so they float within 1.x (SemVer-compatible).
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "=0.9.25"
 rayon = "=1.7.0"
 regex = "=1.9.5"
@@ -26,6 +30,18 @@ sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4.3"
 base64 = "0.22.1"
+# Kafka client — optional, gated behind the `kafka` feature. Pure-Rust build:
+# default features (which include lz4/zstd via C `-sys` crates) are OFF; we
+# opt back in only to gzip (flate2/miniz_oxide) and snappy (snap), both pure
+# Rust. TLS stays off entirely (plaintext only for now). lz4/zstd topics aren't
+# supported until someone needs them — adding those features reintroduces a C
+# toolchain dep, which is exactly why we picked rskafka over rdkafka.
+rskafka = { version = "=0.6.0", optional = true, default-features = false, features = ["compression-gzip", "compression-snappy"] }
+
+[features]
+# Opt-in Kafka produce/consume support. Off by default so the stock build stays
+# lean and dependency-light. Build/test with `--features kafka`.
+kafka = ["dep:rskafka"]
 
 [dev-dependencies]
 tempfile = "=3.8.0"

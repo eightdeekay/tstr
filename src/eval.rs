@@ -596,6 +596,19 @@ fn resolve_dotted_path(path: &str, scope: &Scope) -> Result<Value, EvalError> {
 fn eval_method_call(object: &Expr, method: &str, args: &[Expr], scope: &Scope) -> Result<Value, EvalError> {
     let obj = eval_expr(object, scope)?;
 
+    // Kafka handles (broker/cursor) intercept method dispatch before the
+    // collection/UFCS logic below — this is also what lets a Kafka
+    // `cursor.find(regex, timeout)` coexist with the array `.find(block)` arm:
+    // the two are told apart by receiver kind, not method name.
+    #[cfg(feature = "kafka")]
+    if let Some(kind) = crate::kafka::kind_of(&obj) {
+        let mut vals = Vec::with_capacity(args.len());
+        for a in args {
+            vals.push(eval_expr(a, scope)?);
+        }
+        return crate::kafka::dispatch_method(&kind, &obj, method, &vals, scope);
+    }
+
     match method {
         "filter" => {
             let arr = expect_array(&obj, "filter")?;
@@ -993,6 +1006,20 @@ fn eval_builtin(name: &str, args: &[Expr], scope: &Scope) -> Result<Value, EvalE
             let signed_payload = format!("{}.{}", timestamp, payload);
             let v1 = hmac_sha256(secret.as_bytes(), signed_payload.as_bytes(), "hex")?;
             Ok(Value::String(format!("t={},v1={}", timestamp, v1)))
+        }
+
+        #[cfg(feature = "kafka")]
+        "kafka" => {
+            if args.len() != 1 {
+                return Err(EvalError::new("$.kafka(bootstrap) takes 1 argument"));
+            }
+            match eval_expr(&args[0], scope)? {
+                Value::String(s) => Ok(crate::kafka::broker(&s)),
+                other => Err(EvalError::new(format!(
+                    "$.kafka(bootstrap) expects a string, got {}",
+                    other.type_name()
+                ))),
+            }
         }
 
         _ => Err(EvalError::new(format!("unknown built-in function '$.{}()'", name))),

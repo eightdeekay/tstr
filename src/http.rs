@@ -24,7 +24,15 @@ pub fn set_timeout(secs: u64) {
 fn client() -> &'static Client {
     CLIENT.get_or_init(|| {
         let secs = *TIMEOUT_SECS.get_or_init(|| 60);
-        let mut builder = Client::builder();
+        // Do not reuse idle keep-alive connections. Services reached through the
+        // telepresence tunnel close idle connections on their own timeout; when
+        // reqwest pulls such a connection from the pool just as the server is
+        // closing it, the request goes out on a dead socket and surfaces as a
+        // flaky "connection closed before message completed" (~2% of requests
+        // under load, scattered across unrelated endpoints). Opening a fresh
+        // connection per request makes the reuse race structurally impossible —
+        // correctness over throughput for a test runner.
+        let mut builder = Client::builder().pool_max_idle_per_host(0);
         if secs > 0 {
             builder = builder.timeout(Duration::from_secs(secs));
         }
@@ -172,6 +180,16 @@ pub fn execute_http_call(
     }
 
     Ok(body_value)
+}
+
+/// Parse a raw payload into a `(Value, format-label)` pair using the same
+/// sniffing as HTTP response bodies (SSE → JSON → ndjson → text). Reused by the
+/// Kafka consumer (`crate::kafka`) so a message body reads identically to a
+/// response body — hence gated to the `kafka` feature (nothing else calls it).
+#[cfg(feature = "kafka")]
+pub(crate) fn parse_payload(body: &str) -> (Value, String) {
+    let (v, fmt) = parse_body(body);
+    (v, fmt.to_string())
 }
 
 /// Detected body format. Surfaced via `_response.format` so tests can assert
@@ -348,8 +366,9 @@ pub fn json_to_value(json: &serde_json::Value) -> Value {
     }
 }
 
-/// Convert a Value to a JSON string for request bodies.
-fn value_to_json_string(val: &Value) -> String {
+/// Convert a Value to a JSON string for request bodies. Also reused by the
+/// Kafka producer (`crate::kafka`) to serialize object/array message payloads.
+pub(crate) fn value_to_json_string(val: &Value) -> String {
     match val {
         Value::Null => "null".to_string(),
         Value::Bool(b) => b.to_string(),

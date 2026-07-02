@@ -8,6 +8,37 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.6.6"></a>
+## [0.6.6] — 2026-07-02
+
+### Added
+- **Kafka produce/consume**, behind an opt-in `kafka` cargo feature
+  (`cargo build --features kafka`); the default build is unchanged. Four
+  primitives: `$.kafka(bootstrap)` opens a broker handle, `broker.since(topic)`
+  marks the topic's current end offsets as a cursor, `cursor.find(regex,
+  timeout)` seeks back to that mark and scans forward for the first message whose
+  full payload matches `regex` (returning a response-shaped `{body, raw, format,
+  key, partition, offset, timestamp, headers}` message, or `null` on timeout),
+  and `broker.produce(topic, value [, key])` sends and returns a `{partition,
+  offset}` ack. Built on the **drain + tight-window** model — mark before the
+  action, so a message produced afterward is caught while pre-existing ones are
+  skipped (a not-yet-created topic marks as empty and reads from the start once
+  it appears). Message bodies get the same JSON/ndjson/SSE/text sniffing as HTTP
+  responses; failure output carries a `KAFKA find <topic> /<regex>/` context
+  line. Pure-Rust (`rskafka`, no C toolchain); plaintext brokers only for now.
+  Live round-trips run via `scripts/kafka-it.sh` (throwaway Redpanda);
+  `cargo test --features kafka` covers the hermetic units.
+- **Duration literals** — `30s`, `500ms`, `2m` now evaluate to a number of
+  milliseconds in any expression (previously only inside `retry(...)`), so
+  `cursor.find(regex, 30s)` and the like read naturally. Guarded by a word
+  boundary, so `30something` is untouched.
+
+### Changed
+- `serde`/`serde_json` relaxed from exact pins to caret `1.0` (the `kafka`
+  feature pulls `rsasl`, which requires newer minimums). Default builds are
+  unaffected. Note: the `kafka` feature requires Rust ≥ 1.85 (rskafka is
+  edition 2024).
+
 <a id="v0.6.5"></a>
 ## [0.6.5] — 2026-06-30
 

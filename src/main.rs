@@ -13,6 +13,8 @@ mod filter;
 mod cli;
 mod config;
 mod version;
+#[cfg(feature = "kafka")]
+mod kafka;
 
 use clap::Parser;
 
