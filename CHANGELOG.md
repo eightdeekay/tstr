@@ -8,6 +8,36 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.7.0"></a>
+## [0.7.0] — 2026-07-02
+
+The Kafka DSL (feature-gated, added in 0.6.6) moves to a configured **handle**
+model: `$.kafka(config)` returns a handle you set `.topic` / `.key` / `.headers`
+on, then `send` / `since`. This adds message headers, a message key, and broker
+`requiresTypeId` / `requiresKey` guardrails — at the cost of a breaking change to
+the Kafka primitives.
+
+→ **Migration:** [UPGRADING.md § 0.7.0](UPGRADING.md#v0.7.0)
+
+### ⚠️ Breaking
+- **Kafka: `$.kafka` takes a config object, `produce` → `send`, `since` takes no
+  argument.** `$.kafka(config)` now accepts `{ bootstrap, requiresTypeId?,
+  requiresKey? }` (a bare bootstrap string still works). The topic moved onto the
+  handle as a `.topic` field, so `broker.since(topic)` becomes `k.topic = "…";
+  k.since()`, and `broker.produce(topic, value [, key])` is replaced by
+  `k.send(value)`, which reads `.topic` / `.key` / `.headers` off the handle.
+  Only affects suites built against the 0.6.x Kafka feature (opt-in, two patch
+  releases old); migrate by hand per UPGRADING — no codemod, since the reshape
+  from positional args to field assignments isn't a mechanical substitution.
+
+### Added
+- **Kafka message headers and a key**, set as `.headers` (an object) and `.key`
+  on the handle before `send`; `find`'s returned message already surfaced both.
+- **`requiresTypeId` / `requiresKey` guardrails** on the broker config. When set,
+  `send` fails fast — before connecting — unless a `__TypeId__` header (the
+  Spring Kafka type hint), respectively a key, is present. For topics whose
+  consumers can't deserialize a message without them.
+
 <a id="v0.6.7"></a>
 ## [0.6.7] — 2026-07-02
 

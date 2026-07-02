@@ -3,6 +3,46 @@
 Migration steps for releases that need action on existing suites. Each section
 cross-links to the full change list in [CHANGELOG.md](CHANGELOG.md).
 
+<a id="v0.7.0"></a>
+## 0.7.0 — Kafka moves to a configured handle (`send`, `.topic` / `.key` / `.headers`)
+
+→ **Full change list:** [CHANGELOG § 0.7.0](CHANGELOG.md#v0.7.0)
+
+Only affects suites using the opt-in `kafka` feature (added in 0.6.6). All four
+primitives changed:
+
+- `$.kafka("host:9092")` still works, but broker options now live in a config
+  object: `$.kafka({ bootstrap: "host:9092", requiresTypeId: true })` — usually a
+  `tstr.yaml` constant passed as `$.kafka(${kafka})`.
+- The **topic moved onto the handle** — set `k.topic = "…"` instead of passing it
+  to `since` / `produce`.
+- `broker.produce(topic, value [, key])` → `k.send(value)`, reading `.topic` /
+  `.key` / `.headers` off the handle.
+- `broker.since(topic)` → `k.since()` (reads `.topic`).
+
+### Migrate by hand
+
+```
+# before (0.6.x)
+broker = $.kafka("localhost:9092");
+cur = broker.since("orders.events");
+broker.produce("orders.commands", { type: "cancel" }, orderId);
+
+# after (0.7.0)
+k = $.kafka("localhost:9092");        # or $.kafka(${kafka}) with a config object
+k.topic = "orders.events";
+cur = k.since();
+
+k.topic = "orders.commands";
+k.key   = orderId;
+k.send({ type: "cancel" });
+```
+
+No codemod ships: the change from positional `produce(...)` arguments to field
+assignments on the handle is a structural reshape, not a mechanical
+substitution, and the feature is new enough (two patch releases) that hand
+migration is trivial.
+
 <a id="v0.6.0"></a>
 ## 0.6.0 — `setup`/`cleanup` are scaffolding-only (not allowed in a leaf)
 

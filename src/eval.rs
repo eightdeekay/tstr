@@ -1011,15 +1011,10 @@ fn eval_builtin(name: &str, args: &[Expr], scope: &Scope) -> Result<Value, EvalE
         #[cfg(feature = "kafka")]
         "kafka" => {
             if args.len() != 1 {
-                return Err(EvalError::new("$.kafka(bootstrap) takes 1 argument"));
+                return Err(EvalError::new("$.kafka(config) takes 1 argument"));
             }
-            match eval_expr(&args[0], scope)? {
-                Value::String(s) => Ok(crate::kafka::broker(&s)),
-                other => Err(EvalError::new(format!(
-                    "$.kafka(bootstrap) expects a string, got {}",
-                    other.type_name()
-                ))),
-            }
+            let cfg = eval_expr(&args[0], scope)?;
+            crate::kafka::broker_from_config(&cfg)
         }
 
         _ => Err(EvalError::new(format!("unknown built-in function '$.{}()'", name))),

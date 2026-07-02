@@ -412,18 +412,34 @@ with the attempt count and elapsed time.
 brokers only (no TLS/SASL yet).*
 
 For flows that emit Kafka messages, tstr can assert on what a service produced —
-and produce messages to drive a flow. Because Kafka is a durable **log**, you
-don't subscribe ahead of time: you **mark the topic's position before the
-action**, fire the action, then seek back to the mark and scan forward for the
-message you expect.
+and send messages to drive a flow. Because Kafka is a durable **log**, you don't
+subscribe ahead of time: you **mark the topic's position before the action**,
+fire the action, then seek back to the mark and scan forward for the message you
+expect.
+
+`$.kafka(config)` returns a **handle** you configure and reuse. Config splits in
+two: the **global** bits (broker address and requirement guardrails) come from
+the config object; the **dynamic** bits (`topic`, `key`, `headers`) are set as
+fields on the handle in the test, right before `send`/`since` — the same shape
+as configuring a `req` object and then calling it.
+
+```yaml
+# tstr.yaml — the global config, kept out of individual tests (like urlPrefix)
+constants:
+  kafka:
+    bootstrap: "broker.internal:9092"
+    requiresTypeId: true    # send errors unless a __TypeId__ header is set
+    requiresKey: true       # send errors unless a key is set
+```
 
 ```
 order-event.test.tstr
 
-broker = $.kafka("localhost:9092");
+k = $.kafka(${kafka});               // handle from the global config object
+k.topic = "orders.events";
 
 // mark the window BEFORE the action that emits the message
-cur = broker.since("orders.events");
+cur = k.since();
 
 r = req.post("/v4/orders") ? 2xx | "create failed";
 
@@ -431,40 +447,33 @@ r = req.post("/v4/orders") ? 2xx | "create failed";
 msg = cur.find("\"orderId\":\"{{r.id}}\"", 30s) | "no kafka event for order";
 msg.body.status == "confirmed"                 | "wrong status";
 
-// producing is one call — returns the delivery ack
-broker.produce("orders.commands", { type: "cancel", orderId: r.id });
+// send: set the dynamic fields, then send the value
+k.topic   = "orders.commands";
+k.key     = r.id;
+k.headers = { "__TypeId__": "com.acme.CancelCommand" };
+k.send({ type: "cancel", orderId: r.id });
 ```
 
-**Broker address.** The examples hardcode `"localhost:9092"` for readability;
-in a real suite keep it out of individual tests — the same way `urlPrefix` lives
-in config, not in every HTTP call. Put it in `tstr.yaml` constants:
-
-```yaml
-# tstr.yaml
-constants:
-  kafka:
-    bootstrap: "broker.internal:9092"
-```
-
-and reference the constant when opening the broker:
-
-```
-broker = $.kafka(${kafka.bootstrap});      // bare-expression constant form
-broker = $.kafka("{{kafka.bootstrap}}");   // or the in-string form
-```
-
-Or build it once in a parent `setup.tstr` and `export broker;` — a broker is a
-plain value and opens no connection until the first `produce`/`since`/`find`, so
-one handle cascades to every test in the tree.
+A bare string still works for the simple case: `k = $.kafka("localhost:9092")`
+(no requirements). A handle opens no connection until the first `send`/`since`,
+so one built in a parent `setup.tstr` and `export`ed cascades to the whole tree.
 
 **Operations:**
 
 | Call | Returns |
 |---|---|
-| `$.kafka(bootstrap)` | a broker handle (no connection opened until first use) |
-| `broker.since(topic)` | a cursor marking the topic's current end offsets |
+| `$.kafka(config)` | a handle — `config` is a bootstrap string or `{ bootstrap, requiresTypeId?, requiresKey? }` |
+| `handle.since()` | a cursor marking `.topic`'s current end offsets |
 | `cursor.find(regex, timeout)` | first message after the mark whose raw payload matches `regex`, or `null` on timeout |
-| `broker.produce(topic, value [, key])` | `{ partition, offset }` delivery ack |
+| `handle.send(value)` | sends `value` to `.topic` with `.key`/`.headers`; returns `{ partition, offset }` |
+
+**Dynamic fields** set on the handle:
+
+| Field | Used by | |
+|---|---|---|
+| `.topic` | `send`, `since` | topic name (required) |
+| `.key` | `send` | message key (required if `requiresKey`) |
+| `.headers` | `send` | object of header name → value (must include `__TypeId__` if `requiresTypeId`) |
 
 **The message** `find` returns mirrors an HTTP response:
 
@@ -477,6 +486,10 @@ one handle cascades to every test in the tree.
 
 **Semantics:**
 
+- **Global vs dynamic.** Broker address and the `requires*` guardrails are global
+  (the config object, typically a `tstr.yaml` constant); `topic`/`key`/`headers`
+  are dynamic, set per test. The guardrails are enforced at `send` *before* any
+  network work, so a missing key or `__TypeId__` fails fast with a clear message.
 - **Mark before the action.** `since` must run before whatever emits the
   message — it snapshots the end offsets, and `find` reads forward from there,
   so a message produced after the mark is caught while pre-existing ones are
@@ -489,8 +502,10 @@ one handle cascades to every test in the tree.
   wrapping in `retry` (though it composes with one if you like).
 - **`timeout`** takes a bare duration literal (`30s`, `500ms`, `2m`) or a plain
   number of milliseconds.
-- **Produce** serializes `value` like an HTTP body — strings raw, objects/arrays
-  as JSON, `null` as a tombstone — and always targets partition 0.
+- **`send`** serializes `value` like an HTTP body — strings raw, objects/arrays
+  as JSON, `null` as a tombstone — and always targets partition 0. The handle
+  keeps its `.key`/`.headers` between sends, so reset them when they should not
+  carry over.
 
 Run the live Kafka tests against a throwaway broker with `scripts/kafka-it.sh`
 (spins up Redpanda in Docker, points the tests at it, tears it down).

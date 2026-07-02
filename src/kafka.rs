@@ -116,13 +116,56 @@ where
     out.map_err(EvalError::new)
 }
 
-/// `$.kafka("host:9092")` → a broker handle. Just tagged config data; no
-/// connection is opened until the first `produce`/`since`/`find`.
-pub fn broker(bootstrap: &str) -> Value {
-    Value::Object(std::collections::HashMap::from([
+/// `$.kafka(config)` → a topic handle. `config` is either a bare bootstrap
+/// string or a config object carrying the **global** bits — `bootstrap` (the
+/// only required field) plus the `requiresTypeId` / `requiresKey` guardrails.
+/// The **dynamic** bits (`topic`, `key`, `headers`) are set as fields on the
+/// returned handle in the test before `send`/`since`. No connection is opened
+/// until the first `send`/`since`.
+///
+/// The handle is a plain mutable object seeded with empty dynamic fields so the
+/// test can assign them (`k.topic = "…"; k.headers = {…}`).
+pub fn broker_from_config(config: &Value) -> Result<Value, EvalError> {
+    let (bootstrap, requires_type_id, requires_key) = match config {
+        Value::String(s) => (s.clone(), false, false),
+        Value::Object(_) => {
+            let bootstrap = match config.get_field("bootstrap") {
+                Value::String(s) => s,
+                Value::Null => {
+                    return Err(EvalError::new(
+                        "$.kafka(config): the config object needs a `bootstrap` string",
+                    ))
+                }
+                other => {
+                    return Err(EvalError::new(format!(
+                        "$.kafka(config): `bootstrap` must be a string, got {}",
+                        other.type_name()
+                    )))
+                }
+            };
+            (
+                bootstrap,
+                config.get_field("requiresTypeId").is_truthy(),
+                config.get_field("requiresKey").is_truthy(),
+            )
+        }
+        other => {
+            return Err(EvalError::new(format!(
+                "$.kafka(config) expects a bootstrap string or a config object, got {}",
+                other.type_name()
+            )))
+        }
+    };
+    Ok(Value::Object(std::collections::HashMap::from([
         (KIND_FIELD.to_string(), Value::String(kind::BROKER.to_string())),
-        ("bootstrap".to_string(), Value::String(bootstrap.to_string())),
-    ]))
+        ("bootstrap".to_string(), Value::String(bootstrap)),
+        ("requiresTypeId".to_string(), Value::Bool(requires_type_id)),
+        ("requiresKey".to_string(), Value::Bool(requires_key)),
+        // dynamic fields, set per-test before send/since
+        ("topic".to_string(), Value::Null),
+        ("key".to_string(), Value::Null),
+        ("headers".to_string(), Value::Null),
+    ])))
 }
 
 /// Route a method call on a Kafka-tagged object. `args` are already evaluated
@@ -137,10 +180,10 @@ pub fn dispatch_method(
     scope: &Scope,
 ) -> Result<Value, EvalError> {
     match (kind, method) {
-        (kind::BROKER, "produce") => produce(obj, args, scope),
+        (kind::BROKER, "send") => send(obj, args, scope),
         (kind::BROKER, "since") => since(obj, args, scope),
         (kind::BROKER, m) => Err(EvalError::new(format!(
-            "unknown Kafka broker method '.{m}()'"
+            "unknown Kafka handle method '.{m}()'"
         ))),
         (kind::CURSOR, "find") => find(obj, args, scope),
         (kind::CURSOR, m) => Err(EvalError::new(format!(
@@ -152,24 +195,35 @@ pub fn dispatch_method(
     }
 }
 
-/// `broker.produce(topic, value [, key])` → `{ partition, offset }` ack.
-/// `value`/`key` are serialized like an HTTP body: strings go raw, objects and
-/// arrays are JSON-encoded, `null` value means a tombstone (no payload).
-fn produce(broker: &Value, args: &[Value], scope: &Scope) -> Result<Value, EvalError> {
-    if args.len() < 2 || args.len() > 3 {
+/// `handle.send(value)` → `{ partition, offset }` ack. Reads the dynamic
+/// `.topic` / `.key` / `.headers` fields off the handle; `value`/`key` are
+/// serialized like an HTTP body (strings raw, objects/arrays JSON, `null` value
+/// = tombstone). Enforces the handle's `requiresKey` / `requiresTypeId`
+/// guardrails *before* connecting, so a misconfigured send fails fast.
+fn send(handle: &Value, args: &[Value], scope: &Scope) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::new("kafka handle.send(value) takes 1 argument"));
+    }
+    let bootstrap = broker_bootstrap(handle)?;
+    let topic = handle_topic(handle, "send")?;
+    scope.set_endpoint(format!("KAFKA send {topic}"));
+
+    let key = value_to_payload(&handle.get_field("key"));
+    let headers = headers_from(&handle.get_field("headers"))?;
+
+    // Guardrails (before any network work).
+    if handle.get_field("requiresKey").is_truthy() && key.is_none() {
         return Err(EvalError::new(
-            "broker.produce(topic, value [, key]) takes 2 or 3 arguments",
+            "kafka send: this broker requires a message key (requiresKey) — set `.key` before sending",
         ));
     }
-    let bootstrap = broker_bootstrap(broker)?;
-    let topic = as_string(&args[0], "topic")?;
-    scope.set_endpoint(format!("KAFKA produce {topic}"));
-    let value = value_to_payload(&args[1]);
-    let key = match args.get(2) {
-        None | Some(Value::Null) => None,
-        Some(k) => Some(as_string(k, "key")?.into_bytes()),
-    };
+    if handle.get_field("requiresTypeId").is_truthy() && !headers.contains_key("__TypeId__") {
+        return Err(EvalError::new(
+            "kafka send: this broker requires a `__TypeId__` header (requiresTypeId) — set `.headers.\"__TypeId__\"` before sending",
+        ));
+    }
 
+    let value = value_to_payload(&args[0]);
     let offsets = run_op(async move {
         let client = ClientBuilder::new(vec![bootstrap])
             .build()
@@ -182,33 +236,63 @@ fn produce(broker: &Value, args: &[Value], scope: &Scope) -> Result<Value, EvalE
         let record = Record {
             key,
             value,
-            headers: BTreeMap::new(),
+            headers,
             timestamp: now_utc(),
         };
         partition
             .produce(vec![record], Compression::NoCompression)
             .await
-            .map_err(|e| format!("kafka produce to '{topic}' failed: {e}"))
+            .map_err(|e| format!("kafka send to '{topic}' failed: {e}"))
     })?;
 
     let offset = offsets.first().copied().unwrap_or(-1);
     Ok(ack(PRODUCE_PARTITION, offset))
 }
 
-/// `broker.since(topic)` → a cursor marking the topic's current end offsets,
-/// one per partition. Seeking back to this mark later (`cursor.find`, phase 4)
+/// Read the handle's `.topic` dynamic field, requiring it to be a non-empty
+/// string. `op` names the operation for the error.
+fn handle_topic(handle: &Value, op: &str) -> Result<String, EvalError> {
+    match handle.get_field("topic") {
+        Value::String(s) if !s.is_empty() => Ok(s),
+        _ => Err(EvalError::new(format!(
+            "kafka {op}: set `.topic` on the handle first (e.g. `k.topic = \"my.topic\";`)"
+        ))),
+    }
+}
+
+/// Convert a handle's `.headers` field into Kafka record headers. `null` (unset)
+/// yields no headers; anything but an object is an error. Values are stringified
+/// (headers are text on the wire).
+fn headers_from(v: &Value) -> Result<BTreeMap<String, Vec<u8>>, EvalError> {
+    match v {
+        Value::Null => Ok(BTreeMap::new()),
+        Value::Object(m) => Ok(m
+            .iter()
+            .map(|(k, val)| (k.clone(), val.to_display_string().into_bytes()))
+            .collect()),
+        other => Err(EvalError::new(format!(
+            "kafka send: `.headers` must be an object, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// `handle.since()` → a cursor marking the current end offsets of the handle's
+/// `.topic`, one per partition. Seeking back to this mark later (`cursor.find`)
 /// reads exactly the messages produced *after* this call — the tight window.
 ///
 /// A topic that doesn't exist yet yields an **empty** offsets map rather than an
 /// error: there are no prior messages to skip, so `find` will read each
 /// partition from the earliest offset once the topic appears. That's what makes
 /// `since` safe to call before the downstream service has created the topic.
-fn since(broker: &Value, args: &[Value], scope: &Scope) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::new("broker.since(topic) takes 1 argument"));
+fn since(handle: &Value, args: &[Value], scope: &Scope) -> Result<Value, EvalError> {
+    if !args.is_empty() {
+        return Err(EvalError::new(
+            "kafka handle.since() takes no arguments — set `.topic` on the handle",
+        ));
     }
-    let bootstrap = broker_bootstrap(broker)?;
-    let topic = as_string(&args[0], "topic")?;
+    let bootstrap = broker_bootstrap(handle)?;
+    let topic = handle_topic(handle, "since")?;
     scope.set_endpoint(format!("KAFKA since {topic}"));
     let (b2, t2) = (bootstrap.clone(), topic.clone());
 
@@ -496,18 +580,28 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    /// Fresh scope for exercising ops that now record an endpoint.
+    /// Fresh scope for ops that record an endpoint.
     fn sc() -> Scope {
         Scope::new()
     }
 
+    /// A handle from a bare bootstrap string (no requirements set).
+    fn handle(bootstrap: &str) -> Value {
+        broker_from_config(&Value::String(bootstrap.to_string())).unwrap()
+    }
+
+    /// Set a dynamic field on a handle (what `k.topic = …` does in the DSL).
+    fn set(mut h: Value, field: &str, v: Value) -> Value {
+        if let Value::Object(ref mut m) = h {
+            m.insert(field.to_string(), v);
+        }
+        h
+    }
+
     #[test]
     fn kind_of_reads_tag() {
-        let broker = Value::Object(HashMap::from([
-            (KIND_FIELD.to_string(), Value::String(kind::BROKER.to_string())),
-            ("bootstrap".to_string(), Value::String("localhost:9092".to_string())),
-        ]));
-        assert_eq!(kind_of(&broker).as_deref(), Some(kind::BROKER));
+        let h = handle("localhost:9092");
+        assert_eq!(kind_of(&h).as_deref(), Some(kind::BROKER));
     }
 
     #[test]
@@ -523,36 +617,109 @@ mod tests {
     }
 
     #[test]
-    fn broker_is_a_tagged_handle() {
-        let b = broker("localhost:9092");
-        assert_eq!(kind_of(&b).as_deref(), Some(kind::BROKER));
-        assert_eq!(broker_bootstrap(&b).unwrap(), "localhost:9092");
+    fn handle_from_string_defaults() {
+        let h = handle("localhost:9092");
+        assert_eq!(broker_bootstrap(&h).unwrap(), "localhost:9092");
+        assert_eq!(h.get_field("requiresTypeId"), Value::Bool(false));
+        assert_eq!(h.get_field("requiresKey"), Value::Bool(false));
+        // dynamic fields start unset
+        assert_eq!(h.get_field("topic"), Value::Null);
+        assert_eq!(h.get_field("key"), Value::Null);
+        assert_eq!(h.get_field("headers"), Value::Null);
+    }
+
+    #[test]
+    fn config_object_reads_globals() {
+        let cfg = Value::Object(HashMap::from([
+            ("bootstrap".to_string(), Value::String("host:9092".into())),
+            ("requiresTypeId".to_string(), Value::Bool(true)),
+            ("requiresKey".to_string(), Value::Bool(true)),
+        ]));
+        let h = broker_from_config(&cfg).unwrap();
+        assert_eq!(broker_bootstrap(&h).unwrap(), "host:9092");
+        assert_eq!(h.get_field("requiresTypeId"), Value::Bool(true));
+        assert_eq!(h.get_field("requiresKey"), Value::Bool(true));
+    }
+
+    #[test]
+    fn config_object_requires_bootstrap() {
+        let cfg = Value::Object(HashMap::from([(
+            "requiresKey".to_string(),
+            Value::Bool(true),
+        )]));
+        assert!(broker_from_config(&cfg).unwrap_err().to_string().contains("bootstrap"));
+        // a bare number is neither a string nor a config object
+        assert!(broker_from_config(&Value::Number(1.0)).is_err());
     }
 
     #[test]
     fn payload_serialization_matches_http_bodies() {
-        // strings go raw (no JSON quoting)
         assert_eq!(value_to_payload(&Value::String("hi".into())), Some(b"hi".to_vec()));
-        // null is a tombstone — no bytes
-        assert_eq!(value_to_payload(&Value::Null), None);
-        // objects are JSON-encoded
+        assert_eq!(value_to_payload(&Value::Null), None); // tombstone
         let obj = Value::Object(HashMap::from([("a".to_string(), Value::Number(1.0))]));
         assert_eq!(value_to_payload(&obj), Some(br#"{"a":1}"#.to_vec()));
-        // non-string scalars fall back to display form
         assert_eq!(value_to_payload(&Value::Number(3.0)), Some(b"3".to_vec()));
     }
 
     #[test]
-    fn produce_arg_arity_is_enforced() {
-        let b = broker("localhost:9092");
-        assert!(produce(&b, &[Value::String("t".into())], &sc()).is_err());
-        assert!(produce(&b, &[], &sc()).is_err());
+    fn headers_from_variants() {
+        assert!(headers_from(&Value::Null).unwrap().is_empty());
+        let h = headers_from(&Value::Object(HashMap::from([
+            ("__TypeId__".to_string(), Value::String("com.foo.Bar".into())),
+            ("n".to_string(), Value::Number(7.0)),
+        ])))
+        .unwrap();
+        assert_eq!(h.get("__TypeId__").map(|v| v.as_slice()), Some(b"com.foo.Bar".as_slice()));
+        assert_eq!(h.get("n").map(|v| v.as_slice()), Some(b"7".as_slice())); // stringified
+        assert!(headers_from(&Value::String("nope".into())).is_err());
     }
 
     #[test]
-    fn dispatch_rejects_unknown_broker_method() {
-        let b = broker("localhost:9092");
-        let err = dispatch_method(kind::BROKER, &b, "frobnicate", &[], &sc()).unwrap_err();
+    fn send_requires_topic_and_one_arg() {
+        let h = handle("localhost:9092"); // no .topic set
+        assert!(send(&h, &[Value::String("v".into())], &sc())
+            .unwrap_err()
+            .to_string()
+            .contains("topic"));
+        // arity: exactly one value
+        let h = set(handle("localhost:9092"), "topic", Value::String("t".into()));
+        assert!(send(&h, &[], &sc()).is_err());
+        assert!(send(&h, &[Value::Null, Value::Null], &sc()).is_err());
+    }
+
+    #[test]
+    fn send_enforces_required_key() {
+        // requiresKey with no .key set → error before any network work.
+        let cfg = Value::Object(HashMap::from([
+            ("bootstrap".to_string(), Value::String("localhost:9092".into())),
+            ("requiresKey".to_string(), Value::Bool(true)),
+        ]));
+        let h = set(broker_from_config(&cfg).unwrap(), "topic", Value::String("t".into()));
+        let err = send(&h, &[Value::String("v".into())], &sc()).unwrap_err().to_string();
+        assert!(err.contains("requiresKey"), "got: {err}");
+    }
+
+    #[test]
+    fn send_enforces_required_type_id() {
+        // requiresTypeId with headers lacking __TypeId__ → error before network.
+        let cfg = Value::Object(HashMap::from([
+            ("bootstrap".to_string(), Value::String("localhost:9092".into())),
+            ("requiresTypeId".to_string(), Value::Bool(true)),
+        ]));
+        let mut h = set(broker_from_config(&cfg).unwrap(), "topic", Value::String("t".into()));
+        // headers present but missing __TypeId__
+        h = set(h, "headers", Value::Object(HashMap::from([(
+            "x".to_string(),
+            Value::String("y".into()),
+        )])));
+        let err = send(&h, &[Value::String("v".into())], &sc()).unwrap_err().to_string();
+        assert!(err.contains("__TypeId__"), "got: {err}");
+    }
+
+    #[test]
+    fn dispatch_rejects_unknown_method() {
+        let h = handle("localhost:9092");
+        let err = dispatch_method(kind::BROKER, &h, "frobnicate", &[], &sc()).unwrap_err();
         assert!(err.to_string().contains("frobnicate"));
     }
 
@@ -576,55 +743,19 @@ mod tests {
     }
 
     #[test]
-    fn since_arity_is_enforced() {
-        let b = broker("localhost:9092");
-        assert!(since(&b, &[], &sc()).is_err());
-        assert!(since(&b, &[Value::String("a".into()), Value::String("b".into())], &sc()).is_err());
-    }
-
-    /// Live: produce N records, then `since` must report end offset == N for
-    /// partition 0. Also checks a never-seen topic yields empty offsets.
-    /// Skipped unless `TSTR_KAFKA_TEST_BROKER` is set.
-    #[test]
-    fn since_captures_end_offset_live() {
-        let addr = match std::env::var("TSTR_KAFKA_TEST_BROKER") {
-            Ok(a) if !a.is_empty() => a,
-            _ => {
-                eprintln!("skipping since_captures_end_offset_live (set TSTR_KAFKA_TEST_BROKER=host:9092)");
-                return;
-            }
-        };
-        let b = broker(&addr);
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-
-        // A topic we never touch → empty offsets, no error.
-        let ghost = since(&b, &[Value::String(format!("tstr-ghost-{nonce}"))], &sc()).unwrap();
-        match ghost.get_field("offsets") {
-            Value::Object(m) => assert!(m.is_empty(), "ghost topic should have no offsets"),
-            other => panic!("expected object, got {other:?}"),
-        }
-
-        // Produce 3, then the mark should sit at offset 3 on partition 0.
-        let topic = format!("tstr-since-{nonce}");
-        for i in 0..3 {
-            produce(&b, &[Value::String(topic.clone()), Value::Number(i as f64)], &sc()).unwrap();
-        }
-        let cur = since(&b, &[Value::String(topic)], &sc()).unwrap();
-        assert_eq!(cur.get_field("offsets").get_field("0"), Value::Number(3.0));
+    fn since_needs_topic_and_no_args() {
+        let h = handle("localhost:9092"); // no .topic
+        assert!(since(&h, &[], &sc()).unwrap_err().to_string().contains("topic"));
+        let h = set(handle("localhost:9092"), "topic", Value::String("t".into()));
+        assert!(since(&h, &[Value::String("extra".into())], &sc()).is_err());
     }
 
     #[test]
     fn find_validates_args() {
         let c = cursor("localhost:9092", "t", &[(0, 0)]);
-        // wrong arity
-        assert!(find(&c, &[Value::String("x".into())], &sc()).is_err());
-        // bad regex
+        assert!(find(&c, &[Value::String("x".into())], &sc()).is_err()); // arity
         let bad = find(&c, &[Value::String("(unclosed".into()), Value::Number(10.0)], &sc());
         assert!(bad.unwrap_err().to_string().contains("invalid regex"));
-        // non-numeric timeout
         assert!(find(&c, &[Value::String("x".into()), Value::String("10s".into())], &sc()).is_err());
     }
 
@@ -643,7 +774,7 @@ mod tests {
             record: Record {
                 key: Some(b"k1".to_vec()),
                 value: Some(br#"{"status":"ok"}"#.to_vec()),
-                headers: BTreeMap::new(),
+                headers: BTreeMap::from([("__TypeId__".to_string(), b"com.foo.Bar".to_vec())]),
                 timestamp: now_utc(),
             },
             offset: 12,
@@ -656,77 +787,102 @@ mod tests {
         assert_eq!(m.get_field("key"), Value::String("k1".into()));
         assert_eq!(m.get_field("partition"), Value::Number(1.0));
         assert_eq!(m.get_field("offset"), Value::Number(12.0));
+        assert_eq!(
+            m.get_field("headers").get_field("__TypeId__"),
+            Value::String("com.foo.Bar".into())
+        );
     }
 
-    /// Live: mark before an action, produce a matching message, `find` catches
-    /// it by full-body regex; a non-matching pattern returns Null within its
-    /// timeout. Exercises late topic creation too (topic is created by the
-    /// produce, after `since`). Skipped unless `TSTR_KAFKA_TEST_BROKER` is set.
+    /// Live: mark via a handle's `.topic`, send 3, `since` reports end offset 3.
+    /// Skipped unless `TSTR_KAFKA_TEST_BROKER` is set.
     #[test]
-    fn find_catches_and_times_out_live() {
+    fn since_captures_end_offset_live() {
         let addr = match std::env::var("TSTR_KAFKA_TEST_BROKER") {
             Ok(a) if !a.is_empty() => a,
             _ => {
-                eprintln!("skipping find_catches_and_times_out_live (set TSTR_KAFKA_TEST_BROKER=host:9092)");
+                eprintln!("skipping since_captures_end_offset_live (set TSTR_KAFKA_TEST_BROKER=host:9092)");
                 return;
             }
         };
-        let b = broker(&addr);
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let topic = format!("tstr-find-{nonce}");
+
+        // Ghost topic → empty offsets.
+        let ghost = set(handle(&addr), "topic", Value::String(format!("tstr-ghost-{nonce}")));
+        match since(&ghost, &[], &sc()).unwrap().get_field("offsets") {
+            Value::Object(m) => assert!(m.is_empty(), "ghost topic should have no offsets"),
+            other => panic!("expected object, got {other:?}"),
+        }
+
+        let topic = format!("tstr-since-{nonce}");
+        let h = set(handle(&addr), "topic", Value::String(topic.clone()));
+        for i in 0..3 {
+            send(&h, &[Value::Number(i as f64)], &sc()).unwrap();
+        }
+        let cur = since(&h, &[], &sc()).unwrap();
+        assert_eq!(cur.get_field("offsets").get_field("0"), Value::Number(3.0));
+    }
+
+    /// Live: mark, send a message carrying a key + `__TypeId__` header, then
+    /// `find` catches it by full-body regex and the key/header round-trip. Also
+    /// checks a non-matching pattern times out to Null. Skipped unless
+    /// `TSTR_KAFKA_TEST_BROKER` is set.
+    #[test]
+    fn send_find_headers_key_round_trip_live() {
+        let addr = match std::env::var("TSTR_KAFKA_TEST_BROKER") {
+            Ok(a) if !a.is_empty() => a,
+            _ => {
+                eprintln!("skipping send_find_headers_key_round_trip_live (set TSTR_KAFKA_TEST_BROKER=host:9092)");
+                return;
+            }
+        };
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let topic = format!("tstr-send-{nonce}");
         let needle = format!("needle-{nonce}");
 
-        // Mark before the topic even exists → empty marks; find reads earliest.
-        let cur = since(&b, &[Value::String(topic.clone())], &sc()).unwrap();
-        produce(
-            &b,
-            &[
-                Value::String(topic.clone()),
-                Value::Object(HashMap::from([("id".to_string(), Value::String(needle.clone()))])),
-            ],
+        // Mark before the topic exists (empty marks → find reads earliest).
+        let marker = set(handle(&addr), "topic", Value::String(topic.clone()));
+        let cur = since(&marker, &[], &sc()).unwrap();
+
+        // Configure the send handle: topic + key + __TypeId__ header.
+        let mut h = set(handle(&addr), "topic", Value::String(topic.clone()));
+        h = set(h, "key", Value::String("site-42".into()));
+        h = set(
+            h,
+            "headers",
+            Value::Object(HashMap::from([(
+                "__TypeId__".to_string(),
+                Value::String("com.foo.OrderEvent".into()),
+            )])),
+        );
+        let ack = send(
+            &h,
+            &[Value::Object(HashMap::from([(
+                "id".to_string(),
+                Value::String(needle.clone()),
+            )]))],
             &sc(),
         )
-        .unwrap();
+        .expect("send failed");
+        assert_eq!(ack.get_field("partition"), Value::Number(0.0));
 
         let msg = find(&cur, &[Value::String(needle.clone()), Value::Number(10_000.0)], &sc())
             .expect("find errored");
         assert_eq!(msg.get_field("body").get_field("id"), Value::String(needle));
-        assert_eq!(msg.get_field("partition"), Value::Number(0.0));
+        assert_eq!(msg.get_field("key"), Value::String("site-42".into()));
+        assert_eq!(
+            msg.get_field("headers").get_field("__TypeId__"),
+            Value::String("com.foo.OrderEvent".into())
+        );
 
-        // Nothing matches this → Null within the (short) timeout.
         let none = find(&cur, &[Value::String("no-such-thing".into()), Value::Number(500.0)], &sc())
             .expect("find errored");
         assert_eq!(none, Value::Null);
     }
-
-    /// Live round-trip against a real broker. Skipped unless
-    /// `TSTR_KAFKA_TEST_BROKER=host:9092` is set, so the default suite stays
-    /// hermetic. Produces to a fresh topic and asserts the first record lands
-    /// at offset 0 (proof the broker accepted and sequenced it).
-    #[test]
-    fn produce_to_real_broker() {
-        let addr = match std::env::var("TSTR_KAFKA_TEST_BROKER") {
-            Ok(a) if !a.is_empty() => a,
-            _ => {
-                eprintln!("skipping produce_to_real_broker (set TSTR_KAFKA_TEST_BROKER=host:9092)");
-                return;
-            }
-        };
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let topic = format!("tstr-produce-test-{nonce}");
-        let b = broker(&addr);
-        let args = [
-            Value::String(topic),
-            Value::Object(HashMap::from([("hello".to_string(), Value::String("world".to_string()))])),
-        ];
-        let ack = produce(&b, &args, &sc()).expect("produce failed");
-        assert_eq!(ack.get_field("partition"), Value::Number(0.0));
-        assert_eq!(ack.get_field("offset"), Value::Number(0.0));
-    }
 }
+
