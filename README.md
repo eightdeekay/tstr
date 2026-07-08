@@ -152,10 +152,23 @@ constants:
   db: postgres://doadmin:${dbPassword}@${dbHost}:${dbPort}/defaultdb
 ```
 
-The file is read as UTF-8, a leading `~/` expands against `$HOME`, and **one
-trailing newline is stripped** (the shape `printf 'pw\n' > pgpass` leaves) — a
-password with a stray `\n` fails authentication in a way that points nowhere near
-this config.
+The file is read as UTF-8 and **one trailing newline is stripped** (the shape
+`printf 'pw\n' > pgpass` leaves) — a password with a stray `\n` fails
+authentication in a way that points nowhere near this config.
+
+Paths resolve as:
+
+| Path | Resolves against |
+|---|---|
+| `~/.config/tstr/pgpass` | `$HOME` |
+| `/etc/tstr/pgpass` | taken as-is |
+| `pgpass` | **the directory of the config file that declares it** |
+
+A relative path is *not* relative to the working directory, so a suite behaves
+the same whether you run it from its own root or from anywhere else. Each config
+layer resolves its own relative paths, so a `pgpass` named in
+`~/.config/tstr/config.yaml` is found next to that file, not next to the
+project's `tstr.yaml`.
 
 Secret tags resolve *before* `${name}` substitution, so a secret composes into
 other constants normally, as `db` does above.

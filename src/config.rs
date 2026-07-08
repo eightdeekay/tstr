@@ -46,11 +46,18 @@ pub struct Defaults {
 
 impl Config {
     /// Parse a config from a yaml file on disk.
+    ///
+    /// `!secret` tags are resolved here, per-layer, because a relative secret
+    /// path is relative to *the config that declares it* — and after
+    /// [`Self::merge`] there is no longer any record of which layer a constant
+    /// came from.
     pub fn load_from_path(path: &Path) -> Result<Self, String> {
         let content = fs::read_to_string(path)
             .map_err(|e| format!("failed to read {}: {}", path.display(), e))?;
-        serde_yaml::from_str(&content)
-            .map_err(|e| format!("failed to parse {}: {}", path.display(), e))
+        let mut config: Config = serde_yaml::from_str(&content)
+            .map_err(|e| format!("failed to parse {}: {}", path.display(), e))?;
+        resolve_secret_tags(&mut config.constants, path.parent())?;
+        Ok(config)
     }
 
     /// Layered load: user global → project → cli override. Later overrides earlier.
@@ -86,12 +93,11 @@ impl Config {
             config.merge(Config::load_from_path(cli_path)?);
         }
 
-        // Post-merge, pre-substitution: replace `!secret <path>` tags with the
-        // file's contents. Must run before `resolve_constant_refs` so a secret
-        // interpolated into a composed value (e.g. `db: postgres://u:${pw}@h`)
-        // carries the plaintext, and so the plaintext is registered for
-        // redaction before anything can print it.
-        resolve_secret_tags(&mut config.constants)?;
+        // `!secret` tags were already resolved per-layer in `load_from_path`,
+        // which runs before this merge — and therefore before the `${name}`
+        // substitution below, so a secret interpolated into a composed value
+        // (e.g. `db: postgres://u:${pw}@h`) carries the plaintext, and the
+        // plaintext is registered for redaction before anything can print it.
 
         // Post-merge: resolve `${name}` references inside constant string values
         // against the merged constants table (env + all yaml layers).
@@ -136,23 +142,43 @@ fn expand_tilde(path: &str) -> PathBuf {
     }
 }
 
+/// Resolve a `!secret` path: `~/` expands against `$HOME`, an absolute path is
+/// taken as-is, and a **relative path resolves against the directory of the
+/// config file that declares it** — not the process working directory, so a
+/// suite runs the same from anywhere.
+fn resolve_secret_path(path: &str, base_dir: Option<&Path>) -> PathBuf {
+    let expanded = expand_tilde(path);
+    match base_dir {
+        Some(dir) if expanded.is_relative() => dir.join(expanded),
+        _ => expanded,
+    }
+}
+
 /// Replace `!secret <path>` tagged constants with the file's contents, and
 /// register those contents with [`crate::secrets`] so display paths mask them.
+///
+/// `base_dir` is the declaring config file's directory; see
+/// [`resolve_secret_path`].
 ///
 /// The value is read as UTF-8 with the trailing newline stripped — a
 /// `pgpass`-style file ends with one, and a password with a stray `\n` fails
 /// authentication in a way that points nowhere near this config.
 fn resolve_secret_tags(
     constants: &mut std::collections::HashMap<String, serde_yaml::Value>,
+    base_dir: Option<&Path>,
 ) -> Result<(), String> {
     for (key, value) in constants.iter_mut() {
-        resolve_secret_tags_in(key, value)?;
+        resolve_secret_tags_in(key, value, base_dir)?;
     }
     Ok(())
 }
 
 /// Recursive worker for [`resolve_secret_tags`]; `key` is only for error text.
-fn resolve_secret_tags_in(key: &str, value: &mut serde_yaml::Value) -> Result<(), String> {
+fn resolve_secret_tags_in(
+    key: &str,
+    value: &mut serde_yaml::Value,
+    base_dir: Option<&Path>,
+) -> Result<(), String> {
     use serde_yaml::Value as Y;
     match value {
         Y::Tagged(tagged) => {
@@ -168,13 +194,19 @@ fn resolve_secret_tags_in(key: &str, value: &mut serde_yaml::Value) -> Result<()
             let path = tagged.value.as_str().ok_or_else(|| {
                 format!("constant `{}`: `!secret` expects a file path string", key)
             })?;
-            let resolved = expand_tilde(path);
+            let resolved = resolve_secret_path(path, base_dir);
             let contents = fs::read_to_string(&resolved).map_err(|e| {
+                // Show where we actually looked when it differs from what was
+                // written — a relative path resolves against the config's dir,
+                // which is the first thing anyone needs to know here.
+                let looked_in = if resolved.as_os_str() == path {
+                    String::new()
+                } else {
+                    format!(" (looked in {})", resolved.display())
+                };
                 format!(
-                    "constant `{}`: cannot read `!secret {}`: {}",
-                    key,
-                    resolved.display(),
-                    e,
+                    "constant `{}`: cannot read `!secret {}`{}: {}",
+                    key, path, looked_in, e,
                 )
             })?;
             let secret = contents.trim_end_matches(['\n', '\r']).to_string();
@@ -184,13 +216,13 @@ fn resolve_secret_tags_in(key: &str, value: &mut serde_yaml::Value) -> Result<()
         }
         Y::Sequence(seq) => {
             for item in seq.iter_mut() {
-                resolve_secret_tags_in(key, item)?;
+                resolve_secret_tags_in(key, item, base_dir)?;
             }
             Ok(())
         }
         Y::Mapping(map) => {
             for (_, v) in map.iter_mut() {
-                resolve_secret_tags_in(key, v)?;
+                resolve_secret_tags_in(key, v, base_dir)?;
             }
             Ok(())
         }
@@ -410,13 +442,21 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    /// Load a config from yaml text, then run the two post-merge passes in the
-    /// same order `load_layered` does.
-    fn resolve(yaml: &str) -> Result<std::collections::HashMap<String, serde_yaml::Value>, String> {
+    /// Resolve yaml text the way `load_layered` does: `!secret` tags first
+    /// (against `base_dir`, the declaring config's directory), then `${name}`.
+    fn resolve_in(
+        yaml: &str,
+        base_dir: Option<&Path>,
+    ) -> Result<std::collections::HashMap<String, serde_yaml::Value>, String> {
         let mut cfg: Config = serde_yaml::from_str(yaml).unwrap();
-        resolve_secret_tags(&mut cfg.constants)?;
+        resolve_secret_tags(&mut cfg.constants, base_dir)?;
         resolve_constant_refs(&mut cfg.constants)?;
         Ok(cfg.constants)
+    }
+
+    /// `resolve_in` with no declaring directory — absolute paths only.
+    fn resolve(yaml: &str) -> Result<std::collections::HashMap<String, serde_yaml::Value>, String> {
+        resolve_in(yaml, None)
     }
 
     #[test]
@@ -476,6 +516,77 @@ mod tests {
     fn secret_tag_expects_a_string_path() {
         let err = resolve("constants:\n  x: !secret 42\n").unwrap_err();
         assert!(err.contains("expects a file path string"), "got: {err}");
+    }
+
+    /// The bug from 0.8.2: a relative `!secret` path resolved against the process
+    /// working directory, so a suite loaded fine from its own dir and failed from
+    /// anywhere else.
+    #[test]
+    fn relative_secret_path_resolves_against_the_config_dir_not_cwd() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("pg_password"), "topsecretpw\n").unwrap();
+
+        // cwd is the crate root during tests, never `tmp` — so a cwd-relative
+        // lookup cannot accidentally succeed here.
+        let consts = resolve_in(
+            "constants:\n  dbPassword: !secret pg_password\n",
+            Some(tmp.path()),
+        )
+        .unwrap();
+
+        assert_eq!(consts["dbPassword"].as_str(), Some("topsecretpw"));
+    }
+
+    #[test]
+    fn absolute_secret_path_ignores_the_config_dir() {
+        let tmp = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let pw = tmp.path().join("pgpass");
+        fs::write(&pw, "abspathsecret\n").unwrap();
+
+        let consts = resolve_in(
+            &format!("constants:\n  dbPassword: !secret {}\n", pw.display()),
+            Some(elsewhere.path()),
+        )
+        .unwrap();
+
+        assert_eq!(consts["dbPassword"].as_str(), Some("abspathsecret"));
+    }
+
+    #[test]
+    fn missing_relative_secret_reports_where_it_looked() {
+        let tmp = TempDir::new().unwrap();
+        let err = resolve_in(
+            "constants:\n  dbPassword: !secret pg_password\n",
+            Some(tmp.path()),
+        )
+        .unwrap_err();
+        assert!(err.contains("!secret pg_password"), "got: {err}");
+        assert!(err.contains("looked in"), "got: {err}");
+        assert!(err.contains(&tmp.path().display().to_string()), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_secret_path_handles_tilde_absolute_and_relative() {
+        let home = std::env::var("HOME").unwrap();
+        let base = Path::new("/etc/tstr");
+        // `~/` wins over base_dir.
+        assert_eq!(
+            resolve_secret_path("~/pgpass", Some(base)),
+            PathBuf::from(&home).join("pgpass"),
+        );
+        // Absolute ignores base_dir.
+        assert_eq!(
+            resolve_secret_path("/abs/pgpass", Some(base)),
+            PathBuf::from("/abs/pgpass"),
+        );
+        // Relative joins base_dir.
+        assert_eq!(
+            resolve_secret_path("pgpass", Some(base)),
+            PathBuf::from("/etc/tstr/pgpass"),
+        );
+        // No base_dir — relative stays relative.
+        assert_eq!(resolve_secret_path("pgpass", None), PathBuf::from("pgpass"));
     }
 
     #[test]

@@ -8,6 +8,19 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.8.3"></a>
+## [0.8.3] — 2026-07-08
+
+### Fixed
+- **A relative `!secret` path now resolves against the config file that declares
+  it**, not the process working directory. As shipped in 0.8.2 a suite loaded
+  fine when run from its own root and failed with `No such file or directory`
+  from anywhere else. Tags are resolved per-layer during load, so a `pgpass`
+  named in `~/.config/tstr/config.yaml` is found beside that file rather than
+  beside the project's `tstr.yaml`. `~/` and absolute paths are unchanged.
+- **A failed `!secret` read now reports where it looked** when the resolved path
+  differs from the one written in the yaml.
+
 <a id="v0.8.2"></a>
 ## [0.8.2] — 2026-07-08
 
