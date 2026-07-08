@@ -12,3 +12,5 @@ pub mod config;
 pub mod version;
 #[cfg(feature = "kafka")]
 pub mod kafka;
+#[cfg(feature = "postgres")]
+pub mod postgres;

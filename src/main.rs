@@ -15,6 +15,8 @@ mod config;
 mod version;
 #[cfg(feature = "kafka")]
 mod kafka;
+#[cfg(feature = "postgres")]
+mod postgres;
 
 use clap::Parser;
 

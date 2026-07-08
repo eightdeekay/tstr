@@ -76,9 +76,14 @@ pub const KIND_FIELD: &str = "__kind";
 /// If `value` is a tagged Kafka object, return its `__kind` string; otherwise
 /// `None`. Method dispatch uses this to tell a broker from a cursor from an
 /// arbitrary user object.
+///
+/// Scoped to the `kafka.` namespace: other subsystems (e.g. `postgres`) tag
+/// their handles with the same `__kind` field, so this must claim only its own
+/// kinds — otherwise the kafka method-dispatch interception in `eval.rs` would
+/// swallow a `pg.connection` and report a bogus "not valid on a Kafka …" error.
 pub fn kind_of(value: &Value) -> Option<String> {
     match value.get_field(KIND_FIELD) {
-        Value::String(s) => Some(s),
+        Value::String(s) if s.starts_with("kafka.") => Some(s),
         _ => None,
     }
 }

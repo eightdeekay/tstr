@@ -609,6 +609,18 @@ fn eval_method_call(object: &Expr, method: &str, args: &[Expr], scope: &Scope) -
         return crate::kafka::dispatch_method(&kind, &obj, method, &vals, scope);
     }
 
+    // Postgres handles (connection/cursor) intercept the same way — routed by
+    // receiver kind, so `.query`/`.paginate`/`.page`/`.total` never collide
+    // with the collection methods below.
+    #[cfg(feature = "postgres")]
+    if let Some(kind) = crate::postgres::kind_of(&obj) {
+        let mut vals = Vec::with_capacity(args.len());
+        for a in args {
+            vals.push(eval_expr(a, scope)?);
+        }
+        return crate::postgres::dispatch_method(&kind, &obj, method, &vals, scope);
+    }
+
     match method {
         "filter" => {
             let arr = expect_array(&obj, "filter")?;
@@ -1015,6 +1027,15 @@ fn eval_builtin(name: &str, args: &[Expr], scope: &Scope) -> Result<Value, EvalE
             }
             let cfg = eval_expr(&args[0], scope)?;
             crate::kafka::broker_from_config(&cfg)
+        }
+
+        #[cfg(feature = "postgres")]
+        "postgres" => {
+            if args.len() != 1 {
+                return Err(EvalError::new("$.postgres(config) takes 1 argument"));
+            }
+            let cfg = eval_expr(&args[0], scope)?;
+            crate::postgres::connection_from_config(&cfg)
         }
 
         _ => Err(EvalError::new(format!("unknown built-in function '$.{}()'", name))),

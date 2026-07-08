@@ -511,6 +511,106 @@ so one built in a parent `setup.tstr` and `export`ed cascades to the whole tree.
 Run the live Kafka tests against a throwaway broker with `scripts/kafka-it.sh`
 (spins up Redpanda in Docker, points the tests at it, tears it down).
 
+## PostgreSQL
+
+*Built by default. For a lean build without Postgres (dropping the tokio-postgres
+/ rustls deps), use `cargo build --no-default-features`. TLS is rustls (pure Rust,
+`ring` provider — no OpenSSL/C toolchain).*
+
+For flows that read or seed a database directly — verify a row landed, set up a
+fixture, tear it down, assert on a large result set page by page — `$.postgres`
+opens a connection handle you configure once and reuse. Like `req`/`$.kafka`, the
+global bits (host, credentials, TLS) live in a `tstr.yaml` constant; the handle
+opens no connection until the first query, so one built in a parent `setup.tstr`
+and `export`ed cascades to the whole tree. Multiple databases = multiple handles.
+
+```yaml
+# tstr.yaml — the connection config, kept out of individual tests
+constants:
+  db:
+    host: localhost
+    port: 5432
+    database: appdb
+    user: tester
+    password: ${PG_PASSWORD}
+    schema: reporting      # optional; SET search_path before each op
+    sslmode: prefer        # disable | prefer | require | verify-full  (default: prefer)
+    sslInsecure: false      # true = accept self-signed certs (test DBs only); default false
+```
+
+```
+db-checks.test.tstr
+
+pg = $.postgres(${db});                 // handle; a bare "postgres://…" URL string also works
+
+// raw parameterized SQL — one primitive, covers select/insert/update/delete.
+// Params ($1, $2, …) bind as text and Postgres coerces them to the column types.
+r = pg.query("select * from users where org = $1 and active = $2", orgId, true);
+r.count > 0                 | "no users";
+r.rows[0].email != null     | "missing email";
+
+r = pg.query("insert into tags(name) values($1) returning id", nm);
+tagId = r.rows[0].id        | "insert returned no id";
+
+pg.query("delete from tags where id = $1", tagId);   // r.count = rows affected
+
+// pagination — a stateless cursor; each .page(n) re-issues with LIMIT/OFFSET
+c  = pg.paginate("select * from users order by id", 50);
+p0 = c.page(0);             // rows 1-50
+p1 = c.page(1);             // rows 51-100
+c.total() > 0               | "no rows";
+```
+
+**Operations:**
+
+| Call | Returns |
+|---|---|
+| `$.postgres(config)` | a connection handle — `config` is a `postgres://…` URL string or a config object (see above) |
+| `handle.query(sql, ...params)` | `{ rows, count }` — runs any statement |
+| `handle.paginate(sql, pageSize)` | a cursor over `sql`, `pageSize` rows per page |
+| `cursor.page(n)` | the 0-indexed n-th page: `{ rows, count, page, pageSize, done }` |
+| `cursor.total()` | total row count of the query (`count(*)`) |
+
+**Result shape.** Every `query` returns `{ rows, count }`:
+
+- **SELECT** (or any statement with `RETURNING`) → `rows` is an array of
+  `{ column: value }` objects; `count` is the number of rows returned.
+- **INSERT / UPDATE / DELETE** without `RETURNING` → `rows` is empty; `count` is
+  the number of rows affected.
+
+`cursor.page(n)` adds `page`, `pageSize`, and `done` (true when the page came
+back shorter than `pageSize` — i.e. the last one).
+
+**Semantics:**
+
+- **Parameters bind as text.** `$1`, `$2`, … are sent in text format and
+  Postgres coerces them to the inferred column types — so a number, bool,
+  timestamp, or uuid all just work without casts. Objects/arrays are sent as
+  JSON (pair with `$1::jsonb` when the target column is `jsonb`); `null` is a
+  real SQL `NULL`. Always parameterize values rather than interpolating them.
+- **Column types.** `int`/`float`/`numeric` come back as numbers (numeric as a
+  string, to preserve precision), `bool` as a bool, `json`/`jsonb` as parsed
+  objects, and `uuid`/timestamp/date/time as strings. Unmapped exotic types come
+  back as `null` rather than failing the query.
+- **`delete` is not a method.** Since `delete` (like `get`/`post`/…) is a
+  reserved HTTP verb, deletes go through `pg.query("delete from …")`, not a
+  `pg.delete(...)` method.
+- **Pagination is stateless** — `.page(n)` takes an explicit page index and
+  re-runs the query with `LIMIT/OFFSET` each time (no server-side cursor, no
+  connection held open between pages). Give the query a stable `ORDER BY` so
+  pages don't overlap.
+- **Schema.** `schema:` runs `SET search_path` on the connection before each op;
+  omit it to use the database default (or schema-qualify in the SQL).
+- **TLS.** `sslmode: disable` connects in plaintext; `require`/`verify-full`
+  use TLS. `sslInsecure: true` skips certificate verification for test servers
+  with self-signed certs — never use it against production.
+
+Each op opens a fresh connection, runs, and drops it (same no-keepalive stance
+as the HTTP client) — connection pooling is a later perf pass.
+
+Run the live Postgres tests against a throwaway server with `scripts/pg-it.sh`
+(spins up Postgres in Docker, points the tests at it, tears it down).
+
 ## Library Functions
 
 Libraries are `*.lib.tstr` files: callable functions with explicit parameters.
@@ -893,6 +993,8 @@ a, b --> {
 - **clap** — CLI argument parsing
 - **serde** + **serde_yaml** — config loading
 - **serde_json** — JSON parsing/serialization
+- **rskafka** — Kafka client (optional, `kafka` feature)
+- **tokio-postgres** + **rustls** — PostgreSQL client with pure-Rust TLS (optional, `postgres` feature)
 
 ## Editor Support
 

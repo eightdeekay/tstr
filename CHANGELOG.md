@@ -8,6 +8,41 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.7.2"></a>
+## [0.7.2] — 2026-07-08
+
+### Added
+- **PostgreSQL support**, behind an opt-in `postgres` cargo feature that is
+  **on by default** (like `kafka`); `cargo build --no-default-features` drops
+  it. `$.postgres(config)` opens a connection handle — `config` is a
+  `postgres://…` URL string or an object with
+  `host`/`port`/`database`/`user`/`password`/`schema`/`sslmode`/`sslInsecure`.
+  Two methods cover everything:
+  - `handle.query(sql, ...params)` runs any statement (select/insert/update/
+    delete) and returns `{ rows, count }`. Params (`$1`, `$2`, …) bind as text
+    and Postgres coerces them to the inferred column types, so no casts are
+    needed; objects/arrays bind as JSON, `null` as a real SQL NULL.
+  - `handle.paginate(sql, pageSize)` returns a stateless cursor; `cursor.page(n)`
+    fetches the 0-indexed n-th page via `LIMIT/OFFSET` and `cursor.total()`
+    returns `count(*)`.
+
+  Multiple connections = multiple handles. An optional `schema` runs
+  `SET search_path` before each op. TLS is rustls (pure Rust, `ring` provider —
+  no OpenSSL/C toolchain); `sslInsecure: true` accepts self-signed certs for
+  test servers. Result columns map to native values — numbers, bools, parsed
+  `json`/`jsonb`, and `numeric`/`uuid`/timestamps as strings. Each op opens a
+  fresh connection (no keepalive), matching the HTTP client. Live round-trips
+  run via `scripts/pg-it.sh` (throwaway Postgres in Docker);
+  `cargo test --features postgres` covers the hermetic units. Requires Rust
+  ≥ 1.85 (shared with the `kafka` feature's edition-2024 floor).
+
+### Fixed
+- **`kafka::kind_of` no longer claims non-Kafka handles.** It matched any object
+  carrying a `__kind` field, so with a second `__kind` user (the new Postgres
+  handles) a `pg.connection` was routed into Kafka method dispatch and reported
+  a bogus `'.query()' is not valid on a Kafka pg.connection value`. Both
+  subsystems now scope `kind_of` to their own namespace (`kafka.` / `pg.`).
+
 <a id="v0.7.1"></a>
 ## [0.7.1] — 2026-07-02
 

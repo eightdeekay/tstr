@@ -1,6 +1,6 @@
 [package]
 name = "tstr"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2021"
 license = "MIT"
 description = "CLI HTTP API test runner with a custom DSL"
@@ -37,14 +37,40 @@ base64 = "0.22.1"
 # supported until someone needs them — adding those features reintroduces a C
 # toolchain dep, which is exactly why we picked rskafka over rdkafka.
 rskafka = { version = "=0.6.0", optional = true, default-features = false, features = ["compression-gzip", "compression-snappy"] }
+# PostgreSQL client — optional, gated behind the `postgres` feature. Same
+# "avoid a C toolchain" stance as the Kafka deps: TLS is rustls (pure Rust) with
+# the `ring` crypto provider, NOT the default `aws-lc-rs` (which builds AWS-LC
+# from C). `rustls` default features are off so aws-lc-rs never gets pulled; we
+# opt back into ring/std/tls12/logging. `webpki-roots` supplies CA roots for the
+# verifying sslmodes.
+#
+# chrono/uuid/rust_decimal (all pure Rust) exist only to *decode* result columns:
+# Postgres sends rows in binary, so a UUID / timestamp / NUMERIC column can't be
+# read as text without the type's FromSql impl. tstr fetches those via these
+# crates' types and stringifies them (see `row_to_object`). The matching
+# tokio-postgres `with-*` features register the impls. `bytes::BytesMut` is the
+# buffer type in the `ToSql` signature for our text-coercing param adapter.
+tokio-postgres = { version = "0.7.18", optional = true, features = ["with-serde_json-1", "with-chrono-0_4", "with-uuid-1"] }
+tokio-postgres-rustls = { version = "0.14.0", default-features = false, features = ["ring", "webpki-roots"], optional = true }
+rustls = { version = "0.23.41", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
+webpki-roots = { version = "1.0.8", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["std"], optional = true }
+uuid = { version = "1", default-features = false, features = ["std"], optional = true }
+rust_decimal = { version = "1", default-features = false, features = ["std", "db-tokio-postgres"], optional = true }
+bytes = { version = "1", optional = true }
 
 [features]
 # Kafka produce/consume support. ON by default — the primary use case needs
 # `$.kafka` in the on-PATH binary, and the release build shouldn't have to
 # remember a flag. For a lean build without the rskafka/rsasl deps and the Rust
 # ≥1.85 (edition 2024) floor they impose, use `cargo build --no-default-features`.
-default = ["kafka"]
+#
+# PostgreSQL support is likewise ON by default — `$.postgres` should be in the
+# on-PATH binary. `cargo build --no-default-features` drops both kafka and
+# postgres (and their transitive deps) for a lean HTTP-only build.
+default = ["kafka", "postgres"]
 kafka = ["dep:rskafka"]
+postgres = ["dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:rustls", "dep:webpki-roots", "dep:chrono", "dep:uuid", "dep:rust_decimal", "dep:bytes"]
 
 [dev-dependencies]
 tempfile = "=3.8.0"
