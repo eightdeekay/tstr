@@ -31,7 +31,7 @@ Tree-sitter grammar not yet available. The vim syntax file above covers the same
 - **Strings**: `"..."` with escape sequences and `{{interpolation}}`
 - **Keywords**: `if`, `else`, `return`, `-->`, `<--`, `js:`
 - **HTTP methods**: `get(`, `post(`, `put(`, `patch(`, `delete(`
-- **Built-ins**: `$.uuid()`, `$.log()`, `$.string()`, etc.
+- **Built-ins**: `$.uuid()`, `$.log()`, `$.string()`, `$.kafka()`, `$.postgres()`, etc.
 - **Operators**: `==`, `!=`, `~`, `~?`, `&&`, `||`, `|`
 - **Status checks**: `? 2xx`, `? 200 201`, `? <500`
 - **Numbers**, **booleans**, **null**

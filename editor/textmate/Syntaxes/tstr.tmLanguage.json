@@ -4,14 +4,17 @@
   "fileTypes": ["tstr"],
   "patterns": [
     { "include": "#comments" },
+    { "include": "#metadata" },
     { "include": "#arrows" },
     { "include": "#strings" },
     { "include": "#regex" },
     { "include": "#builtins" },
+    { "include": "#constant-ref" },
     { "include": "#http-methods" },
     { "include": "#keywords" },
     { "include": "#status-check" },
     { "include": "#operators" },
+    { "include": "#duration" },
     { "include": "#numbers" },
     { "include": "#interpolation" },
     { "include": "#file-ref" },
@@ -81,7 +84,7 @@
       "patterns": [
         {
           "name": "support.function.builtin.tstr",
-          "match": "\\$\\.(uuid|string|randEmail|now|log)\\b"
+          "match": "\\$\\.(uuid|string|randEmail|now|log|hmacSha256|stripeSign|kafka|postgres)\\b"
         },
         {
           "name": "support.function.builtin.tstr",
@@ -93,7 +96,7 @@
       "patterns": [
         {
           "name": "keyword.other.http-method.tstr",
-          "match": "\\b(get|post|put|patch|delete)\\s*\\("
+          "match": "\\b(get|post|put|patch|delete|head|options)\\s*\\("
         }
       ]
     },
@@ -101,7 +104,7 @@
       "patterns": [
         {
           "name": "keyword.control.tstr",
-          "match": "\\b(if|else|return)\\b"
+          "match": "\\b(if|else|return|export|retry|as|matrix)\\b"
         },
         {
           "name": "keyword.other.js.tstr",
@@ -109,7 +112,7 @@
         },
         {
           "name": "storage.type.tstr",
-          "match": "\\b(urlPrefix)\\b"
+          "match": "\\b(urlPrefix|_response)\\b"
         }
       ]
     },
@@ -174,6 +177,30 @@
         {
           "name": "constant.language.tstr",
           "match": "\\b(null|true|false)\\b"
+        }
+      ]
+    },
+    "metadata": {
+      "patterns": [
+        {
+          "name": "keyword.other.metadata.tstr",
+          "match": "^\\s*(requires|disabled|blast-radius)(?=\\s*:)"
+        }
+      ]
+    },
+    "constant-ref": {
+      "patterns": [
+        {
+          "name": "variable.other.constant.tstr",
+          "match": "\\$\\{[^}]+\\}"
+        }
+      ]
+    },
+    "duration": {
+      "patterns": [
+        {
+          "name": "constant.numeric.duration.tstr",
+          "match": "\\b\\d+(ms|s|m)\\b"
         }
       ]
     }

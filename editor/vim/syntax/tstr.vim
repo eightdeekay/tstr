@@ -26,15 +26,21 @@ syn match tstrRegex /\(~?\s*\|!~\s*\|~\s*\)\/[^/]*\// contains=tstrRegexDelim
 syn match tstrRegexDelim /\// contained
 
 " Built-in functions
-syn match tstrBuiltin /\$\.\(uuid\|string\|randEmail\|now\|log\)\>/
+syn match tstrBuiltin /\$\.\(uuid\|string\|randEmail\|now\|log\|hmacSha256\|stripeSign\|kafka\|postgres\)\>/
 syn match tstrBuiltin /\$\.[a-zA-Z_][a-zA-Z0-9_]*/
 
 " HTTP methods
-syn match tstrHttpMethod /\<\(get\|post\|put\|patch\|delete\)\s*(/me=e-1
+syn match tstrHttpMethod /\<\(get\|post\|put\|patch\|delete\|head\|options\)\s*(/me=e-1
 
 " Keywords
-syn keyword tstrKeyword if else return
+syn keyword tstrKeyword if else return export retry as matrix
 syn match tstrKeyword /\<js:/
+
+" Metadata block keys (requires:, disabled:, blast-radius:) — the key only
+syn match tstrMetaKey /^\s*\(requires\|disabled\|blast-radius\)\ze\s*:/
+
+" Constant references ${name}
+syn match tstrConstantRef /\${[^}]\+}/
 
 " Status check
 syn match tstrStatusCheck /?\s*\(\d\+\|\dxx\|[><=]\+\d\+\|\d\+-\d\+\)/
@@ -49,6 +55,10 @@ syn keyword tstrConstant null true false
 
 " Numbers
 syn match tstrNumber /-\?\d\+\(\.\d\+\)\?/
+
+" Duration literals (30s, 500ms, 2m) — defined after numbers so the unit form
+" wins over the bare-number match for the same text.
+syn match tstrDuration /\<\d\+\(ms\|s\|m\)\>/
 
 " File references
 syn match tstrFileRef /@[A-Za-z0-9_./-]\+/
@@ -73,6 +83,9 @@ hi def link tstrStatusCheck PreProc
 hi def link tstrOperator Operator
 hi def link tstrConstant Constant
 hi def link tstrNumber Number
+hi def link tstrDuration Number
+hi def link tstrMetaKey PreProc
+hi def link tstrConstantRef Special
 hi def link tstrFileRef String
 hi def link tstrSpecialVar Identifier
 

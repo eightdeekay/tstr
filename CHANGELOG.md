@@ -8,6 +8,19 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.8.1"></a>
+## [0.8.1] — 2026-07-08
+
+### Changed
+- **Editor syntax files brought back in sync with the language.** The vim and
+  TextMate grammars (`editor/`) had drifted well behind the parser; they now
+  cover HTTP verbs `head`/`options`, the keywords `export`/`retry`/`as`/`matrix`,
+  the metadata block keys (`requires:`/`disabled:`/`blast-radius:`), `${name}`
+  constant references, duration literals (`30s`/`500ms`/`2m`), and the full
+  `$.`-builtin set (`hmacSha256`, `stripeSign`, `kafka`, `postgres`). The two
+  `tmLanguage.json` copies are kept byte-identical. No change to the language,
+  CLI, or binary — editor highlighting only.
+
 <a id="v0.8.0"></a>
 ## [0.8.0] — 2026-07-08
 
