@@ -86,6 +86,13 @@ impl Config {
             config.merge(Config::load_from_path(cli_path)?);
         }
 
+        // Post-merge, pre-substitution: replace `!secret <path>` tags with the
+        // file's contents. Must run before `resolve_constant_refs` so a secret
+        // interpolated into a composed value (e.g. `db: postgres://u:${pw}@h`)
+        // carries the plaintext, and so the plaintext is registered for
+        // redaction before anything can print it.
+        resolve_secret_tags(&mut config.constants)?;
+
         // Post-merge: resolve `${name}` references inside constant string values
         // against the merged constants table (env + all yaml layers).
         resolve_constant_refs(&mut config.constants)?;
@@ -114,6 +121,80 @@ impl Config {
     /// Per-run log files to keep under `<root>/logs/`. `0` means keep all.
     pub fn log_retention(&self) -> usize {
         self.log_retention.unwrap_or(DEFAULT_LOG_RETENTION)
+    }
+}
+
+/// Expand a leading `~/` against `$HOME`. Any other path is returned as-is —
+/// `~user/` (other users' homes) is deliberately not supported.
+fn expand_tilde(path: &str) -> PathBuf {
+    match path.strip_prefix("~/") {
+        Some(rest) => match std::env::var_os("HOME") {
+            Some(home) => PathBuf::from(home).join(rest),
+            None => PathBuf::from(path),
+        },
+        None => PathBuf::from(path),
+    }
+}
+
+/// Replace `!secret <path>` tagged constants with the file's contents, and
+/// register those contents with [`crate::secrets`] so display paths mask them.
+///
+/// The value is read as UTF-8 with the trailing newline stripped — a
+/// `pgpass`-style file ends with one, and a password with a stray `\n` fails
+/// authentication in a way that points nowhere near this config.
+fn resolve_secret_tags(
+    constants: &mut std::collections::HashMap<String, serde_yaml::Value>,
+) -> Result<(), String> {
+    for (key, value) in constants.iter_mut() {
+        resolve_secret_tags_in(key, value)?;
+    }
+    Ok(())
+}
+
+/// Recursive worker for [`resolve_secret_tags`]; `key` is only for error text.
+fn resolve_secret_tags_in(key: &str, value: &mut serde_yaml::Value) -> Result<(), String> {
+    use serde_yaml::Value as Y;
+    match value {
+        Y::Tagged(tagged) => {
+            // `Tag`'s Display renders with the leading `!`.
+            let tag = tagged.tag.to_string();
+            let name = tag.trim_start_matches('!');
+            if name != "secret" {
+                return Err(format!(
+                    "constant `{}`: unknown tag `!{}` (only `!secret` is supported)",
+                    key, name,
+                ));
+            }
+            let path = tagged.value.as_str().ok_or_else(|| {
+                format!("constant `{}`: `!secret` expects a file path string", key)
+            })?;
+            let resolved = expand_tilde(path);
+            let contents = fs::read_to_string(&resolved).map_err(|e| {
+                format!(
+                    "constant `{}`: cannot read `!secret {}`: {}",
+                    key,
+                    resolved.display(),
+                    e,
+                )
+            })?;
+            let secret = contents.trim_end_matches(['\n', '\r']).to_string();
+            crate::secrets::register(&secret);
+            *value = Y::String(secret);
+            Ok(())
+        }
+        Y::Sequence(seq) => {
+            for item in seq.iter_mut() {
+                resolve_secret_tags_in(key, item)?;
+            }
+            Ok(())
+        }
+        Y::Mapping(map) => {
+            for (_, v) in map.iter_mut() {
+                resolve_secret_tags_in(key, v)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -328,6 +409,87 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    /// Load a config from yaml text, then run the two post-merge passes in the
+    /// same order `load_layered` does.
+    fn resolve(yaml: &str) -> Result<std::collections::HashMap<String, serde_yaml::Value>, String> {
+        let mut cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        resolve_secret_tags(&mut cfg.constants)?;
+        resolve_constant_refs(&mut cfg.constants)?;
+        Ok(cfg.constants)
+    }
+
+    #[test]
+    fn secret_tag_loads_file_and_strips_trailing_newline() {
+        let tmp = TempDir::new().unwrap();
+        let pw = tmp.path().join("pgpass");
+        fs::write(&pw, "sup3rs3cret\n").unwrap();
+
+        let consts = resolve(&format!(
+            "constants:\n  dbPassword: !secret {}\n",
+            pw.display(),
+        ))
+        .unwrap();
+
+        assert_eq!(consts["dbPassword"].as_str(), Some("sup3rs3cret"));
+    }
+
+    #[test]
+    fn secret_is_composed_into_a_referencing_constant_as_plaintext() {
+        let tmp = TempDir::new().unwrap();
+        let pw = tmp.path().join("pgpass");
+        fs::write(&pw, "sup3rs3cret\n").unwrap();
+
+        let consts = resolve(&format!(
+            "constants:\n  \
+             dbPassword: !secret {}\n  \
+             db: postgres://doadmin:${{dbPassword}}@example.com:25060/defaultdb\n",
+            pw.display(),
+        ))
+        .unwrap();
+
+        // The composed value must carry the real password — redaction happens at
+        // print time, never in the value itself.
+        assert_eq!(
+            consts["db"].as_str(),
+            Some("postgres://doadmin:sup3rs3cret@example.com:25060/defaultdb"),
+        );
+    }
+
+    #[test]
+    fn unknown_tag_is_an_error_not_a_silent_null() {
+        let tmp = TempDir::new().unwrap();
+        let pw = tmp.path().join("pgpass");
+        fs::write(&pw, "sup3rs3cret\n").unwrap();
+
+        let err = resolve(&format!("constants:\n  x: !file {}\n", pw.display())).unwrap_err();
+        assert!(err.contains("unknown tag `!file`"), "got: {err}");
+    }
+
+    #[test]
+    fn missing_secret_file_is_an_error() {
+        let err = resolve("constants:\n  x: !secret /nonexistent/pgpass\n").unwrap_err();
+        assert!(err.contains("cannot read"), "got: {err}");
+    }
+
+    #[test]
+    fn secret_tag_expects_a_string_path() {
+        let err = resolve("constants:\n  x: !secret 42\n").unwrap_err();
+        assert!(err.contains("expects a file path string"), "got: {err}");
+    }
+
+    #[test]
+    fn expand_tilde_uses_home_and_leaves_other_paths_alone() {
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(
+            expand_tilde("~/.config/tstr/pgpass"),
+            PathBuf::from(&home).join(".config/tstr/pgpass"),
+        );
+        assert_eq!(expand_tilde("/abs/path"), PathBuf::from("/abs/path"));
+        assert_eq!(expand_tilde("rel/path"), PathBuf::from("rel/path"));
+        // `~user` is not tilde expansion — left verbatim.
+        assert_eq!(expand_tilde("~other/path"), PathBuf::from("~other/path"));
+    }
 
     #[test]
     fn load_empty_yaml() {

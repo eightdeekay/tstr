@@ -8,6 +8,29 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.8.2"></a>
+## [0.8.2] — 2026-07-08
+
+### Added
+- **`!secret <path>` constants in `tstr.yaml`.** A constant tagged `!secret` reads
+  its value from a file rather than the yaml, keeping passwords out of a config
+  that gets pasted, committed, or shared on a screen. A leading `~/` expands
+  against `$HOME` and one trailing newline is stripped. Tags resolve before
+  `${name}` substitution, so a secret composes into other constants
+  (`db: postgres://u:${dbPassword}@host`) as usual.
+- **Secret redaction in tstr's own output.** Registered secret values are masked as
+  `[redacted]` wherever a report, variable table, or run log would print them —
+  including when the value is buried inside a composed string. Masking is
+  display-only: requests, queries, and Kafka payloads still carry the real value.
+  Values under 6 characters are not registered, since content-based masking would
+  censor unrelated output.
+
+### Fixed
+- **Unknown yaml tags on constants are now a load-time error naming the tag.**
+  Tagged scalars previously fell through to `null` with no diagnostic, so a typo
+  like `!secrets` would have yielded a null constant and a failure far from its
+  cause.
+
 <a id="v0.8.1"></a>
 ## [0.8.1] — 2026-07-08
 

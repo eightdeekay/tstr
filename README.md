@@ -139,6 +139,47 @@ constants:
 - Only string values are walked; numbers and bools get stringified when substituted
   into a string, but objects/lists can't be inlined.
 
+### Secrets: `!secret <path>`
+
+A constant tagged `!secret` takes its value from a file instead of the yaml, so a
+password never sits in a config you might paste, commit, or open in front of an
+audience:
+
+```yaml
+# ~/.config/tstr/config.yaml
+constants:
+  dbPassword: !secret ~/.config/tstr/pgpass
+  db: postgres://doadmin:${dbPassword}@${dbHost}:${dbPort}/defaultdb
+```
+
+The file is read as UTF-8, a leading `~/` expands against `$HOME`, and **one
+trailing newline is stripped** (the shape `printf 'pw\n' > pgpass` leaves) — a
+password with a stray `\n` fails authentication in a way that points nowhere near
+this config.
+
+Secret tags resolve *before* `${name}` substitution, so a secret composes into
+other constants normally, as `db` does above.
+
+tstr then **masks the value in its own output**. Anywhere a report, variable
+table, or run log would print a secret — on its own or buried inside a composed
+string — it renders as `[redacted]`:
+
+```
++ conn = postgres://doadmin:[redacted]@db.example.com:25060/defaultdb
++ pw = [redacted]
+```
+
+Two things this deliberately does *not* do:
+
+- **It doesn't mask on the wire.** Requests, queries, and Kafka payloads carry the
+  real value — that's the point of having it. Masking applies to display only.
+- **It doesn't protect short values.** Secrets under 6 characters are never
+  registered, since masking by content would censor unrelated output that happens
+  to contain the same substring.
+
+Reading an unreadable or missing file is a load-time error, as is any tag other
+than `!secret`.
+
 ## Constants and Variables
 
 Three categories of named values:

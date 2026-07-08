@@ -1054,7 +1054,9 @@ impl Printer {
 
             if self.mode == OutputMode::Verbose && !result.exports.is_empty() {
                 for (k, v) in &result.exports {
-                    let display = v.to_display_string();
+                    // Redact before truncating: a 60-char slice of a secret no
+                    // longer matches the registry and would print in the clear.
+                    let display = crate::secrets::redact(&v.to_display_string());
                     let truncated = if display.len() > 60 {
                         format!("{}...", &display[..57])
                     } else {
@@ -1745,7 +1747,8 @@ fn format_duration(d: std::time::Duration) -> String {
 const VALUE_MAX: usize = 60;
 
 fn truncate_value(v: &crate::value::Value) -> String {
-    let s = v.to_display_string();
+    // Redact before truncating — see the note in the exports display path.
+    let s = crate::secrets::redact(&v.to_display_string());
     if s.len() > VALUE_MAX {
         format!("{}...", &s[..VALUE_MAX - 3])
     } else {

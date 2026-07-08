@@ -9,6 +9,7 @@ pub mod runner;
 pub mod output;
 pub mod filter;
 pub mod config;
+pub mod secrets;
 pub mod version;
 #[cfg(feature = "kafka")]
 pub mod kafka;
