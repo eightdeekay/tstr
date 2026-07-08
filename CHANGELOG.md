@@ -8,6 +8,21 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.8.0"></a>
+## [0.8.0] — 2026-07-08
+
+Rounds out the PostgreSQL support introduced in 0.7.2 and promotes it to a minor
+milestone. No breaking changes.
+
+### Added
+- **Per-op schema selection on the connection handle.** A connection's `schema`
+  is read fresh before every operation and applied as `SET search_path`, so it
+  can be set dynamically mid-test — `pg.schema = "tenant_a"` — the same way you
+  configure a `req` object. The next query (and every one after, until changed)
+  runs against that schema; a `tstr.yaml` `schema` is just the starting value.
+  Now documented in the README and covered by a live round-trip test
+  (`scripts/pg-it.sh`).
+
 <a id="v0.7.2"></a>
 ## [0.7.2] — 2026-07-08
 

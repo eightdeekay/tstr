@@ -905,4 +905,52 @@ mod tests {
 
         q(&format!("drop table if exists {table}"), &[]).unwrap();
     }
+
+    /// Live: `schema` is read off the handle at every op, so setting it
+    /// dynamically (`pg.schema = "s1"` in the DSL) reroutes the very next
+    /// query's `search_path`. Skipped unless `TSTR_PG_TEST_URL` is set.
+    #[test]
+    fn dynamic_schema_switch_live() {
+        let url = match std::env::var("TSTR_PG_TEST_URL") {
+            Ok(u) if !u.is_empty() => u,
+            _ => {
+                eprintln!("skipping dynamic_schema_switch_live (set TSTR_PG_TEST_URL=postgres://user:pass@host/db)");
+                return;
+            }
+        };
+        // `pg.schema = "…"` in the DSL is a field assignment on the handle
+        // object; here we do the same by inserting the field on the Value.
+        let set_schema = |handle: &Value, schema: &str| -> Value {
+            let mut h = handle.clone();
+            h.set_field("schema", Value::String(schema.to_string()));
+            h
+        };
+        let base = connection_from_config(&Value::String(url)).unwrap();
+        let query = |h: &Value, sql: &str| {
+            dispatch_method(kind::CONNECTION, h, "query", &[Value::String(sql.to_string())], &sc())
+        };
+
+        // Two schemas, same table name, distinguishable rows.
+        query(&base, "drop schema if exists tstr_s1 cascade").unwrap();
+        query(&base, "drop schema if exists tstr_s2 cascade").unwrap();
+        query(&base, "create schema tstr_s1").unwrap();
+        query(&base, "create schema tstr_s2").unwrap();
+        query(&base, "create table tstr_s1.t(tag text)").unwrap();
+        query(&base, "create table tstr_s2.t(tag text)").unwrap();
+        query(&base, "insert into tstr_s1.t values('from-s1')").unwrap();
+        query(&base, "insert into tstr_s2.t values('from-s2')").unwrap();
+
+        // Point the handle at s1, then query the UNqualified table name.
+        let pg = set_schema(&base, "tstr_s1");
+        let r1 = query(&pg, "select tag from t").unwrap();
+        assert_eq!(r1.get_field("rows").get_index(0).get_field("tag"), Value::String("from-s1".into()));
+
+        // Switch to s2 on a fresh handle value (a re-assignment in the DSL).
+        let pg = set_schema(&base, "tstr_s2");
+        let r2 = query(&pg, "select tag from t").unwrap();
+        assert_eq!(r2.get_field("rows").get_index(0).get_field("tag"), Value::String("from-s2".into()));
+
+        query(&base, "drop schema if exists tstr_s1 cascade").unwrap();
+        query(&base, "drop schema if exists tstr_s2 cascade").unwrap();
+    }
 }

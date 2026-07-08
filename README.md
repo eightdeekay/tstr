@@ -599,8 +599,23 @@ back shorter than `pageSize` — i.e. the last one).
   re-runs the query with `LIMIT/OFFSET` each time (no server-side cursor, no
   connection held open between pages). Give the query a stable `ORDER BY` so
   pages don't overlap.
-- **Schema.** `schema:` runs `SET search_path` on the connection before each op;
-  omit it to use the database default (or schema-qualify in the SQL).
+- **Schema — settable per op.** `schema` runs `SET search_path` on the
+  connection before each op; omit it to use the database default (or
+  schema-qualify in the SQL). It's read off the handle *every* time, so you can
+  set it dynamically mid-test — the same way you'd configure a `req` object —
+  and the change applies to the next query (and every one after, until changed):
+
+  ```
+  pg = $.postgres(${db});          // no schema → database default
+  pg.schema = "tenant_a";
+  a = pg.query("select * from accounts");   // runs against tenant_a
+
+  pg.schema = "tenant_b";
+  b = pg.query("select * from accounts");   // now against tenant_b
+  ```
+
+  A schema set in the `tstr.yaml` config is just the starting value; assigning
+  `pg.schema` overrides it from that point on.
 - **TLS.** `sslmode: disable` connects in plaintext; `require`/`verify-full`
   use TLS. `sslInsecure: true` skips certificate verification for test servers
   with self-signed certs — never use it against production.
