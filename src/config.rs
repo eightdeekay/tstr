@@ -107,7 +107,8 @@ impl Config {
     }
 
     /// Merge `other` into `self`. Scalar fields: `other` wins when present.
-    /// List fields: `other` appends to `self`. Constants: per-key, `other` wins.
+    /// List fields: `other` appends to `self`. Constants: deep-merged, see
+    /// [`merge_constant`].
     fn merge(&mut self, other: Config) {
         self.defaults.import.extend(other.defaults.import);
         if other.defaults.display.is_some() {
@@ -120,7 +121,12 @@ impl Config {
             self.log_retention = other.log_retention;
         }
         for (k, v) in other.constants {
-            self.constants.insert(k, v);
+            match self.constants.get_mut(&k) {
+                Some(existing) => merge_constant(existing, v),
+                None => {
+                    self.constants.insert(k, v);
+                }
+            }
         }
     }
 
@@ -130,9 +136,45 @@ impl Config {
     }
 }
 
+/// Merge one constant value from a later layer into an earlier one.
+///
+/// Two mappings are **deep-merged**: keys union, and a key present in both
+/// recurses. Everything else — scalars, sequences, and any type mismatch —
+/// is **replaced** wholesale by the later layer.
+///
+/// This is what lets `~/.config/tstr/config.yaml` and a project `tstr.yaml`
+/// co-own one object constant: the user file supplies `db.host`, the project
+/// file supplies `db.database`, and both survive. A shallow per-key replace
+/// (what tstr did before 0.9.0) meant the project's `db` obliterated the
+/// user's, so per-developer fields had to be smuggled in as flat scalars and
+/// re-composed with `${dbHost}`.
+///
+/// Sequences replace rather than append: appending is right for a search path
+/// like `defaults.import`, and wrong inside a constant, where a parent layer's
+/// leftover elements riding along is the surprising outcome.
+fn merge_constant(base: &mut serde_yaml::Value, other: serde_yaml::Value) {
+    use serde_yaml::Value as Y;
+    match other {
+        Y::Mapping(other_map) if matches!(base, Y::Mapping(_)) => {
+            let Y::Mapping(base_map) = base else {
+                unreachable!("guarded by the matches! above")
+            };
+            for (k, v) in other_map {
+                match base_map.get_mut(&k) {
+                    Some(existing) => merge_constant(existing, v),
+                    None => {
+                        base_map.insert(k, v);
+                    }
+                }
+            }
+        }
+        other => *base = other,
+    }
+}
+
 /// Expand a leading `~/` against `$HOME`. Any other path is returned as-is —
 /// `~user/` (other users' homes) is deliberately not supported.
-fn expand_tilde(path: &str) -> PathBuf {
+pub(crate) fn expand_tilde(path: &str) -> PathBuf {
     match path.strip_prefix("~/") {
         Some(rest) => match std::env::var_os("HOME") {
             Some(home) => PathBuf::from(home).join(rest),
@@ -516,6 +558,92 @@ mod tests {
     fn secret_tag_expects_a_string_path() {
         let err = resolve("constants:\n  x: !secret 42\n").unwrap_err();
         assert!(err.contains("expects a file path string"), "got: {err}");
+    }
+
+    /// Merge `project` (a later layer) into `user` (earlier) and return the
+    /// resulting constants, the way `load_layered` stacks them.
+    fn merged(user: &str, project: &str) -> serde_yaml::Value {
+        let mut base: Config = serde_yaml::from_str(user).unwrap();
+        let other: Config = serde_yaml::from_str(project).unwrap();
+        base.merge(other);
+        serde_yaml::to_value(&base.constants).unwrap()
+    }
+
+    #[test]
+    fn object_constants_deep_merge_across_layers() {
+        // The layer-services shape: user config owns the per-developer fields,
+        // the project file owns the per-suite ones. Before 0.9.0 the project's
+        // `db` replaced the user's outright and `host` was lost.
+        let consts = merged(
+            "constants:\n  db:\n    host: db.example.com\n    port: 25060\n",
+            "constants:\n  db:\n    database: notify\n    sslmode: require\n",
+        );
+        let db = &consts["db"];
+        assert_eq!(db["host"].as_str(), Some("db.example.com"));
+        assert_eq!(db["port"].as_u64(), Some(25060));
+        assert_eq!(db["database"].as_str(), Some("notify"));
+        assert_eq!(db["sslmode"].as_str(), Some("require"));
+    }
+
+    #[test]
+    fn later_layer_wins_on_a_colliding_leaf() {
+        let consts = merged(
+            "constants:\n  db:\n    database: mine\n    host: h\n",
+            "constants:\n  db:\n    database: notify\n",
+        );
+        assert_eq!(consts["db"]["database"].as_str(), Some("notify"));
+        // Non-colliding sibling from the earlier layer survives.
+        assert_eq!(consts["db"]["host"].as_str(), Some("h"));
+    }
+
+    #[test]
+    fn a_user_layer_may_add_a_field_the_project_omits() {
+        // Doug's case: `sslInsecure` set per-developer, on an object the
+        // checked-in project file owns.
+        let consts = merged(
+            "constants:\n  db:\n    sslInsecure: true\n",
+            "constants:\n  db:\n    host: h\n    sslmode: require\n",
+        );
+        assert_eq!(consts["db"]["sslInsecure"].as_bool(), Some(true));
+        assert_eq!(consts["db"]["sslmode"].as_str(), Some("require"));
+    }
+
+    #[test]
+    fn nested_mappings_merge_at_every_depth() {
+        let consts = merged(
+            "constants:\n  a:\n    b:\n      c: 1\n      keep: yes\n",
+            "constants:\n  a:\n    b:\n      c: 2\n    sibling: added\n",
+        );
+        assert_eq!(consts["a"]["b"]["c"].as_u64(), Some(2));
+        assert_eq!(consts["a"]["b"]["keep"].as_str(), Some("yes"));
+        assert_eq!(consts["a"]["sibling"].as_str(), Some("added"));
+    }
+
+    #[test]
+    fn sequences_replace_rather_than_append() {
+        let consts = merged(
+            "constants:\n  xs: [1, 2, 3]\n",
+            "constants:\n  xs: [9]\n",
+        );
+        let xs = consts["xs"].as_sequence().unwrap();
+        assert_eq!(xs.len(), 1, "list should replace, not append: {xs:?}");
+        assert_eq!(xs[0].as_u64(), Some(9));
+    }
+
+    #[test]
+    fn a_type_mismatch_replaces_wholesale() {
+        // Object over string, and string over object — later layer wins either way.
+        let consts = merged(
+            "constants:\n  db: postgres://old\n",
+            "constants:\n  db:\n    host: h\n",
+        );
+        assert_eq!(consts["db"]["host"].as_str(), Some("h"));
+
+        let consts = merged(
+            "constants:\n  db:\n    host: h\n",
+            "constants:\n  db: postgres://new\n",
+        );
+        assert_eq!(consts["db"].as_str(), Some("postgres://new"));
     }
 
     /// The bug from 0.8.2: a relative `!secret` path resolved against the process

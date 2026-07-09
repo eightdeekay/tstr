@@ -109,7 +109,37 @@ constants:
 3. `<suite-root>/tstr.yaml` — project local
 4. `--config <path>` — explicit CLI override
 
-Scalars replace, lists append (so `--import` adds to defaults rather than replacing).
+Under `defaults`, scalars replace and lists append (so `--import` adds to defaults
+rather than replacing).
+
+**Constants deep-merge.** When two layers define the same object constant, their
+keys union and the later layer wins only on the fields it actually sets. This lets
+a user config and a project config co-own one object — the developer supplies the
+machine-specific fields, the project supplies the shared ones:
+
+```yaml
+# ~/.config/tstr/config.yaml — per-developer
+constants:
+  db:
+    host: layer-dk-do-user-1149.b.db.ondigitalocean.com
+    port: 25060
+    sslInsecure: true      # a field the project file doesn't set
+
+# ./tstr.yaml — checked in, shared
+constants:
+  db:
+    database: notify       # per-suite
+    sslmode: require
+```
+
+The handle `$.postgres(${db})` sees all five fields. Anything that isn't a mapping
+— scalars *and lists* — is replaced wholesale by the later layer rather than
+merged, since a parent layer's leftover list elements riding along is rarely what
+anyone means.
+
+Note the precedence direction: the project layer loads *after* the user layer, so
+it wins on any field it sets. A developer can **add** fields the project omits, but
+can't override one the project defines. Use `--set` or `--config` for that.
 
 ### Interpolation Inside `tstr.yaml`
 
@@ -589,8 +619,33 @@ constants:
     password: ${PG_PASSWORD}
     schema: reporting      # optional; SET search_path before each op
     sslmode: prefer        # disable | prefer | require | verify-full  (default: prefer)
-    sslInsecure: false      # true = accept self-signed certs (test DBs only); default false
+    sslRootCert: ~/.config/tstr/do-ca.crt   # verify against this PEM CA bundle
+    sslInsecure: false      # true = accept any cert (test DBs only); default false
 ```
+
+An unrecognized field is an error, not a no-op — a typo like `sslinsecure` or a
+plausible-but-wrong `caCert` fails the run naming the key, rather than being
+dropped and resurfacing as a baffling TLS failure.
+
+### Managed clusters with a private CA
+
+DigitalOcean, RDS, and Cloud SQL sign their server certificates with a *per-project
+CA* that chains to no public root, so the default public root store rejects them
+and the handshake fails. Point `sslRootCert` at the CA bundle the provider gives
+you (DO: console → Connection Details → *Download CA certificate*, or
+`doctl databases ca get <cluster-id>`):
+
+```yaml
+constants:
+  db:
+    sslmode: require
+    sslRootCert: ~/.auth/certs/ca-certificate.crt
+```
+
+The path takes a leading `~/`. A missing file, a file with no `CERTIFICATE` block,
+or an unusable certificate each fail at connect time with a message naming the
+path. `sslRootCert` and `sslInsecure` are mutually exclusive — one performs the
+verification the other skips — and setting both is an error.
 
 ```
 db-checks.test.tstr

@@ -8,6 +8,48 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.9.0"></a>
+## [0.9.0] — 2026-07-09
+
+⚠️ Two changes need a look at existing suites — constants deep-merge across
+config layers, and an unrecognized `$.postgres` field is now an error. Both fail
+loudly. See [UPGRADING § 0.9.0](UPGRADING.md#v0.9.0). No codemod: neither is a
+mechanical rewrite.
+
+### Added
+- **`sslRootCert` on the `$.postgres` handle.** Verify the server certificate
+  against a PEM CA bundle instead of the public root store. Managed clusters
+  (DigitalOcean, RDS, Cloud SQL) sign with a per-project CA that chains to no
+  public root, so the previous choice was `sslInsecure` or nothing. A leading
+  `~/` expands. A missing file, a file with no `CERTIFICATE` block, or an
+  unusable certificate each fail at connect time naming the path. Setting both
+  `sslRootCert` and `sslInsecure` is an error — one performs the verification the
+  other skips.
+
+### Changed
+- ⚠️ **An unrecognized `$.postgres` config field is now an error** listing the
+  offending key and the known fields. Unknown keys were silently dropped, so a
+  typo (`sslinsecure`) or a plausible-but-wrong name (`caCert`) produced no
+  diagnostic and resurfaced as an inscrutable TLS or auth failure. Handles
+  carrying stray keys that happened to be ignored will now fail loudly.
+- ⚠️ **Object constants now deep-merge across config layers** instead of being
+  replaced per top-level key. When `~/.config/tstr/config.yaml` and a project
+  `tstr.yaml` both define `db:`, their fields union and the project layer wins
+  only on the keys it actually sets — so a developer can supply `db.host` and
+  `db.sslInsecure` while the checked-in file owns `db.database`. Previously the
+  project's `db` obliterated the user's, which is why per-developer values had to
+  be smuggled in as flat scalars (`dbHost`) and re-composed with `${dbHost}`.
+  That indirection still works and needs no change.
+
+  Mappings merge; **everything else, including sequences, replaces** — a later
+  layer's list wins outright rather than appending. `defaults.import` is
+  unaffected and still appends.
+
+  Suites that relied on a later layer wholly *discarding* an earlier layer's
+  object constant will now see the earlier layer's extra fields survive. In
+  practice this only bites if a field is set in one layer and deliberately absent
+  in another.
+
 <a id="v0.8.3"></a>
 ## [0.8.3] — 2026-07-08
 

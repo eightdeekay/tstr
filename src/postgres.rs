@@ -21,7 +21,8 @@
 //!
 //! - `$.postgres(config)` → a connection handle (config = a `postgres://…` URL
 //!   string or an object with `host`/`port`/`database`/`user`/`password`/
-//!   `schema`/`sslmode`/`sslInsecure`). No connection opened until the first op.
+//!   `schema`/`sslmode`/`sslInsecure`/`sslRootCert`). An unrecognized field is
+//!   an error. No connection opened until the first op.
 //! - `handle.query(sql, ...params)` → runs any statement. Params bind as
 //!   *text* and Postgres coerces them to the inferred column types (see
 //!   [`TextParam`]). Returns `{ rows: [ {col: val, …} ], count }` — `count` is
@@ -161,6 +162,7 @@ struct PgConf {
     schema: Option<String>,
     sslmode: String,
     insecure: bool,
+    root_cert: Option<String>,
 }
 
 impl PgConf {
@@ -189,6 +191,7 @@ impl PgConf {
             schema: opt_str("schema"),
             sslmode,
             insecure: h.get_field("sslInsecure").is_truthy(),
+            root_cert: opt_str("sslRootCert"),
         })
     }
 
@@ -240,9 +243,21 @@ fn map_ssl_mode(mode: &str) -> tokio_postgres::config::SslMode {
 
 /// Build the rustls TLS connector. Always handed to tokio-postgres; it's only
 /// used when `ssl_mode != Disable`, so it's safe to construct unconditionally.
-/// `insecure` swaps in a verifier that accepts any certificate — for test
-/// databases with self-signed certs. **Never** use it against production.
-fn make_tls(insecure: bool) -> Result<MakeRustlsConnect, EvalError> {
+///
+/// Three modes, in precedence order:
+/// - `insecure` swaps in a verifier that accepts any certificate. **Never** use
+///   it against production.
+/// - `root_cert` verifies against a PEM CA bundle instead of the public roots —
+///   this is what a managed cluster with its own CA (DigitalOcean, RDS, Cloud
+///   SQL) needs, since its chain reaches no public root.
+/// - Otherwise, the webpki public root store.
+fn make_tls(insecure: bool, root_cert: Option<&str>) -> Result<MakeRustlsConnect, EvalError> {
+    if insecure && root_cert.is_some() {
+        return Err(EvalError::new(
+            "$.postgres: `sslInsecure` and `sslRootCert` are mutually exclusive — \
+             sslInsecure skips the verification sslRootCert exists to perform",
+        ));
+    }
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
@@ -254,10 +269,53 @@ fn make_tls(insecure: bool) -> Result<MakeRustlsConnect, EvalError> {
             .with_no_client_auth()
     } else {
         let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        match root_cert {
+            Some(path) => load_root_cert(path, &mut roots)?,
+            None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+        }
         builder.with_root_certificates(roots).with_no_client_auth()
     };
     Ok(MakeRustlsConnect::new(config))
+}
+
+/// Load a PEM CA bundle into `roots`. A file with no `CERTIFICATE` block is an
+/// error rather than an empty store — an empty store rejects every certificate,
+/// which would surface as an inscrutable handshake failure well downstream.
+fn load_root_cert(path: &str, roots: &mut rustls::RootCertStore) -> Result<(), EvalError> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::CertificateDer;
+
+    let resolved = crate::config::expand_tilde(path);
+    let certs = CertificateDer::pem_file_iter(&resolved)
+        .map_err(|e| {
+            EvalError::new(format!(
+                "$.postgres: cannot read sslRootCert {}: {e}",
+                resolved.display()
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            EvalError::new(format!(
+                "$.postgres: invalid PEM in sslRootCert {}: {e}",
+                resolved.display()
+            ))
+        })?;
+
+    if certs.is_empty() {
+        return Err(EvalError::new(format!(
+            "$.postgres: sslRootCert {} contains no CERTIFICATE block",
+            resolved.display()
+        )));
+    }
+    for cert in certs {
+        roots.add(cert).map_err(|e| {
+            EvalError::new(format!(
+                "$.postgres: sslRootCert {} holds an unusable certificate: {e}",
+                resolved.display()
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 /// The accept-any-certificate verifier used when `sslInsecure` is set. Kept in
@@ -460,8 +518,11 @@ pub fn connection_from_config(config: &Value) -> Result<Value, EvalError> {
         }
         Value::Object(m) => {
             // Copy the recognized fields verbatim; PgConf::from_handle reads
-            // them back. Unknown keys are simply ignored.
-            for key in [
+            // them back. An unrecognized key is an error, not a no-op: a typo
+            // (`sslinsecure`) or a field that doesn't exist (`sslCert`) would
+            // otherwise be silently dropped and resurface as a bewildering TLS
+            // or auth failure with nothing pointing back at the config.
+            const KNOWN: [&str; 10] = [
                 "host",
                 "port",
                 "database",
@@ -470,8 +531,23 @@ pub fn connection_from_config(config: &Value) -> Result<Value, EvalError> {
                 "schema",
                 "sslmode",
                 "sslInsecure",
+                "sslRootCert",
                 "url",
-            ] {
+            ];
+            let mut unknown: Vec<&str> = m
+                .keys()
+                .map(|k| k.as_str())
+                .filter(|k| !KNOWN.contains(k))
+                .collect();
+            if !unknown.is_empty() {
+                unknown.sort_unstable();
+                return Err(EvalError::new(format!(
+                    "$.postgres: unknown config field(s): {}. Known fields: {}",
+                    unknown.join(", "),
+                    KNOWN.join(", "),
+                )));
+            }
+            for key in KNOWN {
                 if let Some(v) = m.get(key) {
                     fields.insert(key.to_string(), v.clone());
                 }
@@ -556,7 +632,7 @@ fn query(handle: &Value, args: &[Value], scope: &Scope) -> Result<Value, EvalErr
 
     let pc = PgConf::from_handle(handle)?;
     let cfg = pc.build()?;
-    let tls = make_tls(pc.insecure)?;
+    let tls = make_tls(pc.insecure, pc.root_cert.as_deref())?;
     let schema = pc.schema.clone();
     run_op(async move {
         let client = connect(cfg, tls, schema).await?;
@@ -590,7 +666,7 @@ fn page(cursor: &Value, args: &[Value], scope: &Scope) -> Result<Value, EvalErro
 
     let pc = PgConf::from_handle(&conn)?;
     let cfg = pc.build()?;
-    let tls = make_tls(pc.insecure)?;
+    let tls = make_tls(pc.insecure, pc.root_cert.as_deref())?;
     let schema = pc.schema.clone();
     let result = run_op(async move {
         let client = connect(cfg, tls, schema).await?;
@@ -625,7 +701,7 @@ fn total(cursor: &Value, args: &[Value], scope: &Scope) -> Result<Value, EvalErr
 
     let pc = PgConf::from_handle(&conn)?;
     let cfg = pc.build()?;
-    let tls = make_tls(pc.insecure)?;
+    let tls = make_tls(pc.insecure, pc.root_cert.as_deref())?;
     let schema = pc.schema.clone();
     let result = run_op(async move {
         let client = connect(cfg, tls, schema).await?;
@@ -682,6 +758,115 @@ mod tests {
 
     fn obj(pairs: &[(&str, Value)]) -> Value {
         Value::Object(pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect())
+    }
+
+    // ---- TLS: sslRootCert + unknown-field rejection ----
+
+    /// A throwaway self-signed CA, generated once and embedded so the tests
+    /// don't depend on `openssl` being installed.
+    const TEST_CA_PEM: &str = r#"-----BEGIN CERTIFICATE-----
+MIIDETCCAfmgAwIBAgIUH6DcoBgUYoQ7UrG1RsvDgPUUbk8wDQYJKoZIhvcNAQEL
+BQAwFzEVMBMGA1UEAwwMdHN0ciB0ZXN0IENBMCAXDTI2MDcwOTE3NDEwNFoYDzIx
+MjYwNjE1MTc0MTA0WjAXMRUwEwYDVQQDDAx0c3RyIHRlc3QgQ0EwggEiMA0GCSqG
+SIb3DQEBAQUAA4IBDwAwggEKAoIBAQC6CpiWIhhf0KAyZczyvE9JnXWAHGMDHW70
+XDmEh4P4BFMtgWYY65i+pZTmbovOk5VY0pFn7b6mYwTOKYLEk1xXZ74HodeArIMv
+YBvbc2u0HA5JBnxTza0A30D2RXVteZDRyTD57bs2yqAYTmnXV8B04cngGpXFQ0nn
+FMexo4Gik+CShf4wJH9WD/G4lr27eXKYUXgy34LNOQNk89J/jmfdk/mEt7B9k4c8
+F5XN00JiH/xeHUgjOKozJ0yfNiqfRY30yJ3UhMlF9E38Er5giroUNHRsdHniWcdM
+jm7tJJX3Of5k4bAHUGEb9bhwl35wuHOrrz9yBEOyQepkZfBwRvexAgMBAAGjUzBR
+MB0GA1UdDgQWBBSMmEQ1r/MoeXuGzIRSJbsd7bjnyzAfBgNVHSMEGDAWgBSMmEQ1
+r/MoeXuGzIRSJbsd7bjnyzAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUA
+A4IBAQBEDmfXY8H6IDSL2QDlp+qx1nsS7mqG0edmjj4bE4nvxXNUVZyWlyMlLtu/
+qi6XsoUEMb3jS4wjsh1GK9aYTl6pgm4aCZgs6iUIOa0fcy450cbX807Asdzrp/+t
+KTjQR50g7Go6RfXUvgG20LsBm6QbgLmEaeBpPZEhHrBevGOTlFA7OfzFOeIu6mh8
+ncK0qDZ49/FjWwjl228i9gJoCpKSZyQIVD1BPYACsr6x2W6+xAkOs00/8Q1fA4Sg
+N/j4Emluz9gV9YD9jnhEyQKP7Lu4hvQE4KtSPi+gww/VUdDIJf1y2sAdvCj0TWyu
+WaYIrmqRLTLPzvg/ztML/9G3DzO1
+-----END CERTIFICATE-----"#;
+
+    fn write_tmp(name: &str, body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join(name);
+        std::fs::write(&path, body).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn ssl_root_cert_loads_a_pem_bundle() {
+        let (_dir, path) = write_tmp("ca.pem", TEST_CA_PEM);
+        let mut roots = rustls::RootCertStore::empty();
+        load_root_cert(path.to_str().unwrap(), &mut roots).unwrap();
+        assert_eq!(roots.len(), 1);
+    }
+
+    #[test]
+    fn ssl_root_cert_rejects_a_file_with_no_certificate_block() {
+        let (_dir, path) = write_tmp("empty.pem", "# just a comment\n");
+        let err = load_root_cert(path.to_str().unwrap(), &mut rustls::RootCertStore::empty())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no CERTIFICATE block"), "got: {err}");
+    }
+
+    #[test]
+    fn ssl_root_cert_reports_a_missing_file() {
+        let err = load_root_cert("/nonexistent/ca.pem", &mut rustls::RootCertStore::empty())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot read sslRootCert"), "got: {err}");
+    }
+
+    #[test]
+    fn make_tls_accepts_a_root_cert_and_rejects_it_alongside_ssl_insecure() {
+        let (_dir, path) = write_tmp("ca.pem", TEST_CA_PEM);
+        assert!(make_tls(false, Some(path.to_str().unwrap())).is_ok());
+        assert!(make_tls(false, None).is_ok());
+        assert!(make_tls(true, None).is_ok());
+
+        // `MakeRustlsConnect` isn't Debug, so `unwrap_err()` is unavailable.
+        let err = match make_tls(true, Some(path.to_str().unwrap())) {
+            Ok(_) => panic!("sslInsecure + sslRootCert should be rejected"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("mutually exclusive"), "got: {err}");
+    }
+
+    #[test]
+    fn unknown_config_field_is_an_error() {
+        // The exact shape that cost Doug two rounds: a plausible-looking key
+        // that no code reads.
+        let err = connection_from_config(&obj(&[
+            ("host", Value::String("h".into())),
+            ("user", Value::String("u".into())),
+            ("dbCaCert", Value::String("/etc/ca.crt".into())),
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown config field(s): dbCaCert"), "got: {err}");
+        assert!(err.contains("sslRootCert"), "error should list known fields: {err}");
+    }
+
+    #[test]
+    fn miscased_ssl_insecure_is_an_error_not_a_silent_noop() {
+        let err = connection_from_config(&obj(&[
+            ("host", Value::String("h".into())),
+            ("sslinsecure", Value::Bool(true)),
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("sslinsecure"), "got: {err}");
+    }
+
+    #[test]
+    fn ssl_root_cert_survives_onto_the_handle() {
+        let h = connection_from_config(&obj(&[
+            ("host", Value::String("h".into())),
+            ("user", Value::String("u".into())),
+            ("sslRootCert", Value::String("/etc/ca.crt".into())),
+        ]))
+        .unwrap();
+        let pc = PgConf::from_handle(&h).unwrap();
+        assert_eq!(pc.root_cert.as_deref(), Some("/etc/ca.crt"));
     }
 
     #[test]

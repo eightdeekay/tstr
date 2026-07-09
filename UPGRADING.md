@@ -3,6 +3,75 @@
 Migration steps for releases that need action on existing suites. Each section
 cross-links to the full change list in [CHANGELOG.md](CHANGELOG.md).
 
+<a id="v0.9.0"></a>
+## 0.9.0 — Constants deep-merge; unknown `$.postgres` fields are errors
+
+→ **Full change list:** [CHANGELOG § 0.9.0](CHANGELOG.md#v0.9.0)
+
+No codemod: neither change is a mechanical rewrite. The first needs a decision
+about which config layer owns which field; the second only surfaces keys that
+never did anything. Both fail loudly, so a single `tstr run` finds them.
+
+### Object constants deep-merge across layers
+
+When two layers define the same object constant, their fields now **union**
+rather than the later layer replacing the whole object. Most suites see no
+change — a difference only appears when a field is set in one layer and absent
+in another.
+
+The payoff: a project `tstr.yaml` and a user `~/.config/tstr/config.yaml` can
+co-own one object, so the `${dbHost}` scalar-indirection dance is no longer
+forced.
+
+```yaml
+# before — per-developer values smuggled in as flat scalars
+# ~/.config/tstr/config.yaml
+constants:
+  dbHost: db.example.com
+# tstr.yaml
+constants:
+  db:
+    host: ${dbHost}
+    database: notify
+
+# after — each layer owns its own fields
+# ~/.config/tstr/config.yaml
+constants:
+  db:
+    host: db.example.com
+# tstr.yaml
+constants:
+  db:
+    database: notify
+```
+
+The old shape still works untouched. If you adopt the new one, **delete the
+`host: ${dbHost}` line from the project file** — the project layer loads last and
+wins on every key it sets, so leaving it there overrides the user's value with a
+reference to a constant that no longer exists. That surfaces as
+`unresolved constant reference(s)` at load.
+
+Note the precedence direction: a later layer can be *added to* but not overridden.
+A developer may supply fields the project omits; to override one the project sets,
+use `--set` or `--config`.
+
+Mappings merge. Everything else — scalars **and sequences** — is replaced by the
+later layer. `defaults.import` is unaffected and still appends.
+
+### Unrecognized `$.postgres` config fields now fail
+
+An unknown key on the handle object used to be silently dropped. It's now an
+error naming the key:
+
+```
+$.postgres: unknown config field(s): caCert. Known fields: host, port, database,
+user, password, schema, sslmode, sslInsecure, sslRootCert, url
+```
+
+Fix the name or remove the key. The most common cases are a miscased
+`sslinsecure` and a `caCert`/`sslCert` invented for the CA bundle — that field is
+`sslRootCert`, new in this release.
+
 <a id="v0.7.0"></a>
 ## 0.7.0 — Kafka moves to a configured handle (`send`, `.topic` / `.key` / `.headers`)
 
