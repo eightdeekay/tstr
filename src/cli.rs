@@ -117,6 +117,14 @@ pub enum Commands {
         /// well above CPU count often increases throughput. 0 = CPU count.
         #[arg(short = 'j', long, default_value = "0", value_name = "N")]
         jobs: usize,
+
+        /// Skip leaf directories whose recorded average duration (from
+        /// .tstr-stats.json) exceeds this threshold. Bare `--skip-slow`
+        /// uses 10s; override with `--skip-slow=30s` / `=500ms` / `=2m`
+        /// (`=` required). Unmeasured leaves always run.
+        #[arg(long, value_name = "DURATION", num_args = 0..=1,
+              require_equals = true, default_missing_value = "10s")]
+        skip_slow: Option<String>,
     },
 
     /// List tests matching a pattern
@@ -151,14 +159,21 @@ pub enum Commands {
 pub fn run(cli: Cli) {
     let config_override = cli.config.clone();
     match cli.command {
-        Commands::Run { target, url, set, stop_on_error, repeat, repeat_mode, timeout, verbose, quiet, display, jobs } => {
+        Commands::Run { target, url, set, stop_on_error, repeat, repeat_mode, timeout, verbose, quiet, display, jobs, skip_slow } => {
             crate::http::set_timeout(timeout);
             // Size the global rayon pool before any parallel work. Default
             // (jobs == 0) leaves rayon's CPU-count default in place.
             if jobs > 0 {
                 let _ = rayon::ThreadPoolBuilder::new().num_threads(jobs).build_global();
             }
-            run_command(&target, url, set, stop_on_error, repeat, repeat_mode, verbose, quiet, display, config_override);
+            // Parse --skip-slow up front so a bad duration fails before any work.
+            let skip_slow_ms = skip_slow.as_deref().map(|s| {
+                parse_duration_ms(s).unwrap_or_else(|e| {
+                    eprintln!("error: --skip-slow: {}", e);
+                    process::exit(1);
+                })
+            });
+            run_command(&target, url, set, stop_on_error, repeat, repeat_mode, verbose, quiet, display, skip_slow_ms, config_override);
         }
         Commands::List { target, ty, flat, disabled } => {
             list_command(&target, &ty, flat, disabled);
@@ -183,6 +198,28 @@ fn clean_command(target: &str) {
     } else {
         println!("Cleaned {} run log(s) under {}", removed, root.display());
     }
+}
+
+/// Parse a CLI duration like `500ms`, `10s`, `2m`, `1.5s`, or a bare number
+/// (seconds) into milliseconds. Mirrors the DSL's retry units.
+fn parse_duration_ms(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let (num, unit) = match s.find(|c: char| c.is_ascii_alphabetic()) {
+        Some(i) => (&s[..i], &s[i..]),
+        None => (s, "s"), // bare number = seconds
+    };
+    let n: f64 = num.parse()
+        .map_err(|_| format!("invalid duration '{}' (use e.g. 10s, 500ms, 2m)", s))?;
+    if n < 0.0 {
+        return Err(format!("invalid duration '{}' (must be non-negative)", s));
+    }
+    let ms = match unit {
+        "ms" => n,
+        "s" => n * 1_000.0,
+        "m" => n * 60_000.0,
+        _ => return Err(format!("invalid duration unit '{}' (use ms, s, or m)", unit)),
+    };
+    Ok(ms as u64)
 }
 
 /// Resolve a target string into a root path, optional filter pattern, and optional
@@ -247,6 +284,7 @@ fn run_command(
     verbose: bool,
     quiet: bool,
     display: DisplayMode,
+    skip_slow_ms: Option<u64>,
     config_override: Option<PathBuf>,
 ) {
     if repeat == 0 {
@@ -398,12 +436,18 @@ fn run_command(
     let suite_for_structural = suite.clone();
     let index = FileIndex::build(suite, root.clone());
 
+    // Per-leaf duration ledger: sorts subtrees longest-first this run,
+    // records this run's clean leaf times for the next one.
+    let stats = Arc::new(crate::stats::StatsBook::load(&root));
+
     let opts = runner::RunOptions {
         stop_on_error,
         halt_flag: None,
         display_root: target_dir.clone(),
         config,
         constants,
+        stats: Some(Arc::clone(&stats)),
+        skip_slow_ms,
     };
 
     let run_start = std::time::Instant::now();
@@ -415,6 +459,10 @@ fn run_command(
         runner::run_repeated_sequential(repeat, &suite_for_structural, &index, &overrides, &opts, &printer)
     };
     printer.set_wall_clock(run_start.elapsed());
+
+    if let Err(e) = stats.save() {
+        eprintln!("warning: could not write {}: {}", crate::stats::STATS_FILE, e);
+    }
 
     // Append the variable summary block(s) to the log
     printer.flush_summary();
@@ -681,6 +729,22 @@ fn format_list(items: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_duration_ms_units_and_bare_seconds() {
+        assert_eq!(parse_duration_ms("500ms"), Ok(500));
+        assert_eq!(parse_duration_ms("10s"), Ok(10_000));
+        assert_eq!(parse_duration_ms("2m"), Ok(120_000));
+        assert_eq!(parse_duration_ms("1.5s"), Ok(1_500));
+        assert_eq!(parse_duration_ms("30"), Ok(30_000), "bare number is seconds");
+    }
+
+    #[test]
+    fn parse_duration_ms_rejects_junk() {
+        assert!(parse_duration_ms("10h").is_err(), "unsupported unit");
+        assert!(parse_duration_ms("fast").is_err());
+        assert!(parse_duration_ms("-5s").is_err());
+    }
 
     #[test]
     fn resolve_run_target_rejects_missing_path() {

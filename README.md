@@ -1033,6 +1033,48 @@ History is kept so you can compare runs (handy for intermittent failures). The
 `logs/.gitignore` is created automatically so run logs aren't committed. `tstr
 clean` removes the whole `logs/` directory and the symlink.
 
+## Timing Stats & Scheduling
+
+Each run maintains **`<suite-root>/.tstr-stats.json`** — a per-leaf-directory
+duration ledger:
+
+```json
+{
+  "commerce/carts": { "last_ms": 44120, "avg_ms": 44080, "runs": 31 },
+  "groups":         { "last_ms": 950,   "avg_ms": 1012,  "runs": 31 }
+}
+```
+
+- A leaf records its wall-clock only when it ran **clean** — every file passed
+  (deterministic `disabled:` / `when:`-incompatible skips are fine). Failures
+  and circumstantial skips (missing inputs, blocked setup, blast collateral)
+  would poison the number with fast-fails, so those runs record nothing.
+- `avg_ms` is an exponentially weighted moving average (70% history, 30%
+  latest), so it converges within a few runs after a leaf gets faster or
+  slower — it's the number the scheduler trusts.
+- The runner sorts sibling subtrees **longest-first** from these averages, so
+  slow leaves start early and their waits overlap the rest of the suite
+  instead of dangling off the end. Unmeasured subtrees sort last and earn a
+  number on their first clean run.
+
+The file is machine-local (timings are environment-specific) and self-healing —
+delete it any time and it rebuilds over the next runs. Add `.tstr-stats.json`
+to your suite's `.gitignore`.
+
+### `--skip-slow` — fast deploy-gate runs
+
+```bash
+tstr run --skip-slow          # skip leaves averaging over 10s
+tstr run --skip-slow=30s      # custom threshold (= required; ms/s/m, bare number = seconds)
+```
+
+Leaf directories whose recorded average exceeds the threshold are skipped
+wholesale — every file in them reports SKIP with the reason
+(`slow: avg 44.1s exceeds --skip-slow 10s`). Unmeasured leaves always run
+(can't skip what hasn't been met), and a skipped leaf's stats hold at their
+last measured value, so it stays recognized as slow on the next
+`--skip-slow` run.
+
 ## Failure Output
 
 ```

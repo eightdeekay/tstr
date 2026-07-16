@@ -33,6 +33,13 @@ pub struct RunOptions {
     /// Precomputed constants namespace, derived from `config.constants`.
     /// Shared via Arc so per-file scopes can attach cheaply.
     pub constants: Arc<HashMap<String, Value>>,
+    /// Per-leaf duration ledger (`.tstr-stats.json`). When present, clean leaf
+    /// runs record their wall-clock into it and sibling subtrees are scheduled
+    /// longest-first from its numbers. None disables both (unit tests).
+    pub stats: Option<Arc<crate::stats::StatsBook>>,
+    /// `--skip-slow` threshold: leaves whose recorded average exceeds this
+    /// many milliseconds are skipped wholesale. None runs everything.
+    pub skip_slow_ms: Option<u64>,
 }
 
 impl Default for RunOptions {
@@ -43,6 +50,8 @@ impl Default for RunOptions {
             display_root: None,
             config: Config::default(),
             constants: Arc::new(HashMap::new()),
+            stats: None,
+            skip_slow_ms: None,
         }
     }
 }
@@ -288,6 +297,13 @@ fn run_dir_structural(
     let mut totals = RunTotals::new();
     let is_leaf = dir.children.is_empty();
 
+    // Leaf timing for the stats ledger. `leaf_clean` tracks whether every file
+    // ran to a deterministic outcome — pass, or a disabled/incompatible skip.
+    // Failures and anomalous skips (blocked scope, missing inputs, blast
+    // collateral) fast-fail or no-op, which would poison the duration sample.
+    let leaf_start = std::time::Instant::now();
+    let mut leaf_clean = true;
+
     // Sort entries into phase buckets, each by filename for lex order.
     let mut consts: Vec<&TestEntry> = dir.entries.values()
         .filter(|e| e.file.file_type == FileType::Const)
@@ -321,8 +337,29 @@ fn run_dir_structural(
     // skipped instead of run into a cascade of null-reference failures.
     let mut dir_ambient = parent_ambient.clone();
     let mut blocked: Option<String> = blocked_in;
+
+    // --skip-slow: a leaf whose recorded average exceeds the threshold is
+    // excluded wholesale — every file in it reports SKIP with this reason,
+    // via the same blocked path an upstream failure uses. The skip voids
+    // leaf_clean, so the leaf's stats hold at their last measured value
+    // instead of "improving" toward zero.
+    if is_leaf && blocked.is_none() {
+        if let (Some(threshold_ms), Some(stats)) = (opts.skip_slow_ms, &opts.stats) {
+            if let Some(avg_ms) = stats.expected_ms(&leaf_key(&dir.path, &index.root)) {
+                if avg_ms > threshold_ms {
+                    blocked = Some(format!(
+                        "slow: avg {} exceeds --skip-slow {}",
+                        fmt_duration_ms(avg_ms),
+                        fmt_duration_ms(threshold_ms),
+                    ));
+                }
+            }
+        }
+    }
+
     for entry in consts.iter().chain(setups.iter()) {
         let result = run_or_skip(entry, &dir_ambient, blocked.as_deref(), index, opts);
+        leaf_clean &= is_clean_outcome(&result);
         if blocked.is_none() && (!result.failures.is_empty() || result.skipped) {
             blocked = Some(block_reason(&result, entry));
         }
@@ -336,7 +373,17 @@ fn run_dir_structural(
     // it stood after const + setup — tests run after children, so a leaf's
     // test exports never reach a sibling subtree (leaves have no children).
     let blocked = blocked;
-    let children: Vec<&Suite> = dir.children.values().collect();
+    // Longest-first: sibling subtrees fan out in descending expected duration
+    // (greedy LPT), so slow leaves start their waits early and overlap the
+    // rest of the run. Cost comes from the stats ledger; unmeasured subtrees
+    // sort last (cost 0) and earn a number on their first clean run. Path
+    // tiebreak keeps the order deterministic.
+    let mut children: Vec<&Suite> = dir.children.values().collect();
+    if let Some(stats) = &opts.stats {
+        children.sort_by_cached_key(|c| {
+            (std::cmp::Reverse(subtree_cost_ms(c, stats, &index.root)), c.path.clone())
+        });
+    }
     let child_totals = children.par_iter()
         .map(|child| run_dir_structural(child, &dir_ambient, blocked.clone(), index, opts, printer, display_root))
         .reduce(RunTotals::new, |mut a, b| { a.merge(b); a });
@@ -358,6 +405,7 @@ fn run_dir_structural(
             match active.step(entry) {
                 Some(reason) => {
                     let result = skipped_result(entry, &reason);
+                    leaf_clean = false; // collateral skip — timing is void
                     report_file(entry, &result, index, display_root, printer, &mut totals, is_scaffold(entry, is_leaf));
                     if active.spent() {
                         blast = None;
@@ -369,6 +417,7 @@ fn run_dir_structural(
             }
         }
         let result = run_or_skip(entry, &dir_ambient, blocked.as_deref(), index, opts);
+        leaf_clean &= is_clean_outcome(&result);
         merge_exports_into(&mut dir_ambient, &result.exports);
         report_file(entry, &result, index, display_root, printer, &mut totals, is_scaffold(entry, is_leaf));
         // Arm a radius if this test is a culprit (disabled or failed) with one.
@@ -384,7 +433,62 @@ fn run_dir_structural(
         report_file(entry, &result, index, display_root, printer, &mut totals, is_scaffold(entry, is_leaf));
     }
 
+    // Clean leaf run → record its wall-clock in the stats ledger. Scaffolding
+    // dirs aren't tracked (their duration is dominated by children, which are
+    // measured directly), and a leaf of only consts has nothing to time.
+    if is_leaf && leaf_clean && totals.total() > 0 {
+        if let Some(stats) = &opts.stats {
+            stats.record(
+                &leaf_key(&dir.path, &index.root),
+                leaf_start.elapsed().as_millis() as u64,
+            );
+        }
+    }
+
     totals
+}
+
+/// Whether a file's outcome is deterministic for timing purposes: it passed,
+/// or it was skipped for a reason that recurs identically every run (disabled,
+/// `when:` incompatible). Failures and circumstantial skips void the sample.
+fn is_clean_outcome(result: &FileResult) -> bool {
+    result.failures.is_empty() && (!result.skipped || result.disabled || result.incompatible)
+}
+
+/// Human-form duration for skip reasons: `750ms`, `44.1s`, `2m 5s`.
+fn fmt_duration_ms(ms: u64) -> String {
+    if ms < 1_000 {
+        format!("{}ms", ms)
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1_000.0)
+    } else {
+        format!("{}m {}s", ms / 60_000, (ms % 60_000) / 1_000)
+    }
+}
+
+/// Stats-ledger key for a leaf: its path relative to the suite root, or "."
+/// when the root itself is the leaf.
+fn leaf_key(dir: &std::path::Path, root: &std::path::Path) -> String {
+    let rel = dir.strip_prefix(root).unwrap_or(dir);
+    if rel.as_os_str().is_empty() {
+        ".".to_string()
+    } else {
+        rel.to_string_lossy().to_string()
+    }
+}
+
+/// Expected wall-clock of a subtree, from the stats ledger: a leaf is its
+/// recorded EWMA (0 when unmeasured); a scaffolding dir is the max over its
+/// children — they run in parallel, so the critical path is what matters.
+/// (Scaffolding's own const/setup files aren't tracked; assumed cheap.)
+fn subtree_cost_ms(dir: &Suite, stats: &crate::stats::StatsBook, root: &std::path::Path) -> u64 {
+    if dir.children.is_empty() {
+        return stats.expected_ms(&leaf_key(&dir.path, root)).unwrap_or(0);
+    }
+    dir.children.values()
+        .map(|c| subtree_cost_ms(c, stats, root))
+        .max()
+        .unwrap_or(0)
 }
 
 /// An armed `blast-radius:` — the forward, leaf-local collateral skip a
@@ -738,13 +842,7 @@ mod tests {
 
         let suite = crate::discovery::discover(root).unwrap();
         let index = crate::scheduler::FileIndex::build(suite.clone(), root.to_path_buf());
-        let opts = RunOptions {
-            stop_on_error: false,
-            halt_flag: None,
-            display_root: None,
-            config: crate::config::Config::default(),
-            constants: Arc::new(HashMap::new()),
-        };
+        let opts = RunOptions::default();
         let printer = Arc::new(Printer::new(OutputMode::Quiet, BarStyle::Auto));
 
         let totals = run_structural(&suite, &index, &HashMap::new(), &opts, &printer);
@@ -754,18 +852,159 @@ mod tests {
         assert_eq!(totals.failed, 0);
     }
 
+    /// Run a discovered suite with a stats book attached, returning the book.
+    fn run_with_stats(root: &std::path::Path) -> Arc<crate::stats::StatsBook> {
+        use crate::output::{BarStyle, OutputMode, Printer};
+        let suite = crate::discovery::discover(root).unwrap();
+        let index = crate::scheduler::FileIndex::build(suite.clone(), root.to_path_buf());
+        let stats = Arc::new(crate::stats::StatsBook::load(root));
+        let opts = RunOptions { stats: Some(Arc::clone(&stats)), ..RunOptions::default() };
+        let printer = Arc::new(Printer::new(OutputMode::Quiet, BarStyle::Auto));
+        run_structural(&suite, &index, &HashMap::new(), &opts, &printer);
+        stats
+    }
+
+    /// A clean leaf run records its duration under the leaf's root-relative
+    /// path; the root itself (when it's a leaf) records under ".".
+    #[test]
+    fn clean_leaf_records_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("tstr.yaml"), "constants: {}\n").unwrap();
+        std::fs::create_dir(root.join("api")).unwrap();
+        std::fs::write(root.join("api/01-a.test.tstr"), "{ 1 == 1 | \"x\"; }\n").unwrap();
+
+        let stats = run_with_stats(root);
+        assert!(stats.expected_ms("api").is_some(), "clean leaf should record");
+        assert_eq!(stats.expected_ms("."), None, "root is scaffolding here, not a leaf");
+    }
+
+    #[test]
+    fn root_leaf_records_under_dot() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("tstr.yaml"), "constants: {}\n").unwrap();
+        std::fs::write(root.join("01-a.test.tstr"), "{ 1 == 1 | \"x\"; }\n").unwrap();
+
+        let stats = run_with_stats(root);
+        assert!(stats.expected_ms(".").is_some());
+    }
+
+    /// A failure anywhere in the leaf voids the sample — fast-fails would
+    /// poison the average with an artificially quick number.
+    #[test]
+    fn failing_leaf_does_not_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("tstr.yaml"), "constants: {}\n").unwrap();
+        std::fs::create_dir(root.join("api")).unwrap();
+        std::fs::write(root.join("api/01-a.test.tstr"), "{ 1 == 2 | \"boom\"; }\n").unwrap();
+
+        let stats = run_with_stats(root);
+        assert_eq!(stats.expected_ms("api"), None);
+    }
+
+    /// An anomalous skip (missing input) voids the sample too — the skipped
+    /// test contributed no time, so the leaf's number would read fast.
+    #[test]
+    fn skipped_leaf_does_not_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("tstr.yaml"), "constants: {}\n").unwrap();
+        std::fs::create_dir(root.join("api")).unwrap();
+        std::fs::write(root.join("api/01-a.test.tstr"), "neverSet --> { 1 == 1 | \"x\"; }\n").unwrap();
+
+        let stats = run_with_stats(root);
+        assert_eq!(stats.expected_ms("api"), None);
+    }
+
+    /// A `disabled:` skip is deterministic — it costs ~0 every run — so it
+    /// doesn't disqualify the leaf's timing.
+    #[test]
+    fn disabled_file_still_records_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("tstr.yaml"), "constants: {}\n").unwrap();
+        std::fs::create_dir(root.join("api")).unwrap();
+        std::fs::write(root.join("api/01-a.test.tstr"), "{ 1 == 1 | \"x\"; }\n").unwrap();
+        std::fs::write(root.join("api/02-b.test.tstr"), "disabled: I-999 pending\n{ 1 == 2 | \"never runs\"; }\n").unwrap();
+
+        let stats = run_with_stats(root);
+        assert!(stats.expected_ms("api").is_some(), "disabled skip is deterministic — still clean");
+    }
+
+    /// --skip-slow: a leaf over the threshold is skipped wholesale, an
+    /// unmeasured or fast leaf runs, and the skipped leaf's stats hold
+    /// (no re-record from the skip pass).
+    #[test]
+    fn skip_slow_excludes_only_measured_slow_leaves() {
+        use crate::output::{BarStyle, OutputMode, Printer};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("tstr.yaml"), "constants: {}\n").unwrap();
+        for leaf in ["slow", "fast", "new"] {
+            std::fs::create_dir(root.join(leaf)).unwrap();
+            std::fs::write(root.join(leaf).join("01-a.test.tstr"), "{ 1 == 1 | \"x\"; }\n").unwrap();
+        }
+        let stats = Arc::new(crate::stats::StatsBook::load(root));
+        stats.record("slow", 44_000);
+        stats.record("fast", 200);
+        // "new" has no stats — must run.
+
+        let suite = crate::discovery::discover(root).unwrap();
+        let index = crate::scheduler::FileIndex::build(suite.clone(), root.to_path_buf());
+        let opts = RunOptions {
+            stats: Some(Arc::clone(&stats)),
+            skip_slow_ms: Some(10_000),
+            ..RunOptions::default()
+        };
+        let printer = Arc::new(Printer::new(OutputMode::Quiet, BarStyle::Auto));
+        let totals = run_structural(&suite, &index, &HashMap::new(), &opts, &printer);
+
+        assert_eq!(totals.passed, 2, "fast + new should run");
+        assert_eq!(totals.skipped, 1, "slow leaf should skip");
+        assert_eq!(totals.failed, 0);
+        assert_eq!(stats.expected_ms("slow"), Some(44_000), "skip must not re-record the slow leaf");
+    }
+
+    #[test]
+    fn fmt_duration_ms_forms() {
+        assert_eq!(fmt_duration_ms(750), "750ms");
+        assert_eq!(fmt_duration_ms(44_120), "44.1s");
+        assert_eq!(fmt_duration_ms(125_000), "2m 5s");
+    }
+
+    /// Subtree cost is the critical path: leaves report their EWMA, a
+    /// scaffolding dir takes the max over its (parallel) children.
+    #[test]
+    fn subtree_cost_is_max_over_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("tstr.yaml"), "constants: {}\n").unwrap();
+        for (leaf, _) in [("fast", 100u64), ("slow", 44_000)] {
+            std::fs::create_dir_all(root.join("api").join(leaf)).unwrap();
+            std::fs::write(
+                root.join("api").join(leaf).join("01-a.test.tstr"),
+                "{ 1 == 1 | \"x\"; }\n",
+            ).unwrap();
+        }
+        let suite = crate::discovery::discover(root).unwrap();
+        let stats = crate::stats::StatsBook::load(root);
+        stats.record("api/fast", 100);
+        stats.record("api/slow", 44_000);
+
+        assert_eq!(subtree_cost_ms(&suite, &stats, root), 44_000);
+        let api = suite.children.get("api").unwrap();
+        assert_eq!(subtree_cost_ms(api, &stats, root), 44_000);
+        assert_eq!(subtree_cost_ms(api.children.get("fast").unwrap(), &stats, root), 100);
+    }
+
     /// Run a discovered suite under default options, returning just the totals.
     fn run_totals_in(root: &std::path::Path) -> RunTotals {
         use crate::output::{BarStyle, OutputMode, Printer};
         let suite = crate::discovery::discover(root).unwrap();
         let index = crate::scheduler::FileIndex::build(suite.clone(), root.to_path_buf());
-        let opts = RunOptions {
-            stop_on_error: false,
-            halt_flag: None,
-            display_root: None,
-            config: crate::config::Config::default(),
-            constants: Arc::new(HashMap::new()),
-        };
+        let opts = RunOptions::default();
         let printer = Arc::new(Printer::new(OutputMode::Quiet, BarStyle::Auto));
         run_structural(&suite, &index, &HashMap::new(), &opts, &printer)
     }
@@ -779,13 +1018,7 @@ mod tests {
         std::fs::write(root.join("02-b.test.tstr"), "{ 1 == 2 | \"boom\"; }\n").unwrap();
         let suite = crate::discovery::discover(root).unwrap();
         let index = crate::scheduler::FileIndex::build(suite.clone(), root.to_path_buf());
-        let opts = RunOptions {
-            stop_on_error: false,
-            halt_flag: None,
-            display_root: None,
-            config: crate::config::Config::default(),
-            constants: Arc::new(HashMap::new()),
-        };
+        let opts = RunOptions::default();
         let printer = Arc::new(Printer::new(OutputMode::Quiet, BarStyle::Auto));
         (suite, index, opts, printer)
     }

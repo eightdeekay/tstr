@@ -13,6 +13,7 @@ mod filter;
 mod cli;
 mod config;
 mod secrets;
+mod stats;
 mod version;
 #[cfg(feature = "kafka")]
 mod kafka;
