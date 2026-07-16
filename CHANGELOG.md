@@ -8,6 +8,16 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.9.2"></a>
+## [0.9.2] — 2026-07-16
+
+### Added
+- **`tstr stats`** — the reading view of `.tstr-stats.json`: recorded per-leaf
+  timings as a `LEAF / AVG / LAST / RUNS` table, slowest first. Spot the slow
+  outliers and preview what a `--skip-slow` threshold would exclude. Takes an
+  optional directory (like `clean`) and resolves to the suite root from
+  anywhere inside it.
+
 <a id="v0.9.1"></a>
 ## [0.9.1] — 2026-07-16
 
