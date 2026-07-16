@@ -8,6 +8,39 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.9.1"></a>
+## [0.9.1] — 2026-07-16
+
+Slow tests stop bogging down the suite: their waits now overlap other work,
+they're scheduled first, and `--skip-slow` excludes them from deploy-gate runs.
+
+### Added
+- **Per-leaf timing stats** — each run maintains `<suite-root>/.tstr-stats.json`,
+  recording every leaf directory's wall-clock (`last_ms`, EWMA `avg_ms`, `runs`).
+  Only clean runs record: failures and circumstantial skips (missing inputs,
+  blocked setup, blast collateral) would poison the number with fast-fails;
+  deterministic `disabled:`/`when:`-incompatible skips don't disqualify. The
+  file is machine-local and self-healing — gitignore it in suites; delete it
+  any time.
+- **`--skip-slow[=DURATION]` on `tstr run`** — skip leaf directories whose
+  recorded average exceeds the threshold (bare flag = 10s; `=` required for a
+  value: `--skip-slow=30s`, `=500ms`, `=2m`, bare number = seconds). Skipped
+  files report SKIP with the reason (`slow: avg 44.1s exceeds --skip-slow 10s`).
+  Unmeasured leaves always run, and a skipped leaf's stats hold at their last
+  measured value so it stays recognized as slow.
+
+### Changed
+- **Sibling subtrees now run longest-first** (greedy LPT over the stats
+  averages; a scaffolding dir costs the max of its parallel children). Slow
+  leaves start their waits early instead of dangling off the end of the run.
+  Unmeasured subtrees sort last and earn a number on their first clean run.
+- **A waiting `retry` no longer parks its worker thread** — the sleep donates
+  the thread to the pool (rayon work-stealing), running other pending tests
+  and re-polling when they finish. Two overlapping waits on a single worker
+  now cost the longest wait, not the sum. An attempt can fire later than
+  `interval` when stolen work ran long; nesting is capped (8 deep per worker)
+  before falling back to a plain sleep.
+
 <a id="v0.9.0"></a>
 ## [0.9.0] — 2026-07-09
 

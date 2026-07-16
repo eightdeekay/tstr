@@ -1530,9 +1530,62 @@ pub fn exec_statement(stmt: &Statement, scope: &mut Scope) -> Result<StmtResult,
                             Some(r) => interval_ms.min(r as u64),
                             None => interval_ms,
                         };
-                        std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+                        cooperative_sleep(sleep_ms);
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Nested cooperative-sleep depth on this worker. Each stolen job that itself
+/// hits a retry sleep would yield again, stacking frames without bound in a
+/// suite full of slow leaves — past this depth, sleeps park the thread plainly.
+const MAX_YIELD_DEPTH: u32 = 8;
+thread_local! {
+    static YIELD_DEPTH: std::cell::Cell<u32> = std::cell::Cell::new(0);
+}
+
+/// Sleep for `ms`, donating the wait to the rayon pool: until the deadline,
+/// steal and run other pending work (sibling subtrees, other tests) instead of
+/// parking the worker. This is what lets a 44s state-change poll cost ~nothing
+/// in wall-clock — the thread it holds keeps running the rest of the suite.
+///
+/// One consequence to know: a stolen job runs to completion, so the next retry
+/// attempt can fire later than `interval`. That's the right trade — the poll
+/// is idempotent and the stolen work had to run somewhere anyway.
+///
+/// Falls back to a plain sleep off the rayon pool (main thread, unit tests)
+/// and past MAX_YIELD_DEPTH nesting.
+fn cooperative_sleep(ms: u64) {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_millis(ms);
+    let depth = YIELD_DEPTH.with(|d| d.get());
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        let remaining = deadline - now;
+        if depth >= MAX_YIELD_DEPTH {
+            std::thread::sleep(remaining);
+            return;
+        }
+        YIELD_DEPTH.with(|d| d.set(depth + 1));
+        let yielded = rayon::yield_now();
+        YIELD_DEPTH.with(|d| d.set(depth));
+        match yielded {
+            // Ran a stolen job — re-check the clock and look for more.
+            Some(rayon::Yield::Executed) => {}
+            // Nothing stealable right now: nap a chunk and look again —
+            // new work appears as sibling subtrees unfold into leaves.
+            Some(rayon::Yield::Idle) => {
+                std::thread::sleep(remaining.min(Duration::from_millis(25)));
+            }
+            // Not on a rayon worker — nothing to donate to; sleep it out.
+            None => {
+                std::thread::sleep(remaining);
+                return;
             }
         }
     }
@@ -1784,6 +1837,40 @@ mod tests {
 
     fn eval(expr_str: &str) -> Value {
         eval_with_scope(expr_str, &Scope::new())
+    }
+
+    /// Off the rayon pool there's nothing to donate the wait to — the sleep
+    /// must still take (at least) the requested time and return.
+    #[test]
+    fn cooperative_sleep_off_pool_sleeps_plainly() {
+        let start = std::time::Instant::now();
+        cooperative_sleep(60);
+        let elapsed = start.elapsed();
+        assert!(elapsed >= std::time::Duration::from_millis(60), "returned early: {:?}", elapsed);
+        assert!(elapsed < std::time::Duration::from_secs(2), "wildly overslept: {:?}", elapsed);
+    }
+
+    /// The point of the whole feature: two 400ms waits on a ONE-thread pool
+    /// take ~400ms, not ~800ms — the sleeping worker steals and runs the
+    /// other task instead of parking. A plain thread::sleep would serialize
+    /// them (this asserts well under the 800ms serial floor).
+    #[test]
+    fn cooperative_sleep_overlaps_waits_on_one_worker() {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let start = std::time::Instant::now();
+        pool.install(|| {
+            rayon::scope(|s| {
+                s.spawn(|_| cooperative_sleep(400));
+                s.spawn(|_| cooperative_sleep(400));
+            });
+        });
+        let elapsed = start.elapsed();
+        assert!(elapsed >= std::time::Duration::from_millis(400), "can't beat the longest wait: {:?}", elapsed);
+        assert!(
+            elapsed < std::time::Duration::from_millis(700),
+            "waits should overlap via work-stealing, took {:?} (serial would be ≥800ms)",
+            elapsed
+        );
     }
 
     fn eval_with_scope(expr_str: &str, scope: &Scope) -> Value {

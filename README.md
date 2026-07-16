@@ -483,6 +483,11 @@ retry(max: 10, interval: 500ms, timeout: 30s) {
   failure too — so a `404` while B is still catching up, or a service that
   isn't up yet, both retry naturally.
 - The `interval` sleep is clamped so it never overshoots `timeout`.
+- A waiting retry doesn't park its worker thread — it **runs other pending
+  tests** while it waits (rayon work-stealing) and re-polls when they finish.
+  A long state-change poll costs its own wall-clock, not the suite's.
+  Consequence: an attempt can fire later than `interval` when stolen work ran
+  long — the poll re-fires as soon as the worker is free again.
 - `return` and `matrix` are **not allowed** inside a retry body (they don't
   compose with re-execution) — using one is a runtime error. `if` *is* allowed:
   a conditional assertion just becomes the retry trigger.
