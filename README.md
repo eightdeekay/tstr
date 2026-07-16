@@ -1066,6 +1066,19 @@ The file is machine-local (timings are environment-specific) and self-healing �
 delete it any time and it rebuilds over the next runs. Add `.tstr-stats.json`
 to your suite's `.gitignore`.
 
+### `tstr stats` — the slow-outlier view
+
+```
+$ tstr stats
+LEAF                 AVG      LAST   RUNS
+commerce/carts     44.1s     44.1s     31
+groups              1.0s     950ms     31
+accounts           320ms     310ms     31
+```
+
+Recorded timings, slowest first — spot the outliers and sanity-check what a
+given `--skip-slow` threshold would exclude.
+
 ### `--skip-slow` — fast deploy-gate runs
 
 ```bash

@@ -86,6 +86,17 @@ impl StatsBook {
         self.book.lock().unwrap().get(key).map(|s| s.avg_ms)
     }
 
+    /// All records, slowest first (avg desc, then path for determinism) —
+    /// the `tstr stats` listing.
+    pub fn entries_slowest_first(&self) -> Vec<(String, LeafStat)> {
+        let mut entries: Vec<(String, LeafStat)> = self.book.lock().unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        entries.sort_by(|a, b| b.1.avg_ms.cmp(&a.1.avg_ms).then_with(|| a.0.cmp(&b.0)));
+        entries
+    }
+
     /// Write the book back if anything was recorded. Temp-file + rename so an
     /// interrupt can't leave a half-written file behind. Keys are serialized
     /// sorted (BTreeMap) for stable, diffable output.
@@ -102,6 +113,18 @@ impl StatsBook {
         let tmp = self.path.with_extension("json.tmp");
         std::fs::write(&tmp, json)?;
         std::fs::rename(&tmp, &self.path)
+    }
+}
+
+/// Human-form duration for skip reasons and the stats table:
+/// `750ms`, `44.1s`, `2m 5s`.
+pub fn fmt_duration_ms(ms: u64) -> String {
+    if ms < 1_000 {
+        format!("{}ms", ms)
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1_000.0)
+    } else {
+        format!("{}m {}s", ms / 60_000, (ms % 60_000) / 1_000)
     }
 }
 

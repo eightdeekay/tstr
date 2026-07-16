@@ -148,6 +148,13 @@ pub enum Commands {
         disabled: bool,
     },
 
+    /// Show recorded per-leaf timings (.tstr-stats.json), slowest first
+    Stats {
+        /// Directory inside the suite (default: current directory)
+        #[arg(default_value = ".")]
+        target: String,
+    },
+
     /// Remove all run logs (the `logs/` dir and `tstr-last-run.log`) under the suite root
     Clean {
         /// Directory inside the suite (default: current directory)
@@ -178,9 +185,48 @@ pub fn run(cli: Cli) {
         Commands::List { target, ty, flat, disabled } => {
             list_command(&target, &ty, flat, disabled);
         }
+        Commands::Stats { target } => {
+            stats_command(&target);
+        }
         Commands::Clean { target } => {
             clean_command(&target);
         }
+    }
+}
+
+/// `tstr stats` — the recorded per-leaf timings, slowest first. The reading
+/// view of `.tstr-stats.json`: spot the slow outliers, sanity-check what a
+/// `--skip-slow` threshold would exclude.
+fn stats_command(target: &str) {
+    let path = Path::new(target);
+    let start = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let root = discovery::find_root(&start);
+
+    let book = crate::stats::StatsBook::load(&root);
+    let entries = book.entries_slowest_first();
+    if entries.is_empty() {
+        println!(
+            "No timings recorded under {} — run the suite once to populate {}",
+            root.display(),
+            crate::stats::STATS_FILE
+        );
+        return;
+    }
+
+    let leaf_width = entries.iter()
+        .map(|(k, _)| k.len())
+        .max()
+        .unwrap_or(4)
+        .max("LEAF".len());
+    println!("{:<leaf_width$}  {:>8}  {:>8}  {:>5}", "LEAF", "AVG", "LAST", "RUNS");
+    for (key, stat) in &entries {
+        println!(
+            "{:<leaf_width$}  {:>8}  {:>8}  {:>5}",
+            key,
+            crate::stats::fmt_duration_ms(stat.avg_ms),
+            crate::stats::fmt_duration_ms(stat.last_ms),
+            stat.runs,
+        );
     }
 }
 

@@ -14,6 +14,7 @@ use crate::discovery::{Suite, TestEntry};
 use crate::eval::{self, FileResult};
 use crate::output::Printer;
 use crate::scheduler::FileIndex;
+use crate::stats::fmt_duration_ms;
 use crate::value::Value;
 
 /// Options controlling test execution behavior.
@@ -453,17 +454,6 @@ fn run_dir_structural(
 /// `when:` incompatible). Failures and circumstantial skips void the sample.
 fn is_clean_outcome(result: &FileResult) -> bool {
     result.failures.is_empty() && (!result.skipped || result.disabled || result.incompatible)
-}
-
-/// Human-form duration for skip reasons: `750ms`, `44.1s`, `2m 5s`.
-fn fmt_duration_ms(ms: u64) -> String {
-    if ms < 1_000 {
-        format!("{}ms", ms)
-    } else if ms < 60_000 {
-        format!("{:.1}s", ms as f64 / 1_000.0)
-    } else {
-        format!("{}m {}s", ms / 60_000, (ms % 60_000) / 1_000)
-    }
 }
 
 /// Stats-ledger key for a leaf: its path relative to the suite root, or "."
