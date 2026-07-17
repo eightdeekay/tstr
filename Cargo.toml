@@ -1,6 +1,6 @@
 [package]
 name = "tstr"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2021"
 license = "MIT"
 description = "CLI HTTP API test runner with a custom DSL"
@@ -26,6 +26,9 @@ atty = "=0.2.14"
 terminal_size = "=0.3.0"
 idna = "=0.4.0"
 url = "=2.4.1"
+# Only used to restore the default SIGPIPE disposition in main() (see main.rs)
+# so piping tstr into `head` et al. exits quietly instead of panicking.
+libc = "0.2"
 sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4.3"

@@ -8,6 +8,18 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.10.1"></a>
+## [0.10.1] — 2026-07-17
+
+### Fixed
+- **No more broken-pipe panic when piping tstr into `head` (or any reader that
+  closes early).** Rust's runtime sets `SIGPIPE` to `SIG_IGN` at startup, so a
+  closed downstream pipe became an `EPIPE` write error that `println!` panicked
+  on — `tstr stats | head` would dump a `failed printing to stdout: Broken pipe`
+  backtrace. `main` now restores the default `SIGPIPE` disposition, so tstr exits
+  quietly on a broken pipe like every other Unix filter. Applies to all output,
+  not just `stats`.
+
 <a id="v0.10.0"></a>
 ## [0.10.0] — 2026-07-17
 
