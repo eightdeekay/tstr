@@ -3,6 +3,87 @@
 Migration steps for releases that need action on existing suites. Each section
 cross-links to the full change list in [CHANGELOG.md](CHANGELOG.md).
 
+<a id="v0.10.0"></a>
+## 0.10.0 — Flat config (no `defaults:`); `--jobs`→`--threads`, `--repeat-mode`→`--stress`
+
+→ **Full change list:** [CHANGELOG § 0.10.0](CHANGELOG.md#v0.10.0)
+
+No codemod: the config edit is a few lines you own, and the flag renames only
+touch how you invoke `tstr`, not any file. Every change fails loudly — a stale
+config errors at load and names the offending key; a removed flag errors at
+parse — so one `tstr run` finds them all.
+
+### Config settings move to the top level
+
+The `defaults:` wrapper is gone. Its keys (`import`, `display`) now sit at the
+top level, next to `log_retention` and `constants`. And **unknown keys are now
+rejected** rather than silently ignored, so the old nesting fails loudly.
+
+```yaml
+# before
+defaults:
+  import:
+    - ~/.tstr/shared-libs
+  display: bars
+  repeat_mode: concurrent   # removed — see --stress below
+log_retention: 10
+constants: { ... }
+
+# after
+import:
+  - ~/.tstr/shared-libs
+display: bars
+threads: 16                 # new: was CLI-only, now settable here too
+log_retention: 10
+constants: { ... }
+```
+
+The load error names the key and lists what's valid, e.g.:
+
+```
+config error: failed to parse tstr.yaml: unknown field `defaults`,
+expected one of `import`, `display`, `threads`, `constants`, `log_retention`
+```
+
+The `repeat_mode:` key is dropped entirely — the concurrent-repeat behavior it
+enabled is now the `--stress` flag (below), chosen per-invocation rather than
+declared as a suite default.
+
+### `-j` / `--jobs` → `-t` / `--threads`
+
+Same knob (worker-pool size), new name — it's a pool, not a count of "jobs."
+`--jobs`/`-j` no longer parse. It's now also settable in config as `threads:`;
+the flag overrides the config value.
+
+```
+# before
+tstr run -j 32 .
+# after
+tstr run -t 32 .          # or set `threads: 32` in tstr.yaml
+```
+
+### `--repeat-mode concurrent` → `--stress N`; `--repeat` is always sequential
+
+The `sequential`/`concurrent` mode enum is gone, split into two flags by intent:
+
+- `--repeat N` — N passes, **sequential** (soak / flake-hunt). Unchanged meaning.
+- `--stress N` — N passes, **overlapping** (stress / load). What
+  `--repeat N --repeat-mode concurrent` used to do.
+
+They're mutually exclusive, and `--stress` requires N ≥ 2.
+
+```
+# before
+tstr run --repeat 20 --repeat-mode concurrent .
+# after
+tstr run --stress 20 .
+```
+
+### `-c` is now shorthand for `--config`
+
+`--config` gained a `-c` short form. If you have a shell alias or script binding
+`-c` to something else for `tstr`, rename it.
+
 <a id="v0.9.0"></a>
 ## 0.9.0 — Constants deep-merge; unknown `$.postgres` fields are errors
 

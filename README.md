@@ -32,7 +32,7 @@ tstr list --disabled              # disabled tests + their reasons
 - Within each directory, phases run in order: const → setup → test → cleanup. It's not one global sweep — a directory's children run in parallel *between* its setup and its tests, so a child's tests can run while the parent sits between phases.
 - Within a phase + within a directory: files run in **lex order**
 - Within a directory: sequential (no in-dir parallelism)
-- Across sibling directories: parallel (rayon work-stealing pool; `-j N` or `RAYON_NUM_THREADS` to tune)
+- Across sibling directories: parallel (rayon work-stealing pool; `-t N` or `RAYON_NUM_THREADS` to tune)
 - Parent-dir setups cascade to children's scope
 - `lib.tstr` files never auto-run — only when called
 
@@ -80,17 +80,20 @@ Filename order matters. Use numeric prefixes (`01-`, `02-`, ...) when you want e
 
 ## Configuration: `tstr.yaml`
 
-A YAML file at the suite root holds CLI defaults and project-wide constants. **It does not encode test structure** — that's the filesystem's job. Its *presence* marks the suite root: the runner walks up from cwd until it finds one.
+A YAML file at the suite root holds settings and project-wide constants. **It does not encode test structure** — that's the filesystem's job. Its *presence* marks the suite root: the runner walks up from cwd until it finds one.
+
+Settings live at the **top level** — the file *is* the overrides, so there's no
+`defaults:` wrapper. Unknown keys are rejected, so a typo (`dispaly:`) fails loudly
+at load rather than being silently ignored.
 
 ```yaml
-defaults:
-  import:
-    - ~/.tstr/shared-libs
-    - /opt/corp/tstr-libs
-  display: bars
-  repeat_mode: concurrent # how `--repeat N` runs: sequential (default) or concurrent.
-                          # Declares the suite's own safety; --repeat-mode overrides it.
-
+import:                  # extra library search roots (appends across layers)
+  - ~/.tstr/shared-libs
+  - /opt/corp/tstr-libs
+display: bars            # slot-display style (auto | bars); --display overrides
+threads: 16              # worker-thread pool size; --threads/-t overrides.
+                         # unset → CPU count. It's a pool size — I/O-bound requests
+                         # park a thread, so above core count often raises throughput.
 log_retention: 10        # per-run logs to keep under <root>/logs/ (0 = keep all; default 10)
 
 constants:
@@ -109,8 +112,8 @@ constants:
 3. `<suite-root>/tstr.yaml` — project local
 4. `--config <path>` — explicit CLI override
 
-Under `defaults`, scalars replace and lists append (so `--import` adds to defaults
-rather than replacing).
+Across layers, scalar settings replace and `import` appends (so a user config adds
+to the project's search path rather than replacing it).
 
 **Constants deep-merge.** When two layers define the same object constant, their
 keys union and the later layer wins only on the fields it actually sets. This lets
@@ -956,7 +959,7 @@ providers' signing schemes, build the header yourself from `$.hmacSha256()`.
 tstr run [dir]                    # run the suite, or scope to a subdirectory (default: cwd)
 tstr list [target]                # per-directory tables of files visible
 tstr clean [dir]                  # remove the logs/ dir + tstr-last-run.log under the suite root
-tstr --config path/to/yaml ...    # explicit config (overrides project tstr.yaml)
+tstr -c path/to/yaml ...          # explicit config (overrides project tstr.yaml)
 tstr --version
 ```
 
@@ -966,11 +969,12 @@ tstr --version
 |---|---|
 | `--url <base>` | shorthand for `--set urlPrefix=<base>` |
 | `--set 'KEY=VALUE'` | set an ambient variable (repeatable) |
-| `--repeat <N>` | run the whole suite N times (default `1`). Totals accumulate across iterations; the summary shows `(N iterations x M tests)`. |
-| `--repeat-mode <sequential\|concurrent>` | how `--repeat` runs. `sequential` (default) does one pass after another — safe, good for flushing out flaky failures. `concurrent` runs N overlapping passes at once (requires a suite that tolerates copies of itself). In a terminal, `concurrent` renders one bucketed bar per directory, each spanning that dir's `tests × repeat` cells and filling as the passes complete; piped / off-terminal it's summary-only. Overrides the suite's `defaults.repeat_mode`. |
+| `--repeat <N>` | run the whole suite N times **sequentially** — one pass after another (default `1`). Good for soak / flushing out flaky failures. Totals accumulate; the summary shows `(N iterations x M tests)`. Mutually exclusive with `--stress`. |
+| `--stress <N>` | run the whole suite N times **at once, overlapping** (stress / load). Requires a suite that tolerates concurrent copies of itself (no colliding fixed-name resources). In a terminal, renders one bucketed bar per directory, each spanning that dir's `tests × N` cells and filling as passes complete; piped / off-terminal it's summary-only. |
 | `--display auto\|bars` | slot-display style (`bars` forces colored bucketed bar) |
 | `--timeout <SECONDS>` | per-request HTTP timeout (default: `60`). `0` disables the timeout. |
-| `-j` / `--jobs <N>` | max concurrent worker threads (default: CPU count). HTTP work is I/O-bound — each blocking request parks a worker — so a value well above CPU count often raises throughput. `-j 1` forces serial. |
+| `-t` / `--threads <N>` | worker-thread pool size (default: CPU count, or the config `threads:` value). HTTP work is I/O-bound — each blocking request parks a thread — so a value well above CPU count often raises throughput. `-t 1` forces serial. |
+| `-c` / `--config <PATH>` | explicit config file (overrides project `tstr.yaml` for fields it sets; other fields still merge) |
 | `-v` / `--verbose` | streaming PASS/FAIL + timing + scope changes |
 | `-q` / `--quiet` | only summary and failures |
 

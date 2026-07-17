@@ -8,6 +8,38 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.10.0"></a>
+## [0.10.0] — 2026-07-17
+
+⚠️ The `tstr.yaml` schema and three `run` flags changed. Every change fails
+loudly — a stale config errors at load and names the offending key; a removed
+flag errors at parse — so one `tstr run` finds them. See
+[UPGRADING § 0.10.0](UPGRADING.md#v0.10.0). No codemod: the config edit is a few
+lines you own, and the flag renames only touch how you invoke `tstr`.
+
+### Changed
+- ⚠️ **Config settings move to the top level — the `defaults:` wrapper is gone.**
+  `import` and `display` now sit at the top level next to `log_retention` and
+  `constants`. The nesting under `defaults:` was backwards — the file *is* the
+  overrides, and the hardcoded values are the defaults. Unknown keys are now
+  **rejected** (`deny_unknown_fields`), so the old `defaults:` block, and any
+  typo like `dispaly:`, fail at load with an error that lists the valid keys —
+  previously they were silently ignored.
+- ⚠️ **`-j` / `--jobs` is now `-t` / `--threads`.** Same knob (worker-pool size),
+  a name that matches what it is — a thread pool, not a count of "jobs." The old
+  flag no longer parses.
+- ⚠️ **`--repeat-mode concurrent` is now `--stress N`.** The `sequential` /
+  `concurrent` mode enum is gone, split into two flags by intent: `--repeat N`
+  runs N passes sequentially (soak / flake-hunt), `--stress N` runs N passes
+  overlapping (stress / load). They're mutually exclusive; `--stress` requires
+  N ≥ 2. The `defaults.repeat_mode` config key is removed with it.
+
+### Added
+- **`threads:` in `tstr.yaml`** — the worker-pool size is now settable in config,
+  not just via the flag. `--threads`/`-t` overrides it; unset on both leaves
+  rayon's CPU-count default.
+- **`-c` short flag for `--config`.**
+
 <a id="v0.9.2"></a>
 ## [0.9.2] — 2026-07-16
 

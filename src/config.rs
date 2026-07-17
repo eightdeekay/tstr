@@ -12,12 +12,27 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-/// Top-level config. Both sections are optional; an empty file (or no file)
-/// yields `Config::default()`.
+/// Top-level config. Every field is optional; an empty file (or no file)
+/// yields `Config::default()`. Settings live at the top level — the file *is*
+/// the overrides, so there's no `defaults:` wrapper. Unknown keys are rejected
+/// (`deny_unknown_fields`) so a typo like `dispaly:` fails loudly at load
+/// instead of being silently ignored.
 #[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Extra library search roots. Appends across layers rather than replacing,
+    /// so a user config adds to (doesn't clobber) the project's list.
     #[serde(default)]
-    pub defaults: Defaults,
+    pub import: Vec<PathBuf>,
+    /// Default slot-display style (`auto` | `bars`); `--display` overrides.
+    #[serde(default)]
+    pub display: Option<String>,
+    /// Default worker-thread pool size. `--threads`/`-t` overrides it; unset on
+    /// both leaves rayon's CPU-count default. It's a *pool* size: because
+    /// I/O-bound requests park a thread on the socket, a value above the core
+    /// count often raises throughput.
+    #[serde(default)]
+    pub threads: Option<usize>,
     #[serde(default)]
     pub constants: HashMap<String, serde_yaml::Value>,
     /// How many per-run log files to keep under `<root>/logs/` (oldest pruned
@@ -28,21 +43,6 @@ pub struct Config {
 
 /// Default number of per-run log files kept under `<root>/logs/`.
 pub const DEFAULT_LOG_RETENTION: usize = 10;
-
-/// CLI flag defaults. Any flag tstr accepts may be defaulted here.
-/// Only fields needed by Slice 1 are present; future slices add more.
-#[derive(Debug, Default, Clone, Deserialize)]
-pub struct Defaults {
-    #[serde(default)]
-    pub import: Vec<PathBuf>,
-    #[serde(default)]
-    pub display: Option<String>,
-    /// How `--repeat N` runs the suite: `sequential` (one pass after another) or
-    /// `concurrent` (N overlapping passes). A suite declares its own safety here;
-    /// `--repeat-mode` on the CLI overrides it. Unset → sequential.
-    #[serde(default)]
-    pub repeat_mode: Option<String>,
-}
 
 impl Config {
     /// Parse a config from a yaml file on disk.
@@ -110,12 +110,12 @@ impl Config {
     /// List fields: `other` appends to `self`. Constants: deep-merged, see
     /// [`merge_constant`].
     fn merge(&mut self, other: Config) {
-        self.defaults.import.extend(other.defaults.import);
-        if other.defaults.display.is_some() {
-            self.defaults.display = other.defaults.display;
+        self.import.extend(other.import);
+        if other.display.is_some() {
+            self.display = other.display;
         }
-        if other.defaults.repeat_mode.is_some() {
-            self.defaults.repeat_mode = other.defaults.repeat_mode;
+        if other.threads.is_some() {
+            self.threads = other.threads;
         }
         if other.log_retention.is_some() {
             self.log_retention = other.log_retention;
@@ -150,8 +150,8 @@ impl Config {
 /// re-composed with `${dbHost}`.
 ///
 /// Sequences replace rather than append: appending is right for a search path
-/// like `defaults.import`, and wrong inside a constant, where a parent layer's
-/// leftover elements riding along is the surprising outcome.
+/// like the top-level `import`, and wrong inside a constant, where a parent
+/// layer's leftover elements riding along is the surprising outcome.
 fn merge_constant(base: &mut serde_yaml::Value, other: serde_yaml::Value) {
     use serde_yaml::Value as Y;
     match other {
@@ -736,7 +736,7 @@ mod tests {
         let path = tmp.path().join("tstr.yaml");
         fs::write(&path, "").unwrap();
         let cfg = Config::load_from_path(&path).unwrap();
-        assert!(cfg.defaults.import.is_empty());
+        assert!(cfg.import.is_empty());
         assert!(cfg.constants.is_empty());
     }
 
@@ -745,11 +745,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("tstr.yaml");
         fs::write(&path, r#"
-defaults:
-  import:
-    - /opt/libs
-    - ~/.tstr/libs
-  display: bars
+import:
+  - /opt/libs
+  - ~/.tstr/libs
+display: bars
+threads: 12
 
 constants:
   apiVersion: v4
@@ -757,11 +757,33 @@ constants:
     baseUrl: https://api.example.com
 "#).unwrap();
         let cfg = Config::load_from_path(&path).unwrap();
-        assert_eq!(cfg.defaults.import.len(), 2);
-        assert_eq!(cfg.defaults.display.as_deref(), Some("bars"));
+        assert_eq!(cfg.import.len(), 2);
+        assert_eq!(cfg.display.as_deref(), Some("bars"));
+        assert_eq!(cfg.threads, Some(12));
         assert_eq!(cfg.constants.len(), 2);
         assert!(cfg.constants.contains_key("apiVersion"));
         assert!(cfg.constants.contains_key("orgService"));
+    }
+
+    #[test]
+    fn unknown_top_level_key_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("tstr.yaml");
+        // A typo'd key must error, not silently vanish.
+        fs::write(&path, "dispaly: bars\n").unwrap();
+        let err = Config::load_from_path(&path).unwrap_err();
+        assert!(err.contains("dispaly") || err.contains("unknown field"),
+            "expected an unknown-field error, got: {err}");
+    }
+
+    #[test]
+    fn legacy_defaults_wrapper_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("tstr.yaml");
+        // The pre-0.10 `defaults:` nesting is now an unknown key — the flatten
+        // is a hard break, surfaced at load rather than ignored.
+        fs::write(&path, "defaults:\n  display: bars\n").unwrap();
+        assert!(Config::load_from_path(&path).is_err());
     }
 
     #[test]
@@ -991,28 +1013,23 @@ constants:
     #[test]
     fn merge_lists_append_scalars_override() {
         let mut a = Config {
-            defaults: Defaults {
-                import: vec![PathBuf::from("/a")],
-                display: Some("auto".to_string()),
-                repeat_mode: None,
-            },
+            import: vec![PathBuf::from("/a")],
+            display: Some("auto".to_string()),
+            threads: Some(4),
             constants: HashMap::new(),
             log_retention: None,
         };
         let b = Config {
-            defaults: Defaults {
-                import: vec![PathBuf::from("/b")],
-                display: Some("bars".to_string()),
-                repeat_mode: Some("concurrent".to_string()),
-            },
+            import: vec![PathBuf::from("/b")],
+            display: Some("bars".to_string()),
+            threads: Some(16),
             constants: HashMap::new(),
             log_retention: Some(25),
         };
         a.merge(b);
-        assert_eq!(a.defaults.import, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
-        assert_eq!(a.defaults.display.as_deref(), Some("bars"));
-        assert_eq!(a.defaults.repeat_mode.as_deref(), Some("concurrent"),
-            "repeat_mode scalar override wins on merge");
+        assert_eq!(a.import, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
+        assert_eq!(a.display.as_deref(), Some("bars"));
+        assert_eq!(a.threads, Some(16), "threads scalar override wins on merge");
         assert_eq!(a.log_retention(), 25, "scalar override wins on merge");
     }
 }

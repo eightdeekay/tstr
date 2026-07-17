@@ -18,7 +18,7 @@ use crate::value::Value;
 pub struct Cli {
     /// Explicit config file path. Overrides any user-global or project tstr.yaml
     /// for fields it specifies. Other fields still merge from those sources.
-    #[arg(long, global = true, value_name = "PATH")]
+    #[arg(short = 'c', long, global = true, value_name = "PATH")]
     pub config: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -38,28 +38,6 @@ impl DisplayMode {
         match self {
             DisplayMode::Auto => BarStyle::Auto,
             DisplayMode::Bars => BarStyle::Bars,
-        }
-    }
-}
-
-/// How `--repeat N` runs the suite.
-#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum RepeatMode {
-    /// Run the suite N times, one pass after another (safe default).
-    Sequential,
-    /// Run N independent passes at once — requires a suite that tolerates
-    /// concurrent copies of itself (no colliding fixed-name resources).
-    Concurrent,
-}
-
-impl RepeatMode {
-    /// Parse the `repeat_mode:` config string. Unrecognized values yield `None`
-    /// (the caller warns and falls back).
-    fn from_config(s: &str) -> Option<RepeatMode> {
-        match s.trim().to_lowercase().as_str() {
-            "sequential" | "seq" => Some(RepeatMode::Sequential),
-            "concurrent" | "parallel" => Some(RepeatMode::Concurrent),
-            _ => None,
         }
     }
 }
@@ -84,15 +62,17 @@ pub enum Commands {
         #[arg(long)]
         stop_on_error: bool,
 
-        /// Run the entire suite N times (see --repeat-mode for how)
+        /// Run the entire suite N times, one pass after another (soak /
+        /// flake-hunt). For N overlapping passes, use --stress instead.
         #[arg(long, default_value = "1", value_name = "N")]
         repeat: usize,
 
-        /// How --repeat runs: `sequential` (one pass after another) or
-        /// `concurrent` (N overlapping passes). Overrides the suite's
-        /// `defaults.repeat_mode`; unset falls back to it, then to sequential.
-        #[arg(long, value_enum, value_name = "MODE")]
-        repeat_mode: Option<RepeatMode>,
+        /// Run the entire suite N times at once, overlapping (stress / load).
+        /// Like --repeat but concurrent; needs a suite that tolerates concurrent
+        /// copies of itself (no colliding fixed-name resources). Mutually
+        /// exclusive with --repeat.
+        #[arg(long, value_name = "N", conflicts_with = "repeat")]
+        stress: Option<usize>,
 
         /// HTTP request timeout in seconds (per-request). 0 disables the timeout.
         #[arg(long, default_value = "60", value_name = "SECONDS")]
@@ -112,11 +92,12 @@ pub enum Commands {
         #[arg(long, value_enum, default_value_t = DisplayMode::Auto)]
         display: DisplayMode,
 
-        /// Max concurrent worker threads. Defaults to CPU count. HTTP work
-        /// is I/O-bound (each blocking request parks a worker), so a value
-        /// well above CPU count often increases throughput. 0 = CPU count.
-        #[arg(short = 'j', long, default_value = "0", value_name = "N")]
-        jobs: usize,
+        /// Worker-thread pool size. Defaults to CPU count (or the config
+        /// `threads:` value). HTTP work is I/O-bound — each blocking request
+        /// parks a thread — so a value well above CPU count often increases
+        /// throughput.
+        #[arg(short = 't', long, value_name = "N")]
+        threads: Option<usize>,
 
         /// Skip leaf directories whose recorded average duration (from
         /// .tstr-stats.json) exceeds this threshold. Bare `--skip-slow`
@@ -166,13 +147,11 @@ pub enum Commands {
 pub fn run(cli: Cli) {
     let config_override = cli.config.clone();
     match cli.command {
-        Commands::Run { target, url, set, stop_on_error, repeat, repeat_mode, timeout, verbose, quiet, display, jobs, skip_slow } => {
+        Commands::Run { target, url, set, stop_on_error, repeat, stress, timeout, verbose, quiet, display, threads, skip_slow } => {
             crate::http::set_timeout(timeout);
-            // Size the global rayon pool before any parallel work. Default
-            // (jobs == 0) leaves rayon's CPU-count default in place.
-            if jobs > 0 {
-                let _ = rayon::ThreadPoolBuilder::new().num_threads(jobs).build_global();
-            }
+            // Note: the rayon pool is sized inside run_command, after config
+            // loads — the `threads:` config value is a fallback for --threads,
+            // so we can't build the pool until the config is known.
             // Parse --skip-slow up front so a bad duration fails before any work.
             let skip_slow_ms = skip_slow.as_deref().map(|s| {
                 parse_duration_ms(s).unwrap_or_else(|e| {
@@ -180,7 +159,7 @@ pub fn run(cli: Cli) {
                     process::exit(1);
                 })
             });
-            run_command(&target, url, set, stop_on_error, repeat, repeat_mode, verbose, quiet, display, skip_slow_ms, config_override);
+            run_command(&target, url, set, stop_on_error, repeat, stress, verbose, quiet, display, threads, skip_slow_ms, config_override);
         }
         Commands::List { target, ty, flat, disabled } => {
             list_command(&target, &ty, flat, disabled);
@@ -326,16 +305,23 @@ fn run_command(
     set_vars: Vec<String>,
     stop_on_error: bool,
     repeat: usize,
-    repeat_mode: Option<RepeatMode>,
+    stress: Option<usize>,
     verbose: bool,
     quiet: bool,
     display: DisplayMode,
+    threads: Option<usize>,
     skip_slow_ms: Option<u64>,
     config_override: Option<PathBuf>,
 ) {
     if repeat == 0 {
         eprintln!("error: --repeat must be >= 1");
         process::exit(1);
+    }
+    if let Some(n) = stress {
+        if n < 2 {
+            eprintln!("error: --stress must be >= 2 (for a single run, just run without it)");
+            process::exit(1);
+        }
     }
 
     let mut overrides: HashMap<String, Value> = HashMap::new();
@@ -373,14 +359,25 @@ fn run_command(
         }
     };
 
+    // Size the global rayon pool now — after config, before any parallel work.
+    // Precedence: --threads wins, else config `threads:`, else rayon's CPU-count
+    // default. Must run before the first par_iter or build_global is a no-op.
+    if let Some(n) = threads.or(config.threads) {
+        if n == 0 {
+            eprintln!("error: threads must be >= 1");
+            process::exit(1);
+        }
+        let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global();
+    }
+
     if verbose {
         eprintln!("Suite root: {}", root.display());
         if let Some(ref d) = target_dir {
             eprintln!("Scoped to: {}", d.display());
         }
-        if !config.constants.is_empty() || !config.defaults.import.is_empty() {
+        if !config.constants.is_empty() || !config.import.is_empty() {
             eprintln!("Config: {} constants, {} import dirs",
-                config.constants.len(), config.defaults.import.len());
+                config.constants.len(), config.import.len());
         }
         eprintln!();
     }
@@ -428,41 +425,33 @@ fn run_command(
         process::exit(1);
     }
 
-    // Resolve how --repeat runs: CLI flag wins, else the suite's config, else
-    // sequential. An unrecognized config value warns and falls back.
-    let effective_repeat_mode = repeat_mode.or_else(|| {
-        config.defaults.repeat_mode.as_deref().and_then(|s| {
-            let parsed = RepeatMode::from_config(s);
-            if parsed.is_none() {
-                eprintln!("warning: unknown repeat_mode '{}' in config \
-                    (use sequential|concurrent); using sequential", s);
-            }
-            parsed
-        })
-    }).unwrap_or(RepeatMode::Sequential);
-    let concurrent_repeat = repeat > 1 && effective_repeat_mode == RepeatMode::Concurrent;
+    // --stress N = N overlapping passes; --repeat N = N sequential passes (the
+    // two are mutually exclusive, enforced by clap). `passes` is the count
+    // either way; `concurrent` selects the runner and the display shape.
+    let concurrent = stress.is_some();
+    let passes = stress.unwrap_or(repeat);
 
     let mode = if quiet {
         OutputMode::Quiet
     } else if verbose {
         OutputMode::Verbose
-    } else if concurrent_repeat {
+    } else if concurrent {
         // N overlapping passes can't stream per-test (lines would interleave),
         // but in a terminal they DO render as one wide bar per dir, sized to
-        // `tests × repeat`. Off a terminal there's no live display → summary-only.
+        // `tests × passes`. Off a terminal there's no live display → summary-only.
         if is_tty { OutputMode::Interactive } else { OutputMode::Quiet }
     } else if is_tty {
         OutputMode::Interactive
-    } else if repeat > 1 {
+    } else if passes > 1 {
         // Non-interactive sequential --repeat: don't stream per-test FAIL/PASS for
         // every iteration (would be N times the noise). Quiet by default; -v overrides.
         OutputMode::Quiet
     } else {
         OutputMode::Normal
     };
-    // Concurrent repeat forces the bucketed bar — one row per dir spanning all
-    // its (tests × repeat) cells; per-test glyphs wouldn't fit or read sensibly.
-    let bar_style = if concurrent_repeat { BarStyle::Bars } else { display.to_bar_style() };
+    // Concurrent (stress) forces the bucketed bar — one row per dir spanning all
+    // its (tests × passes) cells; per-test glyphs wouldn't fit or read sensibly.
+    let bar_style = if concurrent { BarStyle::Bars } else { display.to_bar_style() };
     let printer = Arc::new(Printer::new(mode, bar_style));
     printer.init_failure_log(&root, config.log_retention());
     if !warnings.is_empty() {
@@ -497,12 +486,12 @@ fn run_command(
     };
 
     let run_start = std::time::Instant::now();
-    let totals = if repeat == 1 {
+    let totals = if passes == 1 {
         runner::run_structural(&suite_for_structural, &index, &overrides, &opts, &printer)
-    } else if concurrent_repeat {
-        runner::run_repeated_concurrent(repeat, &suite_for_structural, &index, &overrides, &opts, &printer)
+    } else if concurrent {
+        runner::run_repeated_concurrent(passes, &suite_for_structural, &index, &overrides, &opts, &printer)
     } else {
-        runner::run_repeated_sequential(repeat, &suite_for_structural, &index, &overrides, &opts, &printer)
+        runner::run_repeated_sequential(passes, &suite_for_structural, &index, &overrides, &opts, &printer)
     };
     printer.set_wall_clock(run_start.elapsed());
 
@@ -514,9 +503,9 @@ fn run_command(
     printer.flush_summary();
 
     // Summary
-    if repeat > 1 {
-        let tests_per_run = totals.total() / repeat;
-        eprintln!("({} iterations x {} tests)", repeat, tests_per_run);
+    if passes > 1 {
+        let tests_per_run = totals.total() / passes;
+        eprintln!("({} iterations x {} tests)", passes, tests_per_run);
     }
     printer.summary(totals.total(), totals.passed, totals.failed, totals.skipped, warnings.len());
 

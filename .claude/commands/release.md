@@ -46,6 +46,10 @@ If unsure whether something is breaking, say so and ask before bumping.
 9. **Tag** — `git tag -a vX.Y.Z -m "vX.Y.Z"` matching the bumped version.
 10. **Push** — `git push --follow-tags` to the current branch (so the commit and
    its tag go together).
+11. **Mirror the README to layer-services** — copy `README.md` to
+   `~/dev/layer-services/tstr/README.md` so that repo's vendored copy stays in
+   sync. This only writes the file; it does not commit in layer-services — tell
+   Doug that repo now has an uncommitted README change for him to handle there.
 
 ## Notes
 
