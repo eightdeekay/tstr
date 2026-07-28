@@ -8,6 +8,34 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.11.0"></a>
+## [0.11.0] — 2026-07-28
+
+No action needed on existing suites — nothing in your `.tstr` files changes. The
+minor bump is because observable behavior changes: request bodies now go out in
+the order you wrote them. A suite that was passing *because* of the old sorting
+(or failing because of it) will change verdict, which is the point.
+
+### Fixed
+- **JSON object keys now go on the wire in declaration order instead of
+  alphabetized.** `Value::Object` was a `HashMap`, whose iteration order is
+  random, so the serializer sorted keys to get deterministic output — meaning
+  tstr silently rewrote every JSON body it sent. A test declaring
+  `{ "Sequence.2": ..., "Days.30": ... }` to check an API that resolves
+  conflicting keys by "first one wins" actually sent `Days.30` first (D < S) and
+  asserted against a request it never made. `Value::Object` is now an
+  insertion-ordered `IndexMap`, so order is both stable and correct.
+- **Failure output showed the sorted order too**, so the reordering was invisible
+  in diagnostics — the printed body agreed with the wrong request. `Display` now
+  prints declaration order, matching what was sent.
+
+### Changed
+- **Parsed response bodies keep the key order the server sent** (`serde_json`'s
+  `preserve_order`), rather than being alphabetized on the way in. Reading a body
+  into `r` and echoing it back is now order-faithful end to end.
+- **Object constants from `tstr.yaml` preserve their declared order**, following
+  from the same change.
+
 <a id="v0.10.1"></a>
 ## [0.10.1] — 2026-07-17
 

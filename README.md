@@ -429,6 +429,8 @@ r = req.post("/v4/groups") ? 2xx | "Failed";
 
 For relative URLs (`/...`), the request object must contain `urlPrefix`. Absolute URLs (`http://...`) ignore it.
 
+**Object keys go on the wire in the order you declare them.** `{ b: 1, a: 2 }` serializes as `{"b":1,"a":2}`, never re-sorted — so you can test an API that resolves conflicting keys by "first one wins." Parsed responses likewise keep the order the server sent, so a body read into `r` and echoed back is byte-order-faithful.
+
 **Status patterns:** `200`, `2xx`, `200-204`, `>=200`, `<500`.
 
 **Response object** — `r` holds the parsed body; `_response` holds HTTP metadata (`.code`, `.headers`, `.version`, `.format`).

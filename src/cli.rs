@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
@@ -11,7 +10,7 @@ use crate::filter;
 use crate::output::{BarStyle, OutputMode, Printer};
 use crate::runner;
 use crate::scheduler::FileIndex;
-use crate::value::Value;
+use crate::value::{Value, ValueMap};
 
 #[derive(Parser)]
 #[command(name = "tstr", about = "HTTP API test runner", version)]
@@ -324,7 +323,7 @@ fn run_command(
         }
     }
 
-    let mut overrides: HashMap<String, Value> = HashMap::new();
+    let mut overrides: ValueMap = ValueMap::new();
     if let Some(base_url) = url {
         overrides.insert("urlPrefix".to_string(), Value::String(base_url));
     }
@@ -462,7 +461,7 @@ fn run_command(
 
     // Precompute the constants namespace from yaml. Wrapped in Arc so per-file
     // scopes share one map without deep-cloning per file.
-    let constants_map: HashMap<String, Value> = config.constants.iter()
+    let constants_map: ValueMap = config.constants.iter()
         .map(|(k, v)| (k.clone(), Value::from_yaml(v)))
         .collect();
     let constants = Arc::new(constants_map);

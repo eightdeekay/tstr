@@ -1761,7 +1761,7 @@ fn truncate_value(v: &crate::value::Value) -> String {
 fn write_var_table(
     f: &mut Box<dyn Write + Send>,
     inputs: &[(String, Option<String>, crate::value::Value)],
-    outputs: &HashMap<String, crate::value::Value>,
+    outputs: &crate::value::ValueMap,
 ) {
     if inputs.is_empty() && outputs.is_empty() {
         return;

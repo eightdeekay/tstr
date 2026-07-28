@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -8,7 +7,7 @@ use serde_json;
 
 use crate::ast::*;
 use crate::eval::{self, EvalError, Scope};
-use crate::value::Value;
+use crate::value::{Value, ValueMap};
 
 /// Process-wide HTTP client. Built lazily on first use; can be configured
 /// once via `set_timeout` before the first request.
@@ -161,7 +160,7 @@ pub fn execute_http_call(
     let (body_value, format) = parse_body(&body_text);
 
     // Populate _response with format included up front.
-    let mut response_meta = HashMap::new();
+    let mut response_meta = ValueMap::new();
     response_meta.insert("code".to_string(), Value::Number(status_code as f64));
     response_meta.insert("headers".to_string(), Value::Object(response_headers));
     response_meta.insert("version".to_string(), Value::String(version));
@@ -262,7 +261,7 @@ fn parse_sse(body: &str) -> Value {
         if data_lines.is_empty() && event_name.is_none() && event_id.is_none() && retry.is_none() {
             return;
         }
-        let mut obj: HashMap<String, Value> = HashMap::new();
+        let mut obj: ValueMap = ValueMap::new();
         obj.insert("event".to_string(),
             Value::String(event_name.take().unwrap_or_else(|| "message".to_string())));
         let data_str = data_lines.join("\n");
@@ -358,7 +357,7 @@ pub fn json_to_value(json: &serde_json::Value) -> Value {
             Value::Array(arr.iter().map(json_to_value).collect())
         }
         serde_json::Value::Object(obj) => {
-            let map: HashMap<String, Value> = obj.iter()
+            let map: ValueMap = obj.iter()
                 .map(|(k, v)| (k.clone(), json_to_value(v)))
                 .collect();
             Value::Object(map)
@@ -385,18 +384,22 @@ pub(crate) fn value_to_json_string(val: &Value) -> String {
             format!("[{}]", inner.join(","))
         }
         Value::Object(map) => {
-            let mut pairs: Vec<String> = map.iter()
+            // Declaration order, NOT sorted. This used to `pairs.sort()` to get
+            // deterministic output out of a HashMap's random iteration order,
+            // which meant tstr silently rewrote every JSON body it sent — fatal
+            // for any API where the first-declared key wins. `Value::Object` is
+            // now an IndexMap, so insertion order is both stable and correct.
+            let pairs: Vec<String> = map.iter()
                 .map(|(k, v)| format!("\"{}\":{}", k, value_to_json_string(v)))
                 .collect();
-            pairs.sort(); // deterministic output
             format!("{{{}}}", pairs.join(","))
         }
     }
 }
 
 /// Extract response headers into a Value::Object.
-fn extract_headers(response: &Response) -> HashMap<String, Value> {
-    let mut map = HashMap::new();
+fn extract_headers(response: &Response) -> ValueMap {
+    let mut map = ValueMap::new();
     for (name, value) in response.headers() {
         if let Ok(v) = value.to_str() {
             map.insert(name.as_str().to_string(), Value::String(v.to_string()));
@@ -408,6 +411,60 @@ fn extract_headers(response: &Response) -> HashMap<String, Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Object keys go on the wire in declaration order, not sorted. An API may
+    /// resolve conflicting keys by "first one wins", so a test that declares
+    /// `Sequence.2` before `Days.30` has to actually send it that way. tstr used
+    /// to sort keys for deterministic output, which silently flipped the pair
+    /// (D < S) and made the test assert against a request it never sent.
+    #[test]
+    fn json_body_keys_keep_declaration_order() {
+        let obj = Value::Object(ValueMap::from([
+            ("Sequence.2".to_string(), Value::String("seq".to_string())),
+            ("Days.30".to_string(), Value::String("days".to_string())),
+        ]));
+        assert_eq!(
+            value_to_json_string(&obj),
+            r#"{"Sequence.2":"seq","Days.30":"days"}"#
+        );
+
+        // Reversing the declaration reverses the wire order — the sorted
+        // implementation produced the same string for both.
+        let flipped = Value::Object(ValueMap::from([
+            ("Days.30".to_string(), Value::String("days".to_string())),
+            ("Sequence.2".to_string(), Value::String("seq".to_string())),
+        ]));
+        assert_eq!(
+            value_to_json_string(&flipped),
+            r#"{"Days.30":"days","Sequence.2":"seq"}"#
+        );
+    }
+
+    /// A parsed response keeps the key order the server sent (serde_json's
+    /// `preserve_order` feature), so round-tripping a body doesn't reorder it.
+    #[test]
+    fn parsed_response_keeps_wire_order() {
+        let (val, format) = parse_body(r#"{"zeta":1,"alpha":2,"mid":3}"#);
+        assert_eq!(format.to_string(), "json");
+        if let Value::Object(map) = &val {
+            let keys: Vec<&str> = map.keys().map(|k| k.as_str()).collect();
+            assert_eq!(keys, vec!["zeta", "alpha", "mid"]);
+        } else {
+            panic!("expected object, got {}", val.type_name());
+        }
+        assert_eq!(value_to_json_string(&val), r#"{"zeta":1,"alpha":2,"mid":3}"#);
+    }
+
+    /// Display is what shows up in failure output — it has to agree with what
+    /// went on the wire, or a key-order bug is invisible in the diagnostics.
+    #[test]
+    fn display_keeps_declaration_order() {
+        let obj = Value::Object(ValueMap::from([
+            ("zeta".to_string(), Value::Number(1.0)),
+            ("alpha".to_string(), Value::Number(2.0)),
+        ]));
+        assert_eq!(obj.to_string(), r#"{"zeta": 1, "alpha": 2}"#);
+    }
 
     #[test]
     fn test_status_matches_exact() {
@@ -547,7 +604,7 @@ mod tests {
 
     #[test]
     fn test_value_to_json_string() {
-        let val = Value::Object(HashMap::from([
+        let val = Value::Object(ValueMap::from([
             ("name".to_string(), Value::String("Test".to_string())),
             ("count".to_string(), Value::Number(3.0)),
         ]));

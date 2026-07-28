@@ -31,7 +31,7 @@ use rskafka::client::{Client, ClientBuilder};
 use rskafka::record::{Record, RecordAndOffset};
 
 use crate::eval::{EvalError, Scope};
-use crate::value::Value;
+use crate::value::{Value, ValueMap};
 
 /// Wall-clock backstop for any single Kafka op. `produce`/`since` should be
 /// near-instant; this only bites when a broker is unreachable or a topic never
@@ -161,7 +161,7 @@ pub fn broker_from_config(config: &Value) -> Result<Value, EvalError> {
             )))
         }
     };
-    Ok(Value::Object(std::collections::HashMap::from([
+    Ok(Value::Object(ValueMap::from([
         (KIND_FIELD.to_string(), Value::String(kind::BROKER.to_string())),
         ("bootstrap".to_string(), Value::String(bootstrap)),
         ("requiresTypeId".to_string(), Value::Bool(requires_type_id)),
@@ -343,11 +343,11 @@ async fn topic_partitions(client: &Client, topic: &str) -> Result<Vec<i32>, Stri
 /// (`{ "0": 5, "1": 3 }`). Phase 4's `find` seeks each partition to its mark
 /// (or earliest, for partitions absent from the map).
 fn cursor(bootstrap: &str, topic: &str, offsets: &[(i32, i64)]) -> Value {
-    let off_map: std::collections::HashMap<String, Value> = offsets
+    let off_map: crate::value::ValueMap = offsets
         .iter()
         .map(|(p, o)| (p.to_string(), Value::Number(*o as f64)))
         .collect();
-    Value::Object(std::collections::HashMap::from([
+    Value::Object(ValueMap::from([
         (KIND_FIELD.to_string(), Value::String(kind::CURSOR.to_string())),
         ("bootstrap".to_string(), Value::String(bootstrap.to_string())),
         ("topic".to_string(), Value::String(topic.to_string())),
@@ -479,13 +479,13 @@ fn message(partition: i32, ro: &RecordAndOffset, raw: String) -> Value {
         .as_deref()
         .map(|k| Value::String(String::from_utf8_lossy(k).into_owned()))
         .unwrap_or(Value::Null);
-    let headers: HashMap<String, Value> = ro
+    let headers: ValueMap = ro
         .record
         .headers
         .iter()
         .map(|(k, v)| (k.clone(), Value::String(String::from_utf8_lossy(v).into_owned())))
         .collect();
-    Value::Object(HashMap::from([
+    Value::Object(ValueMap::from([
         ("body".to_string(), body),
         ("raw".to_string(), Value::String(raw)),
         ("format".to_string(), Value::String(format)),
@@ -542,7 +542,7 @@ fn now_utc() -> rskafka::chrono::DateTime<rskafka::chrono::Utc> {
 
 /// `{ partition, offset }` — the result of a successful produce.
 fn ack(partition: i32, offset: i64) -> Value {
-    Value::Object(std::collections::HashMap::from([
+    Value::Object(ValueMap::from([
         ("partition".to_string(), Value::Number(partition as f64)),
         ("offset".to_string(), Value::Number(offset as f64)),
     ]))
@@ -583,7 +583,6 @@ fn as_string(v: &Value, what: &str) -> Result<String, EvalError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     /// Fresh scope for ops that record an endpoint.
     fn sc() -> Scope {
@@ -611,7 +610,7 @@ mod tests {
 
     #[test]
     fn kind_of_untagged_is_none() {
-        assert_eq!(kind_of(&Value::Object(HashMap::new())), None);
+        assert_eq!(kind_of(&Value::Object(ValueMap::new())), None);
         assert_eq!(kind_of(&Value::Number(1.0)), None);
         assert_eq!(kind_of(&Value::Null), None);
     }
@@ -635,7 +634,7 @@ mod tests {
 
     #[test]
     fn config_object_reads_globals() {
-        let cfg = Value::Object(HashMap::from([
+        let cfg = Value::Object(ValueMap::from([
             ("bootstrap".to_string(), Value::String("host:9092".into())),
             ("requiresTypeId".to_string(), Value::Bool(true)),
             ("requiresKey".to_string(), Value::Bool(true)),
@@ -648,7 +647,7 @@ mod tests {
 
     #[test]
     fn config_object_requires_bootstrap() {
-        let cfg = Value::Object(HashMap::from([(
+        let cfg = Value::Object(ValueMap::from([(
             "requiresKey".to_string(),
             Value::Bool(true),
         )]));
@@ -661,7 +660,7 @@ mod tests {
     fn payload_serialization_matches_http_bodies() {
         assert_eq!(value_to_payload(&Value::String("hi".into())), Some(b"hi".to_vec()));
         assert_eq!(value_to_payload(&Value::Null), None); // tombstone
-        let obj = Value::Object(HashMap::from([("a".to_string(), Value::Number(1.0))]));
+        let obj = Value::Object(ValueMap::from([("a".to_string(), Value::Number(1.0))]));
         assert_eq!(value_to_payload(&obj), Some(br#"{"a":1}"#.to_vec()));
         assert_eq!(value_to_payload(&Value::Number(3.0)), Some(b"3".to_vec()));
     }
@@ -669,7 +668,7 @@ mod tests {
     #[test]
     fn headers_from_variants() {
         assert!(headers_from(&Value::Null).unwrap().is_empty());
-        let h = headers_from(&Value::Object(HashMap::from([
+        let h = headers_from(&Value::Object(ValueMap::from([
             ("__TypeId__".to_string(), Value::String("com.foo.Bar".into())),
             ("n".to_string(), Value::Number(7.0)),
         ])))
@@ -695,7 +694,7 @@ mod tests {
     #[test]
     fn send_enforces_required_key() {
         // requiresKey with no .key set → error before any network work.
-        let cfg = Value::Object(HashMap::from([
+        let cfg = Value::Object(ValueMap::from([
             ("bootstrap".to_string(), Value::String("localhost:9092".into())),
             ("requiresKey".to_string(), Value::Bool(true)),
         ]));
@@ -707,13 +706,13 @@ mod tests {
     #[test]
     fn send_enforces_required_type_id() {
         // requiresTypeId with headers lacking __TypeId__ → error before network.
-        let cfg = Value::Object(HashMap::from([
+        let cfg = Value::Object(ValueMap::from([
             ("bootstrap".to_string(), Value::String("localhost:9092".into())),
             ("requiresTypeId".to_string(), Value::Bool(true)),
         ]));
         let mut h = set(broker_from_config(&cfg).unwrap(), "topic", Value::String("t".into()));
         // headers present but missing __TypeId__
-        h = set(h, "headers", Value::Object(HashMap::from([(
+        h = set(h, "headers", Value::Object(ValueMap::from([(
             "x".to_string(),
             Value::String("y".into()),
         )])));
@@ -860,14 +859,14 @@ mod tests {
         h = set(
             h,
             "headers",
-            Value::Object(HashMap::from([(
+            Value::Object(ValueMap::from([(
                 "__TypeId__".to_string(),
                 Value::String("com.foo.OrderEvent".into()),
             )])),
         );
         let ack = send(
             &h,
-            &[Value::Object(HashMap::from([(
+            &[Value::Object(ValueMap::from([(
                 "id".to_string(),
                 Value::String(needle.clone()),
             )]))],

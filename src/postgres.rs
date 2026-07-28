@@ -31,7 +31,6 @@
 //!   0-indexed n-th page (stateless LIMIT/OFFSET re-issue); `cursor.total()`
 //!   returns `count(*)` over the wrapped query.
 
-use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,7 +41,7 @@ use tokio_postgres::{Client, Config, Row};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::eval::{EvalError, Scope};
-use crate::value::Value;
+use crate::value::{Value, ValueMap};
 
 /// Wall-clock backstop for any single Postgres op. Bites only when a server is
 /// unreachable or a statement hangs; the current-thread runtime would otherwise
@@ -398,7 +397,7 @@ fn quote_ident(ident: &str) -> String {
 
 /// Turn a result row into a `{ column: value, … }` object.
 fn row_to_object(row: &Row) -> Value {
-    let mut map = HashMap::with_capacity(row.columns().len());
+    let mut map = ValueMap::with_capacity(row.columns().len());
     for (i, col) in row.columns().iter().enumerate() {
         map.insert(col.name().to_string(), column_value(row, i, col.type_()));
     }
@@ -457,7 +456,7 @@ where
 
 /// `{ rows: [...], count: N }` — the uniform result shape.
 fn result_object(rows: Vec<Value>, count: f64) -> Value {
-    Value::Object(HashMap::from([
+    Value::Object(ValueMap::from([
         ("rows".to_string(), Value::Array(rows)),
         ("count".to_string(), Value::Number(count)),
     ]))
@@ -507,7 +506,7 @@ fn sql_summary(sql: &str) -> String {
 /// `$.postgres(config)` → a connection handle. `config` is a `postgres://…` URL
 /// string or an object carrying discrete fields. No connection is opened here.
 pub fn connection_from_config(config: &Value) -> Result<Value, EvalError> {
-    let mut fields: HashMap<String, Value> = HashMap::new();
+    let mut fields: ValueMap = ValueMap::new();
     fields.insert(
         KIND_FIELD.to_string(),
         Value::String(kind::CONNECTION.to_string()),
@@ -581,7 +580,7 @@ fn paginate(handle: &Value, args: &[Value], _scope: &Scope) -> Result<Value, Eva
             ))
         }
     };
-    Ok(Value::Object(HashMap::from([
+    Ok(Value::Object(ValueMap::from([
         (KIND_FIELD.to_string(), Value::String(kind::CURSOR.to_string())),
         ("conn".to_string(), handle.clone()),
         ("sql".to_string(), Value::String(sql)),
@@ -680,7 +679,7 @@ fn page(cursor: &Value, args: &[Value], scope: &Scope) -> Result<Value, EvalErro
     };
     let mut map = match result {
         Value::Object(m) => m,
-        _ => HashMap::new(),
+        _ => ValueMap::new(),
     };
     map.insert("page".to_string(), Value::Number(n as f64));
     map.insert("pageSize".to_string(), Value::Number(page_size as f64));
@@ -873,7 +872,7 @@ WaYIrmqRLTLPzvg/ztML/9G3DzO1
     fn kind_of_tags() {
         let c = connection_from_config(&Value::String("postgres://localhost/db".into())).unwrap();
         assert_eq!(kind_of(&c).as_deref(), Some(kind::CONNECTION));
-        assert_eq!(kind_of(&Value::Object(HashMap::new())), None);
+        assert_eq!(kind_of(&Value::Object(ValueMap::new())), None);
         assert_eq!(kind_of(&Value::Number(1.0)), None);
     }
 

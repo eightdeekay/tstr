@@ -15,7 +15,7 @@ use crate::eval::{self, FileResult};
 use crate::output::Printer;
 use crate::scheduler::FileIndex;
 use crate::stats::fmt_duration_ms;
-use crate::value::Value;
+use crate::value::{Value, ValueMap};
 
 /// Options controlling test execution behavior.
 pub struct RunOptions {
@@ -33,7 +33,7 @@ pub struct RunOptions {
     pub config: Config,
     /// Precomputed constants namespace, derived from `config.constants`.
     /// Shared via Arc so per-file scopes can attach cheaply.
-    pub constants: Arc<HashMap<String, Value>>,
+    pub constants: Arc<ValueMap>,
     /// Per-leaf duration ledger (`.tstr-stats.json`). When present, clean leaf
     /// runs record their wall-clock into it and sibling subtrees are scheduled
     /// longest-first from its numbers. None disables both (unit tests).
@@ -50,7 +50,7 @@ impl Default for RunOptions {
             halt_flag: None,
             display_root: None,
             config: Config::default(),
-            constants: Arc::new(HashMap::new()),
+            constants: Arc::new(ValueMap::new()),
             stats: None,
             skip_slow_ms: None,
         }
@@ -101,7 +101,7 @@ impl RunTotals {
 pub fn run_structural(
     suite: &Suite,
     index: &FileIndex,
-    cli_overrides: &HashMap<String, Value>,
+    cli_overrides: &ValueMap,
     opts: &RunOptions,
     printer: &Arc<Printer>,
 ) -> RunTotals {
@@ -110,7 +110,7 @@ pub fn run_structural(
     // Build the initial ambient scope from CLI overrides only.
     // Constants and libs are attached per-file (each file gets its own
     // freshly-constructed scope so cascading is explicit).
-    let initial_ambient: HashMap<String, Value> = cli_overrides.clone();
+    let initial_ambient: ValueMap = cli_overrides.clone();
 
     let display_root = opts.display_root.clone()
         .unwrap_or_else(|| index.root.clone());
@@ -149,7 +149,7 @@ pub fn run_repeated_sequential(
     repeat: usize,
     suite: &Suite,
     index: &FileIndex,
-    cli_overrides: &HashMap<String, Value>,
+    cli_overrides: &ValueMap,
     opts: &RunOptions,
     printer: &Arc<Printer>,
 ) -> RunTotals {
@@ -178,7 +178,7 @@ pub fn run_repeated_concurrent(
     repeat: usize,
     suite: &Suite,
     index: &FileIndex,
-    cli_overrides: &HashMap<String, Value>,
+    cli_overrides: &ValueMap,
     opts: &RunOptions,
     printer: &Arc<Printer>,
 ) -> RunTotals {
@@ -286,7 +286,7 @@ fn slot_key(entry: &TestEntry, display_root: &std::path::Path) -> String {
 #[allow(unused_assignments)]
 fn run_dir_structural(
     dir: &Suite,
-    parent_ambient: &HashMap<String, Value>,
+    parent_ambient: &ValueMap,
     blocked_in: Option<String>,
     index: &FileIndex,
     opts: &RunOptions,
@@ -564,7 +564,7 @@ fn filename_starts_with(entry: &TestEntry, prefix: &str) -> bool {
 ///   2. An upstream const/setup didn't complete (`blocked`) → cite that.
 fn run_or_skip(
     entry: &TestEntry,
-    ambient: &HashMap<String, Value>,
+    ambient: &ValueMap,
     blocked: Option<&str>,
     index: &FileIndex,
     opts: &RunOptions,
@@ -581,7 +581,7 @@ fn run_or_skip(
 
 /// Declared input parameters (`name -->`) that are absent or null in ambient
 /// scope — i.e. the inputs a prior setup was supposed to publish but didn't.
-fn missing_inputs(file: &crate::ast::File, ambient: &HashMap<String, Value>) -> Vec<String> {
+fn missing_inputs(file: &crate::ast::File, ambient: &ValueMap) -> Vec<String> {
     let mut missing = Vec::new();
     for name in &file.inputs {
         match ambient.get(name.as_str()) {
@@ -631,7 +631,7 @@ fn skipped_result(entry: &TestEntry, reason: &str) -> FileResult {
         inputs: Vec::new(),
         failures: Vec::new(),
         endpoint: None,
-        exports: HashMap::new(),
+        exports: ValueMap::new(),
         logs: Vec::new(),
         elapsed: std::time::Duration::ZERO,
         is_const: entry.file.file_type == FileType::Const,
@@ -684,7 +684,7 @@ fn report_file(
 /// Sets `_in` for backward compat with legacy files that still use it.
 fn exec_structural_file(
     entry: &TestEntry,
-    ambient: &HashMap<String, Value>,
+    ambient: &ValueMap,
     index: &FileIndex,
     opts: &RunOptions,
 ) -> eval::FileResult {
@@ -702,9 +702,9 @@ fn exec_structural_file(
     }
     // Legacy compat: also build a `_in` object so files using `_in.X`
     // syntax keep working during migration.
-    let in_obj: HashMap<String, Value> = ambient.clone();
+    let in_obj: ValueMap = ambient.clone();
     file_scope.set("_in".to_string(), Value::Object(in_obj));
-    file_scope.set("_out".to_string(), Value::Object(HashMap::new()));
+    file_scope.set("_out".to_string(), Value::Object(ValueMap::new()));
 
     match eval::exec_file(&entry.file, &entry.name, &mut file_scope) {
         Ok(result) => result,
@@ -717,7 +717,7 @@ fn exec_structural_file(
             inputs: Vec::new(),
             failures: vec![eval::AssertionFailure::new(format!("runtime error: {}", e))],
             endpoint: file_scope.last_endpoint(),
-            exports: HashMap::new(),
+            exports: ValueMap::new(),
             logs: file_scope.take_logs(),
             elapsed: std::time::Duration::ZERO,
             is_const: entry.file.file_type == FileType::Const,
@@ -726,7 +726,7 @@ fn exec_structural_file(
     }
 }
 
-fn merge_exports_into(ambient: &mut HashMap<String, Value>, exports: &HashMap<String, Value>) {
+fn merge_exports_into(ambient: &mut ValueMap, exports: &ValueMap) {
     for (k, v) in exports {
         ambient.insert(k.clone(), v.clone());
     }
@@ -760,7 +760,7 @@ mod tests {
     #[test]
     fn missing_inputs_flags_absent_and_null() {
         let file = parse("orgId, token --> { x = 1; }");
-        let mut ambient: HashMap<String, Value> = HashMap::new();
+        let mut ambient: ValueMap = ValueMap::new();
         ambient.insert("token".to_string(), Value::Null); // present but null counts as missing
         // orgId absent + token null → both reported
         let mut got = missing_inputs(&file, &ambient);
@@ -771,7 +771,7 @@ mod tests {
     #[test]
     fn missing_inputs_empty_when_available() {
         let file = parse("orgId --> { x = 1; }");
-        let mut ambient: HashMap<String, Value> = HashMap::new();
+        let mut ambient: ValueMap = ValueMap::new();
         ambient.insert("orgId".to_string(), Value::String("abc".to_string()));
         assert!(missing_inputs(&file, &ambient).is_empty());
     }
@@ -781,7 +781,7 @@ mod tests {
         // A file with no input header can't be skipped by this check — the
         // upstream-failure backstop covers ambient-only dependents instead.
         let file = parse("--> { x = 1; }");
-        assert!(missing_inputs(&file, &HashMap::new()).is_empty());
+        assert!(missing_inputs(&file, &ValueMap::new()).is_empty());
     }
 
     #[test]
@@ -835,7 +835,7 @@ mod tests {
         let opts = RunOptions::default();
         let printer = Arc::new(Printer::new(OutputMode::Quiet, BarStyle::Auto));
 
-        let totals = run_structural(&suite, &index, &HashMap::new(), &opts, &printer);
+        let totals = run_structural(&suite, &index, &ValueMap::new(), &opts, &printer);
 
         assert_eq!(totals.passed, 2, "both tests should pass");
         assert_eq!(totals.skipped, 0, "second test must not skip — it should see 01's export");
@@ -850,7 +850,7 @@ mod tests {
         let stats = Arc::new(crate::stats::StatsBook::load(root));
         let opts = RunOptions { stats: Some(Arc::clone(&stats)), ..RunOptions::default() };
         let printer = Arc::new(Printer::new(OutputMode::Quiet, BarStyle::Auto));
-        run_structural(&suite, &index, &HashMap::new(), &opts, &printer);
+        run_structural(&suite, &index, &ValueMap::new(), &opts, &printer);
         stats
     }
 
@@ -949,7 +949,7 @@ mod tests {
             ..RunOptions::default()
         };
         let printer = Arc::new(Printer::new(OutputMode::Quiet, BarStyle::Auto));
-        let totals = run_structural(&suite, &index, &HashMap::new(), &opts, &printer);
+        let totals = run_structural(&suite, &index, &ValueMap::new(), &opts, &printer);
 
         assert_eq!(totals.passed, 2, "fast + new should run");
         assert_eq!(totals.skipped, 1, "slow leaf should skip");
@@ -996,7 +996,7 @@ mod tests {
         let index = crate::scheduler::FileIndex::build(suite.clone(), root.to_path_buf());
         let opts = RunOptions::default();
         let printer = Arc::new(Printer::new(OutputMode::Quiet, BarStyle::Auto));
-        run_structural(&suite, &index, &HashMap::new(), &opts, &printer)
+        run_structural(&suite, &index, &ValueMap::new(), &opts, &printer)
     }
 
     /// Build a Quiet-mode suite (no live display) with one passing and one
@@ -1019,7 +1019,7 @@ mod tests {
     fn concurrent_repeat_accumulates_totals_across_passes() {
         let dir = tempfile::tempdir().unwrap();
         let (suite, index, opts, printer) = one_pass_one_fail_suite(dir.path());
-        let totals = run_repeated_concurrent(5, &suite, &index, &HashMap::new(), &opts, &printer);
+        let totals = run_repeated_concurrent(5, &suite, &index, &ValueMap::new(), &opts, &printer);
         assert_eq!(totals.passed, 5);
         assert_eq!(totals.failed, 5);
         assert_eq!(totals.skipped, 0);
@@ -1030,7 +1030,7 @@ mod tests {
     fn sequential_repeat_accumulates_totals_across_passes() {
         let dir = tempfile::tempdir().unwrap();
         let (suite, index, opts, printer) = one_pass_one_fail_suite(dir.path());
-        let totals = run_repeated_sequential(3, &suite, &index, &HashMap::new(), &opts, &printer);
+        let totals = run_repeated_sequential(3, &suite, &index, &ValueMap::new(), &opts, &printer);
         assert_eq!(totals.passed, 3);
         assert_eq!(totals.failed, 3);
         assert_eq!(totals.skipped, 0);

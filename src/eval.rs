@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use regex::Regex;
 
 use crate::ast::*;
-use crate::value::Value;
+use crate::value::{Value, ValueMap};
 
 /// Runtime error during evaluation.
 #[derive(Debug)]
@@ -46,14 +46,14 @@ impl AssertionFailure {
 /// Variable scope — holds named values, with optional parent for inheritance.
 #[derive(Debug)]
 pub struct Scope {
-    vars: HashMap<String, Value>,
+    vars: ValueMap,
     /// Provenance for each variable: where it came from (e.g. "cli", "const:foo.const.tstr",
     /// "matrix:Site A", "test:01-create.test.tstr"). Missing entry = source unknown / set in-file.
     sources: HashMap<String, String>,
     /// Immutable project-wide constants namespace, accessed via `${name}` syntax.
     /// Sourced from yaml `constants:` and (future) `.const.tstr` returns.
     /// Arc so cloning a scope doesn't deep-copy the map.
-    constants: std::sync::Arc<HashMap<String, Value>>,
+    constants: std::sync::Arc<ValueMap>,
     /// Libraries visible to this scope, by name. Populated per-file from the
     /// FileIndex according to the lib resolution rule (dir chain + lib/ subtrees).
     /// Looked up by `Expr::LibCall` and `Expr::MethodCall` (UFCS).
@@ -83,9 +83,9 @@ impl Clone for Scope {
 impl Scope {
     pub fn new() -> Self {
         Scope {
-            vars: HashMap::new(),
+            vars: ValueMap::new(),
             sources: HashMap::new(),
-            constants: std::sync::Arc::new(HashMap::new()),
+            constants: std::sync::Arc::new(ValueMap::new()),
             libs: std::sync::Arc::new(HashMap::new()),
             base_dir: None,
             logs: RefCell::new(Vec::new()),
@@ -93,11 +93,11 @@ impl Scope {
         }
     }
 
-    pub fn with_vars(vars: HashMap<String, Value>) -> Self {
+    pub fn with_vars(vars: ValueMap) -> Self {
         Scope {
             vars,
             sources: HashMap::new(),
-            constants: std::sync::Arc::new(HashMap::new()),
+            constants: std::sync::Arc::new(ValueMap::new()),
             libs: std::sync::Arc::new(HashMap::new()),
             base_dir: None,
             logs: RefCell::new(Vec::new()),
@@ -118,7 +118,7 @@ impl Scope {
 
     /// Attach a constants namespace (yaml constants + future .const.tstr returns).
     /// Replaces any previously-set constants. Use Arc so subsequent clones are cheap.
-    pub fn with_constants(mut self, constants: std::sync::Arc<HashMap<String, Value>>) -> Self {
+    pub fn with_constants(mut self, constants: std::sync::Arc<ValueMap>) -> Self {
         self.constants = constants;
         self
     }
@@ -239,7 +239,7 @@ pub fn eval_expr(expr: &Expr, scope: &Scope) -> Result<Value, EvalError> {
         }
 
         Expr::JsonObject(entries) => {
-            let mut map = HashMap::new();
+            let mut map = ValueMap::new();
             for (key, val_expr) in entries {
                 let val = eval_expr(val_expr, scope)?;
                 map.insert(key.clone(), val);
@@ -342,7 +342,7 @@ pub fn eval_expr(expr: &Expr, scope: &Scope) -> Result<Value, EvalError> {
                 if outputs.len() == 1 {
                     last_value = block_scope.get(&outputs[0]);
                 } else {
-                    let mut map = HashMap::new();
+                    let mut map = ValueMap::new();
                     for name in outputs {
                         map.insert(name.clone(), block_scope.get(name));
                     }
@@ -715,7 +715,7 @@ fn invoke_lib(
     }
     // `_out` accumulates the lib's `export` bindings — that object is the lib's
     // value at the call site.
-    lib_scope.set("_out".to_string(), Value::Object(HashMap::new()));
+    lib_scope.set("_out".to_string(), Value::Object(ValueMap::new()));
 
     // Execute statements. A top-level `return;` is void — it just halts; the
     // lib's value is its exports (collected below).
@@ -739,7 +739,7 @@ fn invoke_lib(
     if lib.outputs.is_empty() {
         Ok(out_obj)
     } else {
-        let mut narrowed = HashMap::new();
+        let mut narrowed = ValueMap::new();
         if let Value::Object(map) = out_obj {
             for k in &lib.outputs {
                 if let Some(v) = map.get(k) {
@@ -848,7 +848,7 @@ fn eval_block_transform(block: &Expr, item: &Value, scope: &Scope) -> Result<Val
                 if outputs.len() == 1 {
                     Ok(block_scope.get(&outputs[0]))
                 } else {
-                    let mut map = HashMap::new();
+                    let mut map = ValueMap::new();
                     for name in outputs {
                         map.insert(name.clone(), block_scope.get(name));
                     }
@@ -1236,7 +1236,7 @@ pub struct MatrixDef {
 #[derive(Debug, Clone)]
 pub struct EvaluatedMatrixEntry {
     pub label: String,
-    pub vars: HashMap<String, Value>,
+    pub vars: ValueMap,
 }
 
 /// Build a short diagnostic string for a failed assertion.
@@ -1433,7 +1433,7 @@ pub fn exec_statement(stmt: &Statement, scope: &mut Scope) -> Result<StmtResult,
             if let Value::Object(map) = exported {
                 let mut out = match scope.get("_out") {
                     Value::Object(m) => m,
-                    _ => HashMap::new(),
+                    _ => ValueMap::new(),
                 };
                 for (k, v) in map {
                     out.insert(k, v);
@@ -1597,7 +1597,7 @@ fn set_nested_field(scope: &mut Scope, object: &str, path: &[PropertyKey], value
 
     // If the root doesn't exist yet, create an empty object
     if current == Value::Null {
-        current = Value::Object(HashMap::new());
+        current = Value::Object(ValueMap::new());
     }
 
     if path.len() == 1 {
@@ -1638,7 +1638,7 @@ fn set_deep_field(obj: &mut Value, path: &[PropertyKey], value: Value) -> Result
     } else {
         match obj {
             Value::Object(map) => {
-                let child = map.entry(key).or_insert_with(|| Value::Object(HashMap::new()));
+                let child = map.entry(key).or_insert_with(|| Value::Object(ValueMap::new()));
                 set_deep_field(child, &path[1..], value)
             }
             _ => Err(EvalError::new(format!("cannot access field on {}", obj.type_name()))),
@@ -1671,7 +1671,7 @@ pub struct FileResult {
     /// Assertion failures
     pub failures: Vec<AssertionFailure>,
     /// Exported variables (from <--)
-    pub exports: HashMap<String, Value>,
+    pub exports: ValueMap,
     /// Log messages from $.log()
     pub logs: Vec<String>,
     /// Last HTTP endpoint called (e.g. "POST https://example.com/v4/groups")
@@ -1696,7 +1696,7 @@ pub fn exec_file(
     let is_const = file.file_type == crate::ast::FileType::Const;
 
     // Initialize _out as empty object for export assignments
-    scope.set("_out".to_string(), Value::Object(HashMap::new()));
+    scope.set("_out".to_string(), Value::Object(ValueMap::new()));
 
     // Capture _in variable values + their sources for the log table
     let inputs: Vec<(String, Option<String>, Value)> = match scope.get("_in") {
@@ -1726,7 +1726,7 @@ pub fn exec_file(
             inputs,
             failures: Vec::new(),
             endpoint: None,
-            exports: HashMap::new(),
+            exports: ValueMap::new(),
             logs: scope.take_logs(),
             elapsed: start.elapsed(),
             is_const,
@@ -1755,7 +1755,7 @@ pub fn exec_file(
                     inputs,
                     failures: Vec::new(),
                     endpoint: None,
-                    exports: HashMap::new(),
+                    exports: ValueMap::new(),
                     logs: scope.take_logs(),
                     elapsed: start.elapsed(),
                     is_const,
@@ -1801,7 +1801,7 @@ pub fn exec_file(
     }
 
     // Exports come from `export` statements, accumulated in `_out`.
-    let mut exports = HashMap::new();
+    let mut exports = ValueMap::new();
     if let Value::Object(out_map) = scope.get("_out") {
         for (k, v) in out_map {
             exports.insert(k, v);
@@ -1888,7 +1888,7 @@ mod tests {
     // --- Constants namespace ---
 
     fn scope_with_constants(pairs: &[(&str, Value)]) -> Scope {
-        let map: HashMap<String, Value> = pairs.iter()
+        let map: ValueMap = pairs.iter()
             .map(|(k, v)| (k.to_string(), v.clone()))
             .collect();
         Scope::new().with_constants(std::sync::Arc::new(map))
@@ -1932,7 +1932,7 @@ mod tests {
 
     #[test]
     fn interp_braces_dotted_constant() {
-        let mut org = HashMap::new();
+        let mut org = ValueMap::new();
         org.insert("baseUrl".to_string(), Value::String("https://api.example.com".to_string()));
         let scope = scope_with_constants(&[("org", Value::Object(org))]);
         assert_eq!(
@@ -1951,7 +1951,7 @@ mod tests {
 
     #[test]
     fn test_constant_lookup_dotted() {
-        let mut org = HashMap::new();
+        let mut org = ValueMap::new();
         org.insert("baseUrl".to_string(), Value::String("https://api.example.com".to_string()));
         org.insert("version".to_string(), Value::String("v4".to_string()));
         let scope = scope_with_constants(&[
@@ -1979,7 +1979,7 @@ mod tests {
     #[test]
     fn test_constant_missing_subkey_returns_null() {
         // Sub-key lookups are forgiving (like field access on missing keys).
-        let mut org = HashMap::new();
+        let mut org = ValueMap::new();
         org.insert("baseUrl".to_string(), Value::String("x".to_string()));
         let scope = scope_with_constants(&[("orgService", Value::Object(org))]);
         assert_eq!(eval_with_scope("${orgService.notThere}", &scope), Value::Null);
@@ -2096,7 +2096,7 @@ mod tests {
     #[test]
     fn test_property_access() {
         let mut scope = Scope::new();
-        let mut obj = HashMap::new();
+        let mut obj = ValueMap::new();
         obj.insert("id".to_string(), Value::Number(123.0));
         obj.insert("name".to_string(), Value::String("Test".to_string()));
         scope.set("r".to_string(), Value::Object(obj));
@@ -2109,10 +2109,10 @@ mod tests {
     #[test]
     fn test_nested_property() {
         let mut scope = Scope::new();
-        let inner = HashMap::from([
+        let inner = ValueMap::from([
             ("city".to_string(), Value::String("NYC".to_string())),
         ]);
-        let outer = HashMap::from([
+        let outer = ValueMap::from([
             ("address".to_string(), Value::Object(inner)),
         ]);
         scope.set("user".to_string(), Value::Object(outer));
@@ -2129,7 +2129,7 @@ mod tests {
         scope.set("r".to_string(), Value::Null);
         assert_eq!(eval_with_scope("r?.name", &scope), Value::Null);
 
-        let obj = HashMap::from([
+        let obj = ValueMap::from([
             ("name".to_string(), Value::String("Test".to_string())),
         ]);
         scope.set("r".to_string(), Value::Object(obj));
@@ -2446,11 +2446,11 @@ mod tests {
     fn test_find() {
         let mut scope = Scope::new();
         scope.set("items".to_string(), Value::Array(vec![
-            Value::Object(HashMap::from([
+            Value::Object(ValueMap::from([
                 ("name".to_string(), Value::String("alpha".to_string())),
                 ("id".to_string(), Value::Number(1.0)),
             ])),
-            Value::Object(HashMap::from([
+            Value::Object(ValueMap::from([
                 ("name".to_string(), Value::String("beta".to_string())),
                 ("id".to_string(), Value::Number(2.0)),
             ])),
@@ -2464,7 +2464,7 @@ mod tests {
     fn test_find_no_match() {
         let mut scope = Scope::new();
         scope.set("items".to_string(), Value::Array(vec![
-            Value::Object(HashMap::from([
+            Value::Object(ValueMap::from([
                 ("name".to_string(), Value::String("alpha".to_string())),
             ])),
         ]));
@@ -2477,15 +2477,15 @@ mod tests {
     fn test_filter() {
         let mut scope = Scope::new();
         scope.set("items".to_string(), Value::Array(vec![
-            Value::Object(HashMap::from([
+            Value::Object(ValueMap::from([
                 ("active".to_string(), Value::Bool(true)),
                 ("name".to_string(), Value::String("a".to_string())),
             ])),
-            Value::Object(HashMap::from([
+            Value::Object(ValueMap::from([
                 ("active".to_string(), Value::Bool(false)),
                 ("name".to_string(), Value::String("b".to_string())),
             ])),
-            Value::Object(HashMap::from([
+            Value::Object(ValueMap::from([
                 ("active".to_string(), Value::Bool(true)),
                 ("name".to_string(), Value::String("c".to_string())),
             ])),

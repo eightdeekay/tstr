@@ -1,5 +1,15 @@
-use std::collections::HashMap;
+use indexmap::IndexMap;
 use std::fmt;
+
+/// Backing map for `Value::Object` — insertion-ordered, like Java's
+/// `LinkedHashMap`. Key order in a DSL object literal is meaningful (some APIs
+/// resolve conflicts by "first key declared wins"), so a plain `HashMap` — whose
+/// iteration order is random, and which we used to paper over by sorting keys on
+/// output — would silently rewrite the request the test author wrote.
+///
+/// One trap: `IndexMap::swap_remove` is O(1) but destroys order by moving the
+/// last entry into the hole. Use `shift_remove` when order must hold.
+pub type ValueMap = IndexMap<String, Value>;
 
 /// Runtime value — the result of evaluating any expression.
 #[derive(Debug, Clone)]
@@ -9,7 +19,7 @@ pub enum Value {
     Number(f64),
     String(String),
     Array(Vec<Value>),
-    Object(HashMap<String, Value>),
+    Object(ValueMap),
 }
 
 impl Value {
@@ -28,7 +38,7 @@ impl Value {
                 Value::Array(seq.iter().map(Value::from_yaml).collect())
             }
             serde_yaml::Value::Mapping(map) => {
-                let mut out = HashMap::new();
+                let mut out = ValueMap::new();
                 for (k, v) in map {
                     if let Some(key) = k.as_str() {
                         out.insert(key.to_string(), Value::from_yaml(v));
@@ -199,12 +209,11 @@ impl fmt::Display for Value {
                 write!(f, "]")
             }
             Value::Object(map) => {
+                // Declaration order, not sorted — this is what got sent.
                 write!(f, "{{")?;
-                let mut keys: Vec<_> = map.keys().collect();
-                keys.sort();
-                for (i, key) in keys.iter().enumerate() {
+                for (i, (key, val)) in map.iter().enumerate() {
                     if i > 0 { write!(f, ", ")?; }
-                    write!(f, "\"{}\": {}", key, map[*key])?;
+                    write!(f, "\"{}\": {}", key, val)?;
                 }
                 write!(f, "}}")
             }
@@ -230,7 +239,7 @@ mod tests {
 
     #[test]
     fn test_get_field() {
-        let mut map = HashMap::new();
+        let mut map = ValueMap::new();
         map.insert("name".to_string(), Value::String("Test".to_string()));
         map.insert("count".to_string(), Value::Number(3.0));
         let obj = Value::Object(map);
@@ -280,10 +289,10 @@ mod tests {
     #[test]
     fn test_collect_field() {
         let arr = Value::Array(vec![
-            Value::Object(HashMap::from([
+            Value::Object(ValueMap::from([
                 ("id".to_string(), Value::Number(1.0)),
             ])),
-            Value::Object(HashMap::from([
+            Value::Object(ValueMap::from([
                 ("id".to_string(), Value::Number(2.0)),
             ])),
         ]);
