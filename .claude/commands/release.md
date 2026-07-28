@@ -50,6 +50,13 @@ If unsure whether something is breaking, say so and ask before bumping.
    `~/dev/layer-services/tstr/README.md` so that repo's vendored copy stays in
    sync. This only writes the file; it does not commit in layer-services — tell
    Doug that repo now has an uncommitted README change for him to handle there.
+12. **Announce on Slack** — `scripts/announce-release.sh`. It derives the version
+   from `Cargo.toml` and the one-line summary from the newest CHANGELOG entry, so
+   it takes no arguments. Runs last, after the push, so the tag link resolves.
+   Needs `SLACK_BOT_TOKEN` and `TSTR_RELEASE_SLACK_CHANNEL` in the environment;
+   if either is unset the script exits 2 with a message — report that the release
+   itself succeeded but the announcement didn't go out, and do not treat it as a
+   failed release. Use `--dry-run` to inspect the payload without posting.
 
 ## Notes
 
@@ -64,3 +71,8 @@ If unsure whether something is breaking, say so and ask before bumping.
   never split into a trailing "Sync Cargo.lock" commit.
 - The README gate (step 4) is a consistency check, not a content generator: it
   fails the release only when a user-facing change shipped without its docs.
+- **The Slack announcement is configured by environment, not by this file.** The
+  channel lives in `TSTR_RELEASE_SLACK_CHANNEL` because this repo is public and
+  the target is an internal workspace channel — don't hardcode it here or in
+  `scripts/announce-release.sh`. Likewise never echo `SLACK_BOT_TOKEN` or run
+  curl with `-v` (which prints the Authorization header).
