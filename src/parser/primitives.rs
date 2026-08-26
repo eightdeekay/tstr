@@ -40,6 +40,7 @@ pub fn escaped_string(input: &mut &str) -> ModalResult<String> {
                 *input = &input[1..];
                 match input.chars().next() {
                     Some('n') => { result.push('\n'); *input = &input[1..]; }
+                    Some('r') => { result.push('\r'); *input = &input[1..]; }
                     Some('t') => { result.push('\t'); *input = &input[1..]; }
                     Some('\\') => { result.push('\\'); *input = &input[1..]; }
                     Some('"') => { result.push('"'); *input = &input[1..]; }

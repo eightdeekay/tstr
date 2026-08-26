@@ -3,6 +3,78 @@
 Migration steps for releases that need action on existing suites. Each section
 cross-links to the full change list in [CHANGELOG.md](CHANGELOG.md).
 
+<a id="v0.12.0"></a>
+## 0.12.0 — A failure halts its leaf; `--stop-on-error` → `--continue-on-error`
+
+→ **Full change list:** [CHANGELOG § 0.12.0](CHANGELOG.md#v0.12.0)
+
+No codemod: no `.tstr` file changes at all. The flag rename only touches how you
+invoke `tstr`, and it fails loudly — `--stop-on-error` no longer parses, so one
+run of your CI command finds every place that passes it.
+
+### Drop `--stop-on-error`
+
+```
+# before
+tstr run --stop-on-error .
+
+# after
+tstr run .
+```
+
+The flag was accepted but never propagated — a documented no-op since the
+structural runner landed — so removing it changes no behavior on its own. It is
+now **rejected** rather than ignored:
+
+```
+error: unexpected argument '--stop-on-error' found
+
+  tip: a similar argument exists: '--continue-on-error'
+```
+
+### A failure now halts the rest of its leaf
+
+This is the change that needs a look at your suites. Previously, when a test
+failed, the remaining tests in that leaf ran anyway. Now they don't — they report
+`SKIP  halted: <culprit> failed`, because once a test fails the ones after it in
+the same leaf are running against unknown state.
+
+Nothing to edit; what changes is what a broken run *looks like*. Expect a failing
+leaf to show one `FAIL` and a run of `SKIP`s where it used to show a `FAIL`
+followed by a pile of cascading failures. Suite totals shift accordingly — skips
+up, passes and fails down. The exit status is unchanged: a failure still fails
+the run.
+
+The halt is **leaf-local**. Sibling leaves and directories run to completion, so
+one broken leaf never masks the rest of the suite's verdict.
+
+### If you want the old behavior
+
+```
+tstr run --continue-on-error .
+```
+
+Every test in a leaf runs regardless of what failed before it, exactly as it did
+pre-0.12.
+
+### `blast-radius:` now *narrows* the fallout
+
+A file's own `blast-radius:` is still honored verbatim, and it wins over the
+default halt — which means declaring one now **bounds** the damage instead of
+extending it:
+
+| Culprit | Result |
+|---|---|
+| fails, no `blast-radius:` | rest of the leaf skips (the new default) |
+| fails, `blast-radius: 2` | exactly the next 2 skip; the leaf **resumes** at the third |
+| fails, `blast-radius: all` | rest of the leaf skips (same as the default) |
+| `disabled:`, no `blast-radius:` | nothing skips — it never ran, so it broke nothing |
+| `disabled:`, `blast-radius: N` | the next N skip (unchanged) |
+
+So a leaf where a known-flaky early test shouldn't stop everything after it is
+best served by giving that test an explicit radius covering just its real
+collateral, rather than reaching for `--continue-on-error` suite-wide.
+
 <a id="v0.10.0"></a>
 ## 0.10.0 — Flat config (no `defaults:`); `--jobs`→`--threads`, `--repeat-mode`→`--stress`
 

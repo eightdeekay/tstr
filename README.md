@@ -388,6 +388,19 @@ as `SKIP  blast-radius from <culprit>`, traceable to the cause.
 - `disabled:` + `blast-radius: N` → skip self **+** the next N tests.
 - a runtime **failure** + `blast-radius: N` → self reports **FAIL**, the next N **SKIP**.
 
+**A failure with no `blast-radius:` halts the rest of its leaf.** Once a test
+fails, the ones after it in the same leaf are running against unknown state, so
+by default they don't run at all — they report `SKIP  halted: <culprit> failed`.
+This is the unbounded case of the same idea, which is why declaring a radius
+*narrows* the fallout rather than widening it: `blast-radius: 2` says "exactly
+these two are collateral", and the leaf resumes at the third. To carry on
+through a leaf after a failure — the pre-0.12 behavior — pass
+`--continue-on-error`. A `disabled:` file with no radius halts nothing: it never
+ran, so it broke nothing.
+
+The halt is **leaf-local**, like the radius itself: every other leaf still runs
+to completion, so one broken leaf never masks the rest of the suite's verdict.
+
 It's leaf-local and forward-only — it never reaches into child directories
 (which run concurrently) and cleanups still run. Value forms:
 
@@ -430,6 +443,17 @@ r = req.post("/v4/groups") ? 2xx | "Failed";
 For relative URLs (`/...`), the request object must contain `urlPrefix`. Absolute URLs (`http://...`) ignore it.
 
 **Object keys go on the wire in the order you declare them.** `{ b: 1, a: 2 }` serializes as `{"b":1,"a":2}`, never re-sorted — so you can test an API that resolves conflicting keys by "first one wins." Parsed responses likewise keep the order the server sent, so a body read into `r` and echoed back is byte-order-faithful.
+
+**A string `body` goes on the wire verbatim.** Objects and arrays are serialized to JSON; a string is sent as-is, with no encoding and no rewriting of your `content-type`. That's what makes hand-rolled wire formats possible — a `multipart/form-data` envelope, say:
+
+```
+csv = @fixtures/people.csv;
+req.headers."content-type" = "multipart/form-data; boundary=B";
+req.body = "--B\r\nContent-Disposition: form-data; name=\"file\"; filename=\"people.csv\"\r\nContent-Type: text/csv\r\n\r\n{{csv}}\r\n--B--\r\n";
+r = req.post("/v4/imports") ? 2xx | "upload rejected";
+```
+
+String escapes are `\n`, `\r`, `\t`, `\\`, `\"`. **Anything else is passed through literally** — `\q` stays a backslash and a `q`. Formats that require CRLF line endings need `\r\n`; a bare `\n` will not parse as multipart.
 
 **Status patterns:** `200`, `2xx`, `200-204`, `>=200`, `<500`.
 
@@ -971,6 +995,7 @@ tstr --version
 |---|---|
 | `--url <base>` | shorthand for `--set urlPrefix=<base>` |
 | `--set 'KEY=VALUE'` | set an ambient variable (repeatable) |
+| `--continue-on-error` | keep running a leaf's remaining tests after one fails. By default a failure halts the rest of *that leaf* (sibling leaves and directories carry on regardless) — see [`blast-radius:`](#blast-radius--skip-downstream-collateral). A file's own `blast-radius:` wins in either mode. |
 | `--repeat <N>` | run the whole suite N times **sequentially** — one pass after another (default `1`). Good for soak / flushing out flaky failures. Totals accumulate; the summary shows `(N iterations x M tests)`. Mutually exclusive with `--stress`. |
 | `--stress <N>` | run the whole suite N times **at once, overlapping** (stress / load). Requires a suite that tolerates concurrent copies of itself (no colliding fixed-name resources). In a terminal, renders one bucketed bar per directory, each spanning that dir's `tests × N` cells and filling as passes complete; piped / off-terminal it's summary-only. |
 | `--display auto\|bars` | slot-display style (`bars` forces colored bucketed bar) |
@@ -1112,7 +1137,6 @@ last measured value, so it stays recognized as slow on the next
 
 Tracked here for visibility; none are blockers:
 
-- **`--stop-on-error`** — accepted but not propagated.
 - **`run` scoping is directory-only.** `tstr run path/to/sub` scopes the run to
   that subdirectory; a non-directory target is an error. There is no name/glob
   filtering and no single-file execution (by design — leaf tests aren't run in

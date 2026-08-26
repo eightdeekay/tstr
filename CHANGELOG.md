@@ -8,6 +8,48 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.12.0"></a>
+## [0.12.0] — 2026-08-26
+
+⚠️ A failing test now halts the rest of its leaf, and `--stop-on-error` is
+replaced by `--continue-on-error`. Nothing in your `.tstr` files changes — the
+action is on how CI invokes `tstr` and on reading a run whose skip count is
+suddenly higher. The removed flag fails loudly at parse. See
+[UPGRADING § 0.12.0](UPGRADING.md#v0.12.0). No codemod: the flag only touches how
+you invoke `tstr`, not any file.
+
+### Changed
+- ⚠️ **A failing test now halts the rest of its leaf by default, and
+  `--stop-on-error` is replaced by `--continue-on-error`.** Once a test fails,
+  every test after it in the same leaf is running against unknown state — the
+  old behavior ran them anyway and turned one broken resource into a screenful
+  of downstream noise. They now report `SKIP  halted: <culprit> failed`. The
+  halt is leaf-local: sibling leaves and directories still run to completion, so
+  the rest of the suite's verdict is unaffected. A file's own `blast-radius:` is
+  still honored verbatim and *narrows* the fallout — `blast-radius: 2` marks
+  exactly two tests as collateral and the leaf resumes at the third. A
+  `disabled:` file with no radius halts nothing (it never ran, so it broke
+  nothing). Pass `--continue-on-error` to carry on through the leaf as before.
+- **`--stop-on-error` is gone.** It was accepted but never propagated (a
+  documented no-op since the structural runner landed), so nothing that passed
+  it observed a behavior change — but the flag is now rejected rather than
+  ignored. Drop it; add `--continue-on-error` if you want the old carry-on
+  behavior after a failure.
+
+### Fixed
+- **`\r` is now a recognized string escape.** The escape table handled `\n`,
+  `\t`, `\\` and `\"` and passed everything else through literally, so `"\r\n"`
+  put a backslash and an `r` on the wire followed by a newline. That is invisible
+  in the source and fatal to any format that requires CRLF: a hand-rolled
+  `multipart/form-data` body looked correct but no boundary line ever matched,
+  and the server answered 500. Escaping now yields a real CR (0x0D). Unknown
+  escapes still pass through verbatim, which is unchanged and now tested.
+
+### Documentation
+- Documented the string escape table and the rule that a string `req.body` is
+  sent verbatim (no JSON encoding, no `content-type` rewriting) under
+  [HTTP Requests](README.md#http-requests), with a multipart upload example.
+
 <a id="v0.11.0"></a>
 ## [0.11.0] — 2026-07-28
 

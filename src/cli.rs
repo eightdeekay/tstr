@@ -57,9 +57,11 @@ pub enum Commands {
         #[arg(long = "set", value_name = "KEY=VALUE")]
         set: Vec<String>,
 
-        /// Stop all execution on first failure
+        /// Keep running a leaf's remaining tests after one of them fails.
+        /// By default a failure halts the rest of that leaf (other leaves and
+        /// directories continue); a file's own `blast-radius:` still wins.
         #[arg(long)]
-        stop_on_error: bool,
+        continue_on_error: bool,
 
         /// Run the entire suite N times, one pass after another (soak /
         /// flake-hunt). For N overlapping passes, use --stress instead.
@@ -146,7 +148,7 @@ pub enum Commands {
 pub fn run(cli: Cli) {
     let config_override = cli.config.clone();
     match cli.command {
-        Commands::Run { target, url, set, stop_on_error, repeat, stress, timeout, verbose, quiet, display, threads, skip_slow } => {
+        Commands::Run { target, url, set, continue_on_error, repeat, stress, timeout, verbose, quiet, display, threads, skip_slow } => {
             crate::http::set_timeout(timeout);
             // Note: the rayon pool is sized inside run_command, after config
             // loads — the `threads:` config value is a fallback for --threads,
@@ -158,7 +160,7 @@ pub fn run(cli: Cli) {
                     process::exit(1);
                 })
             });
-            run_command(&target, url, set, stop_on_error, repeat, stress, verbose, quiet, display, threads, skip_slow_ms, config_override);
+            run_command(&target, url, set, continue_on_error, repeat, stress, verbose, quiet, display, threads, skip_slow_ms, config_override);
         }
         Commands::List { target, ty, flat, disabled } => {
             list_command(&target, &ty, flat, disabled);
@@ -302,7 +304,7 @@ fn run_command(
     target: &str,
     url: Option<String>,
     set_vars: Vec<String>,
-    stop_on_error: bool,
+    continue_on_error: bool,
     repeat: usize,
     stress: Option<usize>,
     verbose: bool,
@@ -457,8 +459,6 @@ fn run_command(
         printer.log_parse_errors(&warnings);
     }
 
-    let _ = stop_on_error; // not yet wired through structural runner
-
     // Precompute the constants namespace from yaml. Wrapped in Arc so per-file
     // scopes share one map without deep-cloning per file.
     let constants_map: ValueMap = config.constants.iter()
@@ -475,8 +475,7 @@ fn run_command(
     let stats = Arc::new(crate::stats::StatsBook::load(&root));
 
     let opts = runner::RunOptions {
-        stop_on_error,
-        halt_flag: None,
+        continue_on_error,
         display_root: target_dir.clone(),
         config,
         constants,

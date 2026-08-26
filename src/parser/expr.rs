@@ -1219,6 +1219,21 @@ mod tests {
         assert_eq!(expr(&mut input).unwrap(), Expr::StringLiteral("line1\nline2".to_string()));
     }
 
+    #[test]
+    fn test_string_escaped_carriage_return() {
+        // CRLF matters for hand-rolled wire formats (multipart/form-data bodies),
+        // where a literal backslash-r would leave no parseable boundary.
+        let mut input = "\"a\\r\\nb\"";
+        assert_eq!(expr(&mut input).unwrap(), Expr::StringLiteral("a\r\nb".to_string()));
+    }
+
+    #[test]
+    fn test_string_unknown_escape_passes_through() {
+        // Anything not in the escape table stays verbatim, backslash included.
+        let mut input = "\"a\\qb\"";
+        assert_eq!(expr(&mut input).unwrap(), Expr::StringLiteral("a\\qb".to_string()));
+    }
+
     // --- tstr block tests ---
 
     #[test]

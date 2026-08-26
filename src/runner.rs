@@ -6,7 +6,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use crate::ast::FileType;
 use crate::config::Config;
@@ -19,10 +18,10 @@ use crate::value::{Value, ValueMap};
 
 /// Options controlling test execution behavior.
 pub struct RunOptions {
-    pub stop_on_error: bool,
-    /// Shared halt flag — when provided, allows multiple concurrent runs to
-    /// signal each other to stop (e.g., --repeat with --stop-on-error).
-    pub halt_flag: Option<Arc<AtomicBool>>,
+    /// `--continue-on-error`: keep running a leaf's remaining tests after one
+    /// of them fails. Off by default — a failure with no `blast-radius:` of its
+    /// own halts the rest of *that leaf* (every other leaf keeps running).
+    pub continue_on_error: bool,
     /// Anchor for the slot display: each slot represents one immediate
     /// child of `display_root`. With `display_root == suite root`, slots
     /// are TLDs (broad summary); with a deeper target, slots zoom into
@@ -46,8 +45,7 @@ pub struct RunOptions {
 impl Default for RunOptions {
     fn default() -> Self {
         RunOptions {
-            stop_on_error: false,
-            halt_flag: None,
+            continue_on_error: false,
             display_root: None,
             config: Config::default(),
             constants: Arc::new(ValueMap::new()),
@@ -399,6 +397,12 @@ fn run_dir_structural(
     // sequence — collateral that depends on the culprit's side effects, which
     // the input-cascade can't see. Children already ran (concurrent phase
     // above) and Phase-4 cleanups still run, so the radius never reaches them.
+    //
+    // A failure that declares *no* radius arms one implicitly, spanning the
+    // rest of the leaf: once a test fails, the ones after it in the same leaf
+    // are running against unknown state, so by default they don't run at all.
+    // The halt is leaf-local — sibling leaves are untouched — and
+    // `--continue-on-error` turns it off, carrying on through the leaf.
     let mut blast: Option<Blast> = None;
     for entry in tests {
         // If a prior culprit's radius covers this entry, skip it as collateral.
@@ -421,8 +425,8 @@ fn run_dir_structural(
         leaf_clean &= is_clean_outcome(&result);
         merge_exports_into(&mut dir_ambient, &result.exports);
         report_file(entry, &result, index, display_root, printer, &mut totals, is_scaffold(entry, is_leaf));
-        // Arm a radius if this test is a culprit (disabled or failed) with one.
-        blast = Blast::arm(entry, &result);
+        // Arm a radius if this test is a culprit (disabled or failed).
+        blast = Blast::arm(entry, &result, opts.continue_on_error);
     }
 
     // Phase 4 — cleanups in this dir (sequential, lex order). They see the
@@ -487,6 +491,10 @@ struct Blast {
     span: BlastSpan,
     /// Name of the test that armed this radius — for the skip reason.
     culprit: String,
+    /// Armed by the default leaf-halt (a failure with no declared
+    /// `blast-radius:`) rather than by the metadata marker. Only the skip
+    /// reason differs — the span is always the rest of the leaf.
+    implicit: bool,
 }
 
 /// How far the radius reaches. Mirrors `ast::BlastRadius` but holds mutable
@@ -501,21 +509,37 @@ enum BlastSpan {
 }
 
 impl Blast {
-    /// Arm a radius if `entry` is a culprit — disabled, or it ran and failed —
-    /// and declares a `blast-radius:`. Incompatible/skipped tests don't arm:
-    /// they didn't run, so they own no collateral.
-    fn arm(entry: &TestEntry, result: &FileResult) -> Option<Blast> {
-        let radius = entry.file.metadata.blast_radius.as_ref()?;
+    /// Arm a radius if `entry` is a culprit — disabled, or it ran and failed.
+    /// Incompatible/skipped tests don't arm: they didn't run, so they own no
+    /// collateral.
+    ///
+    /// A declared `blast-radius:` wins and is honored verbatim in either mode:
+    /// the author has stated exactly how far the collateral reaches, so the
+    /// leaf picks back up once the radius is spent. Without one, a **failure**
+    /// halts the remainder of the leaf unless `--continue-on-error` says
+    /// otherwise; a `disabled:` file — which never ran, and so broke nothing —
+    /// arms nothing.
+    fn arm(entry: &TestEntry, result: &FileResult, continue_on_error: bool) -> Option<Blast> {
         let failed = !result.skipped && !result.failures.is_empty();
         if !(result.disabled || failed) {
             return None;
         }
-        let span = match radius {
-            crate::ast::BlastRadius::Count(n) => BlastSpan::Count(*n),
-            crate::ast::BlastRadius::All => BlastSpan::All,
-            crate::ast::BlastRadius::Through(p) => BlastSpan::Through(p.clone()),
-        };
-        Some(Blast { span, culprit: entry.name.clone() })
+        let culprit = entry.name.clone();
+        match entry.file.metadata.blast_radius.as_ref() {
+            Some(crate::ast::BlastRadius::Count(n)) => {
+                Some(Blast { span: BlastSpan::Count(*n), culprit, implicit: false })
+            }
+            Some(crate::ast::BlastRadius::All) => {
+                Some(Blast { span: BlastSpan::All, culprit, implicit: false })
+            }
+            Some(crate::ast::BlastRadius::Through(p)) => {
+                Some(Blast { span: BlastSpan::Through(p.clone()), culprit, implicit: false })
+            }
+            None if failed && !continue_on_error => {
+                Some(Blast { span: BlastSpan::All, culprit, implicit: true })
+            }
+            None => None,
+        }
     }
 
     /// Decide whether `entry` is collateral. Returns the skip reason if so
@@ -524,7 +548,11 @@ impl Blast {
         if self.spent() {
             return None;
         }
-        let reason = format!("blast-radius from {}", self.culprit);
+        let reason = if self.implicit {
+            format!("halted: {} failed", self.culprit)
+        } else {
+            format!("blast-radius from {}", self.culprit)
+        };
         // A `Through` radius ends once it includes a matching file.
         let reached_boundary = match &self.span {
             BlastSpan::Through(prefix) => filename_starts_with(entry, prefix),
@@ -991,12 +1019,16 @@ mod tests {
 
     /// Run a discovered suite under default options, returning just the totals.
     fn run_totals_in(root: &std::path::Path) -> RunTotals {
+        run_totals_with(root, &RunOptions::default())
+    }
+
+    /// Same, with caller-supplied options (e.g. `continue_on_error`).
+    fn run_totals_with(root: &std::path::Path, opts: &RunOptions) -> RunTotals {
         use crate::output::{BarStyle, OutputMode, Printer};
         let suite = crate::discovery::discover(root).unwrap();
         let index = crate::scheduler::FileIndex::build(suite.clone(), root.to_path_buf());
-        let opts = RunOptions::default();
         let printer = Arc::new(Printer::new(OutputMode::Quiet, BarStyle::Auto));
-        run_structural(&suite, &index, &ValueMap::new(), &opts, &printer)
+        run_structural(&suite, &index, &ValueMap::new(), opts, &printer)
     }
 
     /// Build a Quiet-mode suite (no live display) with one passing and one
@@ -1071,6 +1103,95 @@ mod tests {
         assert_eq!(totals.failed, 1, "01 ran and failed");
         assert_eq!(totals.skipped, 1, "02 is collateral");
         assert_eq!(totals.passed, 1, "03 is beyond the radius and runs");
+    }
+
+    /// Default (no `--continue-on-error`): a failure with no declared
+    /// `blast-radius:` halts the rest of its leaf — the following tests SKIP.
+    #[test]
+    fn failure_halts_rest_of_leaf_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("tstr.yaml"), "constants: {}\n").unwrap();
+        std::fs::write(root.join("01-fail.test.tstr"), "{ false | \"boom\"; }\n").unwrap();
+        std::fs::write(root.join("02-a.test.tstr"), "{ 1 == 1 | \"x\"; }\n").unwrap();
+        std::fs::write(root.join("03-b.test.tstr"), "{ 1 == 1 | \"x\"; }\n").unwrap();
+
+        let totals = run_totals_in(root);
+        assert_eq!(totals.failed, 1, "01 ran and failed");
+        assert_eq!(totals.passed, 0, "02 and 03 never ran");
+        assert_eq!(totals.skipped, 2, "rest of the leaf halted");
+    }
+
+    /// `--continue-on-error` restores carry-on: the tests after a failure run.
+    #[test]
+    fn continue_on_error_runs_rest_of_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("tstr.yaml"), "constants: {}\n").unwrap();
+        std::fs::write(root.join("01-fail.test.tstr"), "{ false | \"boom\"; }\n").unwrap();
+        std::fs::write(root.join("02-a.test.tstr"), "{ 1 == 1 | \"x\"; }\n").unwrap();
+        std::fs::write(root.join("03-b.test.tstr"), "{ 1 == 1 | \"x\"; }\n").unwrap();
+
+        let opts = RunOptions { continue_on_error: true, ..RunOptions::default() };
+        let totals = run_totals_with(root, &opts);
+        assert_eq!(totals.failed, 1);
+        assert_eq!(totals.passed, 2, "02 and 03 still run");
+        assert_eq!(totals.skipped, 0);
+    }
+
+    /// The halt is leaf-local: a failure in one leaf doesn't reach a sibling
+    /// leaf, which runs its tests in full.
+    #[test]
+    fn failure_halt_does_not_cross_leaves() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("tstr.yaml"), "constants: {}\n").unwrap();
+        std::fs::create_dir(root.join("a")).unwrap();
+        std::fs::create_dir(root.join("b")).unwrap();
+        std::fs::write(root.join("a/01-fail.test.tstr"), "{ false | \"boom\"; }\n").unwrap();
+        std::fs::write(root.join("a/02-a.test.tstr"), "{ 1 == 1 | \"x\"; }\n").unwrap();
+        std::fs::write(root.join("b/01-a.test.tstr"), "{ 1 == 1 | \"x\"; }\n").unwrap();
+        std::fs::write(root.join("b/02-b.test.tstr"), "{ 1 == 1 | \"x\"; }\n").unwrap();
+
+        let totals = run_totals_in(root);
+        assert_eq!(totals.failed, 1, "a/01 failed");
+        assert_eq!(totals.skipped, 1, "a/02 halted with its leaf");
+        assert_eq!(totals.passed, 2, "leaf b is untouched");
+    }
+
+    /// A declared `blast-radius:` still wins over the default halt: the leaf
+    /// picks back up once the radius is spent.
+    #[test]
+    fn declared_radius_bounds_the_halt() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("tstr.yaml"), "constants: {}\n").unwrap();
+        std::fs::write(root.join("01-fail.test.tstr"),
+            "blast-radius: 1\n{ false | \"boom\"; }\n").unwrap();
+        std::fs::write(root.join("02-a.test.tstr"), "{ 1 == 1 | \"x\"; }\n").unwrap();
+        std::fs::write(root.join("03-b.test.tstr"), "{ 1 == 1 | \"x\"; }\n").unwrap();
+
+        let totals = run_totals_in(root);
+        assert_eq!(totals.failed, 1);
+        assert_eq!(totals.skipped, 1, "just 02, per the declared radius");
+        assert_eq!(totals.passed, 1, "03 runs — the radius bounded the fallout");
+    }
+
+    /// A `disabled:` file without a `blast-radius:` arms nothing — it never ran,
+    /// so it broke nothing, and the rest of the leaf is unaffected.
+    #[test]
+    fn disabled_without_radius_does_not_halt_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("tstr.yaml"), "constants: {}\n").unwrap();
+        std::fs::write(root.join("01-off.test.tstr"),
+            "disabled: I-1 pending\n{ false | \"nope\"; }\n").unwrap();
+        std::fs::write(root.join("02-a.test.tstr"), "{ 1 == 1 | \"x\"; }\n").unwrap();
+
+        let totals = run_totals_in(root);
+        assert_eq!(totals.failed, 0);
+        assert_eq!(totals.skipped, 1, "just the disabled file");
+        assert_eq!(totals.passed, 1, "02 runs");
     }
 
     /// `blast-radius: all` turns off every remaining test in the leaf.
