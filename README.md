@@ -1000,6 +1000,7 @@ tstr --version
 | `--stress <N>` | run the whole suite N times **at once, overlapping** (stress / load). Requires a suite that tolerates concurrent copies of itself (no colliding fixed-name resources). In a terminal, renders one bucketed bar per directory, each spanning that dir's `tests × N` cells and filling as passes complete; piped / off-terminal it's summary-only. |
 | `--display auto\|bars` | slot-display style (`bars` forces colored bucketed bar) |
 | `--timeout <SECONDS>` | per-request HTTP timeout (default: `60`). `0` disables the timeout. |
+| `--connect-timeout <SECONDS>` | TCP connect (and TLS) timeout (default: `10`). `0` disables it. Bounds only the connect phase, so a host that isn't accepting connections fails in seconds with a connect error instead of burning the whole `--timeout` and reading like a slow server. |
 | `-t` / `--threads <N>` | worker-thread pool size (default: CPU count, or the config `threads:` value). HTTP work is I/O-bound — each blocking request parks a thread — so a value well above CPU count often raises throughput. `-t 1` forces serial. |
 | `-c` / `--config <PATH>` | explicit config file (overrides project `tstr.yaml` for fields it sets; other fields still merge) |
 | `-v` / `--verbose` | streaming PASS/FAIL + timing + scope changes |

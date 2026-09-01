@@ -79,6 +79,12 @@ pub enum Commands {
         #[arg(long, default_value = "60", value_name = "SECONDS")]
         timeout: u64,
 
+        /// TCP connect timeout in seconds (per-connection). Bounds connect and
+        /// TLS only, so an unreachable host fails fast with a connect error
+        /// instead of burning the full --timeout. 0 disables it.
+        #[arg(long, default_value = "10", value_name = "SECONDS")]
+        connect_timeout: u64,
+
         /// Verbose output (show logs, timing, scope changes)
         #[arg(short, long)]
         verbose: bool,
@@ -148,8 +154,9 @@ pub enum Commands {
 pub fn run(cli: Cli) {
     let config_override = cli.config.clone();
     match cli.command {
-        Commands::Run { target, url, set, continue_on_error, repeat, stress, timeout, verbose, quiet, display, threads, skip_slow } => {
+        Commands::Run { target, url, set, continue_on_error, repeat, stress, timeout, connect_timeout, verbose, quiet, display, threads, skip_slow } => {
             crate::http::set_timeout(timeout);
+            crate::http::set_connect_timeout(connect_timeout);
             // Note: the rayon pool is sized inside run_command, after config
             // loads — the `threads:` config value is a fallback for --threads,
             // so we can't build the pool until the config is known.

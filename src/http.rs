@@ -1,4 +1,6 @@
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use reqwest::blocking::{Client, Response};
@@ -9,35 +11,137 @@ use crate::ast::*;
 use crate::eval::{self, EvalError, Scope};
 use crate::value::{Value, ValueMap};
 
-/// Process-wide HTTP client. Built lazily on first use; can be configured
-/// once via `set_timeout` before the first request.
-static CLIENT: OnceLock<Client> = OnceLock::new();
+/// Process-wide HTTP clients, keyed by target host. One client per host so each
+/// can carry that host's pinned DNS answer (see `client_for`); hosts we don't
+/// pin share `FALLBACK_CLIENT`. Built lazily on first use; timeouts must be
+/// configured before the first request.
+static CLIENTS: OnceLock<Mutex<HashMap<String, Arc<Client>>>> = OnceLock::new();
+static FALLBACK_CLIENT: OnceLock<Arc<Client>> = OnceLock::new();
 static TIMEOUT_SECS: OnceLock<u64> = OnceLock::new();
+static CONNECT_TIMEOUT_SECS: OnceLock<u64> = OnceLock::new();
+
+/// Attempts for the once-per-host DNS lookup, and the backoff between them.
+/// Because the lookup happens once per host per process rather than once per
+/// request, retrying here is cheap and turns a transient resolver hiccup into a
+/// short pause instead of a failed test.
+const DNS_ATTEMPTS: u32 = 3;
+const DNS_RETRY_BACKOFF_MS: u64 = 250;
 
 /// Configure the HTTP timeout in seconds. Must be called before the first
-/// HTTP call; subsequent calls are no-ops. Defaults to 30s if never called.
+/// HTTP call; subsequent calls are no-ops. Defaults to 60s if never called.
 pub fn set_timeout(secs: u64) {
     let _ = TIMEOUT_SECS.set(secs);
 }
 
-fn client() -> &'static Client {
-    CLIENT.get_or_init(|| {
-        let secs = *TIMEOUT_SECS.get_or_init(|| 60);
-        // Do not reuse idle keep-alive connections. Services reached through the
-        // telepresence tunnel close idle connections on their own timeout; when
-        // reqwest pulls such a connection from the pool just as the server is
-        // closing it, the request goes out on a dead socket and surfaces as a
-        // flaky "connection closed before message completed" (~2% of requests
-        // under load, scattered across unrelated endpoints). Opening a fresh
-        // connection per request makes the reuse race structurally impossible —
-        // correctness over throughput for a test runner.
-        let mut builder = Client::builder().pool_max_idle_per_host(0);
-        if secs > 0 {
-            builder = builder.timeout(Duration::from_secs(secs));
+/// Configure the TCP connect timeout in seconds. Must be called before the
+/// first HTTP call; subsequent calls are no-ops. Defaults to 10s if never
+/// called. This bounds connect (and TLS) only — the whole-request budget is
+/// `set_timeout`. Splitting them means a tunnel that accepts no connection
+/// fails in seconds with a connect error, instead of burning the full request
+/// timeout and reporting an ambiguous one.
+pub fn set_connect_timeout(secs: u64) {
+    let _ = CONNECT_TIMEOUT_SECS.set(secs);
+}
+
+/// The settings every client shares, whatever its DNS pinning.
+fn base_builder() -> reqwest::blocking::ClientBuilder {
+    let secs = *TIMEOUT_SECS.get_or_init(|| 60);
+    let connect_secs = *CONNECT_TIMEOUT_SECS.get_or_init(|| 10);
+    // Do not reuse idle keep-alive connections. Services reached through the
+    // telepresence tunnel close idle connections on their own timeout; when
+    // reqwest pulls such a connection from the pool just as the server is
+    // closing it, the request goes out on a dead socket and surfaces as a
+    // flaky "connection closed before message completed" (~2% of requests
+    // under load, scattered across unrelated endpoints). Opening a fresh
+    // connection per request makes the reuse race structurally impossible —
+    // correctness over throughput for a test runner.
+    let mut builder = Client::builder().pool_max_idle_per_host(0);
+    if secs > 0 {
+        builder = builder.timeout(Duration::from_secs(secs));
+    }
+    // secs == 0 → no timeout (old behavior: relies on OS TCP limits)
+    if connect_secs > 0 {
+        builder = builder.connect_timeout(Duration::from_secs(connect_secs));
+    }
+    builder
+}
+
+/// Client for hosts we deliberately don't pin (IP literals, unparseable URLs).
+fn fallback_client() -> Arc<Client> {
+    Arc::clone(FALLBACK_CLIENT.get_or_init(|| {
+        Arc::new(base_builder().build().expect("failed to build HTTP client"))
+    }))
+}
+
+/// Resolve `host` to socket addresses, retrying a few times before giving up.
+///
+/// The port is irrelevant: reqwest's DNS override ignores whatever port is in
+/// the address and uses the one from the URL, so we look up with port 0 and
+/// only care about the addresses.
+fn resolve_host(host: &str) -> Result<Vec<SocketAddr>, String> {
+    let mut last_err = String::from("no addresses returned");
+    for attempt in 0..DNS_ATTEMPTS {
+        match (host, 0u16).to_socket_addrs() {
+            Ok(addrs) => {
+                let addrs: Vec<SocketAddr> = addrs.collect();
+                if !addrs.is_empty() {
+                    return Ok(addrs);
+                }
+            }
+            Err(e) => last_err = e.to_string(),
         }
-        // secs == 0 → no timeout (old behavior: relies on OS TCP limits)
-        builder.build().expect("failed to build HTTP client")
-    })
+        if attempt + 1 < DNS_ATTEMPTS {
+            std::thread::sleep(Duration::from_millis(
+                DNS_RETRY_BACKOFF_MS * u64::from(attempt + 1),
+            ));
+        }
+    }
+    Err(last_err)
+}
+
+/// The client to use for `url`, resolving its host exactly once per process.
+///
+/// Pinning matters at suite scale. With keep-alive pooling off, every request
+/// opens a fresh connection, and hyper's default resolver would call
+/// `getaddrinfo` for each one — thousands of identical lookups over a run,
+/// which is enough to make a tunnelled resolver start dropping answers. Here
+/// the first request to a host does the one lookup and every later request to
+/// that host reuses the answer via reqwest's DNS override, so DNS leaves the
+/// hot path entirely.
+///
+/// The map lock is deliberately held across the lookup: it serializes the first
+/// request to each host, but that is the point — otherwise every worker thread
+/// starting at once would fire the same lookup simultaneously, which is the
+/// stampede we're removing. After the first request per host it's a pure cache
+/// hit.
+fn client_for(url: &str) -> Result<Arc<Client>, EvalError> {
+    let host = match reqwest::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_string)) {
+        // An IP literal never reaches the resolver, and a URL we can't parse is
+        // reqwest's problem to report with its own error. Neither gets pinned.
+        Some(h) if h.parse::<IpAddr>().is_err() => h,
+        _ => return Ok(fallback_client()),
+    };
+
+    let clients = CLIENTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = clients.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(c) = guard.get(&host) {
+        return Ok(Arc::clone(c));
+    }
+
+    let addrs = resolve_host(&host).map_err(|e| {
+        EvalError::new(format!(
+            "DNS lookup for '{}' failed after {} attempts: {} — the host is unresolvable from here (VPN/tunnel down?), not a slow server",
+            host, DNS_ATTEMPTS, e
+        ))
+    })?;
+    let client = Arc::new(
+        base_builder()
+            .resolve_to_addrs(&host, &addrs)
+            .build()
+            .expect("failed to build HTTP client"),
+    );
+    guard.insert(host, Arc::clone(&client));
+    Ok(client)
 }
 
 /// Execute an HTTP call statement and return the response body as a Value.
@@ -90,7 +194,7 @@ pub fn execute_http_call(
     scope.set_endpoint(format!("{} {}", method_str, full_url));
 
     // Build request
-    let c = client();
+    let c = client_for(&full_url)?;
     let mut builder = match method {
         HttpMethod::Get => c.get(&full_url),
         HttpMethod::Post => c.post(&full_url),
@@ -411,6 +515,41 @@ fn extract_headers(response: &Response) -> ValueMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The point of `client_for`: one DNS lookup per host for the whole run,
+    /// not one per request. Same host in, same client out — which is what
+    /// carries the pinned address, so nothing after the first call resolves.
+    #[test]
+    fn client_for_pins_a_host_and_reuses_it() {
+        let a = client_for("http://localhost:1/one").expect("localhost resolves");
+        let b = client_for("http://localhost:2/two").expect("localhost resolves");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "same host should hand back the same pinned client, not re-resolve"
+        );
+    }
+
+    /// An IP literal never reaches a resolver, so there is nothing to pin and
+    /// it shares the unpinned fallback client.
+    #[test]
+    fn ip_literals_share_the_fallback_client() {
+        let a = client_for("http://127.0.0.1:8080/x").expect("no lookup needed");
+        let b = client_for("http://127.0.0.1:9090/y").expect("no lookup needed");
+        assert!(Arc::ptr_eq(&a, &b), "IP literals should share one client");
+        assert!(Arc::ptr_eq(&a, &fallback_client()));
+    }
+
+    /// A host that can't be resolved has to say so in those words. It used to
+    /// surface as a generic request failure after the full request timeout,
+    /// which read like a slow server rather than a down tunnel.
+    #[test]
+    fn unresolvable_host_reports_dns_not_a_generic_failure() {
+        let err = client_for("http://no-such-host.invalid/x")
+            .expect_err("`.invalid` is reserved and never resolves");
+        let msg = err.to_string();
+        assert!(msg.contains("DNS lookup"), "got: {}", msg);
+        assert!(msg.contains("no-such-host.invalid"), "got: {}", msg);
+    }
 
     /// Object keys go on the wire in declaration order, not sorted. An API may
     /// resolve conflicting keys by "first one wins", so a test that declares

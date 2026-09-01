@@ -8,6 +8,38 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.12.1"></a>
+## [0.12.1] — 2026-09-01
+
+No action needed on existing suites. One new flag, and DNS moves out of the
+per-request path — a suite that was failing on resolver timeouts under load
+should stop.
+
+### Fixed
+- **A host is now resolved once per run instead of once per request.** With
+  keep-alive pooling off (0.6.6), every request opens a fresh connection, and
+  hyper's default resolver called `getaddrinfo` for each one — thousands of
+  identical lookups across a 1100-test suite, enough to make a tunnelled
+  resolver start dropping answers and fail unrelated tests. The first request to
+  a host now does the one lookup and pins the answer for the rest of the run via
+  reqwest's DNS override; later requests to that host don't resolve at all. The
+  trade-off: a pinned address is held for the life of the process, so a service
+  that changes IP mid-run (a pod restarting behind the tunnel) is not followed
+  until the next run.
+- **A transient resolver hiccup no longer fails a test.** Because the lookup
+  happens once per host rather than once per request, it can afford to retry —
+  three attempts with a short backoff.
+- **An unresolvable host says so.** It used to surface as a generic request
+  failure after the full `--timeout`, which read like a slow server; it now
+  fails in under a second naming the host and the DNS failure.
+
+### Added
+- **`--connect-timeout <SECONDS>`** (default `10`, `0` disables) bounds the TCP
+  connect and TLS handshake separately from the whole-request `--timeout`. A
+  host that isn't accepting connections now fails in seconds with a connect
+  error instead of burning the full 60s request budget and reporting an
+  ambiguous timeout.
+
 <a id="v0.12.0"></a>
 ## [0.12.0] — 2026-08-26
 
