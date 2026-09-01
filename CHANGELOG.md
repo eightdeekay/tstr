@@ -8,6 +8,35 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.12.2"></a>
+## [0.12.2] — 2026-09-01
+
+No action needed on existing suites. One fix, but a quiet one: if you have tests
+that lean on `$.uuid()` or `$.string()` for fixture isolation, they may have been
+asserting less than you thought.
+
+### Fixed
+- **`$.uuid()` and `$.string()` no longer return duplicates for calls in the same
+  clock tick.** Both generators re-seeded a local LCG from `SystemTime::now()` on
+  every call and kept no state in between. `SystemTime::now()` isn't
+  nanosecond-granular on macOS, so calls landing in the same tick got an
+  identical seed and produced an identical value — in practice, adjacent calls
+  came back paired. Four consecutive `$.uuid()` calls yielded two distinct ids.
+  The generators now share one thread-local PRNG, seeded once per thread and
+  advanced on every draw, so successive calls cannot repeat. `$.randEmail()`
+  routes through the same string generator and was affected identically; it is
+  fixed by the same change.
+
+  This never raised an error — it silently weakened whatever the test was
+  asserting. Two fixtures meant to be distinct became one, and any assertion that
+  depended on them being separate quietly stopped testing anything. The case that
+  surfaced it: three seats meant to come from three different order items, to
+  exercise a capacity cap of 2. Two ids collided, so the third hold merely
+  re-took its own seat, `acquired` came back true, and the cap was never
+  exercised. If you have suites shaped like that, they're worth re-running now
+  that the ids are actually unique — a test that starts failing was likely
+  failing all along.
+
 <a id="v0.12.1"></a>
 ## [0.12.1] — 2026-09-01
 

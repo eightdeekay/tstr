@@ -1066,20 +1066,62 @@ fn hmac_sha256(key: &[u8], message: &[u8], encoding: &str) -> Result<String, Eva
     }
 }
 
-/// Generate a v4 UUID using simple randomness.
-fn generate_uuid_v4() -> String {
+/// Process-wide counter mixed into each thread's RNG seed. Suites run across a
+/// rayon pool, so several threads can seed within the same clock tick; the
+/// counter guarantees they still get distinct streams.
+static RNG_SEED_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// Per-thread PRNG state, seeded **once** and then advanced on every draw.
+    ///
+    /// Re-seeding from the wall clock on each call (what this used to do) made
+    /// consecutive `$.uuid()` / `$.string()` calls return byte-identical values:
+    /// `SystemTime::now()` is nowhere near nanosecond-granular on macOS, so calls
+    /// in the same tick saw the same seed. These are the suite's isolation
+    /// primitives — a collision never errors, it just silently collapses two
+    /// fixtures into one.
+    static RNG_STATE: std::cell::Cell<u64> = std::cell::Cell::new(seed_rng());
+}
+
+/// SplitMix64 finalizer — avalanches a weakly-varying input across all 64 bits.
+fn splitmix_finalize(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// Initial per-thread seed: wall clock (coarse) mixed with a process-wide
+/// counter (never repeats) so no two threads share a stream.
+fn seed_rng() -> u64 {
+    use std::sync::atomic::Ordering;
     use std::time::{SystemTime, UNIX_EPOCH};
-    let seed = SystemTime::now()
+
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos();
+        .as_nanos() as u64;
+    let counter = RNG_SEED_COUNTER.fetch_add(1, Ordering::Relaxed);
+    splitmix_finalize(nanos ^ counter.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+}
 
-    // Simple LCG-based random for UUID generation
-    let mut state = seed as u64 ^ 0x5DEECE66D;
+/// Draw the next 64 random bits, advancing the thread's state.
+fn next_random_u64() -> u64 {
+    RNG_STATE.with(|state| {
+        let next = state
+            .get()
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        state.set(next);
+        splitmix_finalize(next)
+    })
+}
+
+/// Generate a v4 UUID using simple randomness.
+fn generate_uuid_v4() -> String {
     let mut bytes = [0u8; 16];
-    for b in &mut bytes {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        *b = (state >> 33) as u8;
+    for chunk in bytes.chunks_mut(8) {
+        let draw = next_random_u64().to_le_bytes();
+        chunk.copy_from_slice(&draw[..chunk.len()]);
     }
 
     // Set version (4) and variant (8/9/a/b)
@@ -1098,20 +1140,12 @@ fn generate_uuid_v4() -> String {
 
 /// Generate a random alphanumeric string of given length.
 fn generate_random_string(len: usize) -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-
-    let chars: Vec<char> = "abcdefghijklmnopqrstuvwxyz0123456789".chars().collect();
-    let mut state = seed as u64 ^ 0xDEADBEEF;
+    let chars: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
     let mut result = String::with_capacity(len);
 
     for _ in 0..len {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        let idx = ((state >> 33) as usize) % chars.len();
-        result.push(chars[idx]);
+        let idx = (next_random_u64() % chars.len() as u64) as usize;
+        result.push(chars[idx] as char);
     }
 
     result
@@ -2619,6 +2653,40 @@ mod tests {
             Value::String(s) => assert_eq!(s.len(), 20),
             _ => panic!("expected string"),
         }
+    }
+
+    /// Regression: the generators used to re-seed from the wall clock on every
+    /// call, so calls landing in the same coarse clock tick returned identical
+    /// values — silently collapsing the ids that keep fixtures isolated.
+    #[test]
+    fn test_builtin_uuid_calls_are_distinct() {
+        let (scope, _) = exec("a = $.uuid(); b = $.uuid(); c = $.uuid(); d = $.uuid();");
+        let ids: Vec<String> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|k| match scope.get(k) {
+                Value::String(s) => s.clone(),
+                other => panic!("expected string, got {:?}", other),
+            })
+            .collect();
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "duplicate uuids: {:?}", ids);
+    }
+
+    #[test]
+    fn test_builtin_string_calls_are_distinct() {
+        let mut src = String::new();
+        for i in 0..64 {
+            src.push_str(&format!("s{} = $.string(12);\n", i));
+        }
+        let (scope, _) = exec(&src);
+        let values: Vec<String> = (0..64)
+            .map(|i| match scope.get(&format!("s{}", i)) {
+                Value::String(s) => s.clone(),
+                other => panic!("expected string, got {:?}", other),
+            })
+            .collect();
+        let unique: std::collections::HashSet<&String> = values.iter().collect();
+        assert_eq!(unique.len(), values.len(), "duplicate strings: {:?}", values);
     }
 
     #[test]
