@@ -143,6 +143,13 @@ pub enum Commands {
         target: String,
     },
 
+    /// Replace this binary with the newest published release
+    SelfUpdate {
+        /// Report whether a newer release exists without installing it
+        #[arg(long)]
+        check: bool,
+    },
+
     /// Remove all run logs (the `logs/` dir and `tstr-last-run.log`) under the suite root
     Clean {
         /// Directory inside the suite (default: current directory)
@@ -177,6 +184,15 @@ pub fn run(cli: Cli) {
         }
         Commands::Clean { target } => {
             clean_command(&target);
+        }
+        Commands::SelfUpdate { check } => {
+            match crate::selfupdate::run(check) {
+                Ok(msg) => println!("{}", msg),
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    process::exit(1);
+                }
+            }
         }
     }
 }
@@ -321,6 +337,10 @@ fn run_command(
     skip_slow_ms: Option<u64>,
     config_override: Option<PathBuf>,
 ) {
+    // Kick the update check off before any work: it gets the length of the run
+    // to answer, and if it hasn't by the end we simply say nothing.
+    let update_check = crate::selfupdate::spawn_check();
+
     if repeat == 0 {
         eprintln!("error: --repeat must be >= 1");
         process::exit(1);
@@ -518,6 +538,12 @@ fn run_command(
         eprintln!("{} failure(s) logged to {}", count, path);
     } else if let Some(path) = printer.log_path() {
         eprintln!("Run log: {}", path);
+    }
+
+    // Last line before the exit code, so it survives a scrollback glance and
+    // isn't buried above the failure list.
+    if let Some(nudge) = crate::selfupdate::take_nudge(&update_check) {
+        eprintln!("{}", nudge);
     }
 
     if totals.failed > 0 {

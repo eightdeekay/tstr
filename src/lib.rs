@@ -12,6 +12,7 @@ pub mod config;
 pub mod secrets;
 pub mod stats;
 pub mod version;
+pub mod selfupdate;
 #[cfg(feature = "kafka")]
 pub mod kafka;
 #[cfg(feature = "postgres")]

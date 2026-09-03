@@ -15,6 +15,7 @@ mod config;
 mod secrets;
 mod stats;
 mod version;
+mod selfupdate;
 #[cfg(feature = "kafka")]
 mod kafka;
 #[cfg(feature = "postgres")]

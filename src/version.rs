@@ -65,6 +65,16 @@ pub fn parse_requirement(s: &str) -> Result<Requirement, String> {
     Ok(Requirement { op, version })
 }
 
+/// Whether `candidate` is a strictly newer version than the running binary.
+/// Used by the self-update check; an unparseable candidate is never "newer",
+/// so a surprise tag like `v2.0.0-rc1` stays quiet rather than nagging.
+pub fn is_newer_than_current(candidate: &str) -> bool {
+    match (parse_components(candidate), parse_components(current())) {
+        (Some(new), Some(have)) => cmp_components(&new, &have) == Ordering::Greater,
+        _ => false,
+    }
+}
+
 /// Parse `"0.5.3"` → `[0, 5, 3]`. `None` if any component isn't a non-negative
 /// integer (or there are no components).
 fn parse_components(s: &str) -> Option<Vec<u64>> {
@@ -116,6 +126,16 @@ impl Requirement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn newer_than_current_compares_against_the_running_version() {
+        assert!(is_newer_than_current("999.0.0"));
+        assert!(!is_newer_than_current(current()));
+        assert!(!is_newer_than_current("0.0.1"));
+        // Anything that isn't dotted numerics is not a version we can rank.
+        assert!(!is_newer_than_current("v999.0.0"));
+        assert!(!is_newer_than_current("999.0.0-rc1"));
+    }
 
     fn req(s: &str) -> Requirement {
         parse_requirement(s).unwrap()

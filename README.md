@@ -2,12 +2,65 @@
 
 A CLI HTTP API test runner with a custom DSL. Structural execution model (phase → directory → lex order), library functions as first-class primitives, project-wide constants via `tstr.yaml`, and per-directory introspection.
 
-## Quick Start
+## Install
+
+Download the archive for your machine from the [latest
+release](https://github.com/eightdeekay/tstr/releases/latest), unpack it, and put
+the binary somewhere on your `PATH`:
+
+```bash
+# Apple Silicon; use tstr-x86_64-apple-darwin.tar.gz on an Intel Mac
+tar xzf ~/Downloads/tstr-aarch64-apple-darwin.tar.gz
+mv tstr ~/.local/bin/tstr
+```
+
+The published binaries are ad-hoc signed but not notarized, so macOS quarantines
+anything downloaded through a browser and Gatekeeper refuses to run it. Clear the
+flag once:
+
+```bash
+xattr -d com.apple.quarantine ~/.local/bin/tstr
+```
+
+You only have to do that for a browser download. `tstr self-update` (below)
+fetches the binary itself, which is never quarantined.
+
+**From source**, if you have a Rust toolchain and want to run unreleased work:
 
 ```bash
 cargo build --release
-ln -s ~/dev/tstr/target/release/tstr ~/bin/tstr
+ln -s "$PWD/target/release/tstr" ~/.local/bin/tstr
+```
 
+## Updating
+
+```bash
+tstr self-update                  # fetch the newest release and replace this binary
+tstr self-update --check          # just say whether a newer one exists
+```
+
+The swap is atomic and only happens after the download has been unpacked and the
+new binary has been checked, so a failed or interrupted update leaves the working
+one in place. On an Apple Silicon Mac running the Intel build under Rosetta,
+self-update installs the native arm64 build. A binary built from source (one that
+lives in `target/`) is left alone, with a note to `git pull` instead.
+
+Separately, once a day `tstr run` asks GitHub whether a newer release exists and
+prints a single line if so:
+
+```
+tstr 0.13.0 available (you have 0.12.2) — run: tstr self-update
+```
+
+The check runs in the background with a 3-second budget and never delays or fails
+a run — if it doesn't answer in time, nothing is printed. It stays quiet when
+output isn't a terminal, so it won't appear in CI logs. Set
+`TSTR_NO_UPDATE_CHECK=1` to turn it off entirely. The last result is cached in
+`~/.config/tstr/update-check.json`.
+
+## Quick Start
+
+```bash
 tstr run                          # run all tests (walks up to find tstr.yaml)
 tstr run notify                   # scope the run to the notify/ subdirectory
 tstr list                         # per-directory tables

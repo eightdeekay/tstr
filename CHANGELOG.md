@@ -8,6 +8,51 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.12.3"></a>
+## [0.12.3] — 2026-09-03
+
+No action needed on existing suites. tstr can now update itself, and will tell
+you once a day when it is out of date.
+
+### Added
+- **`tstr self-update`** — replaces the running binary with the newest published
+  release. Downloads the archive for the machine it is actually on, verifies the
+  new binary runs, and swaps it in with an atomic rename, so an interrupted or
+  failed update leaves the working binary untouched. `--check` reports whether a
+  newer release exists without installing anything.
+
+  On an Apple Silicon Mac running the Intel build under Rosetta, it installs the
+  native arm64 build rather than another Intel one. A binary built from source —
+  one living in a `target/` directory — is refused, since overwriting it would
+  just be undone by the next `cargo build`; that case is told to `git pull`
+  instead. An install directory you lack write permission on reports that, with
+  the two ways out, rather than an errno.
+
+  The macOS binaries are ad-hoc signed but not notarized, so a copy downloaded
+  through a browser is quarantined and Gatekeeper blocks it until the attribute
+  is cleared by hand. A binary fetched by tstr itself is never quarantined, so
+  updating this way sidesteps that entirely.
+
+- **A once-a-day update check on `tstr run`**, printing one line when a newer
+  release exists:
+
+  ```
+  tstr 0.13.0 available (you have 0.12.3) — run: tstr self-update
+  ```
+
+  It runs on a background thread with a three-second budget and is read without
+  blocking, so it can never delay or fail a run — if the answer has not arrived
+  by the time the run ends, nothing is printed and the result is cached for next
+  time. It stays silent when output is not a terminal, so it does not appear in
+  CI logs. `TSTR_NO_UPDATE_CHECK=1` disables it; the last result is cached in
+  `~/.config/tstr/update-check.json`.
+
+- **Installation and updating instructions in the README.** The previous Quick
+  Start told everyone to build from source and symlink into `~/bin`, which
+  described one developer's setup rather than how tstr is actually installed.
+  There are now separate Install and Updating sections covering the released
+  binaries, the Gatekeeper quarantine step, and both update paths.
+
 <a id="v0.12.2"></a>
 ## [0.12.2] — 2026-09-01
 
