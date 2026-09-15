@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::io::Write;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reqwest::blocking::{Client, Response};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -20,6 +21,11 @@ static FALLBACK_CLIENT: OnceLock<Arc<Client>> = OnceLock::new();
 static TIMEOUT_SECS: OnceLock<u64> = OnceLock::new();
 static CONNECT_TIMEOUT_SECS: OnceLock<u64> = OnceLock::new();
 
+/// Optional per-request timings sink (`--timings <file>`): one ndjson line per
+/// HTTP call. Shared across the rayon pool, so writes take the mutex and emit a
+/// whole line at once — lines from concurrent `--stress` copies never interleave.
+static TIMINGS: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
+
 /// Attempts for the once-per-host DNS lookup, and the backoff between them.
 /// Because the lookup happens once per host per process rather than once per
 /// request, retrying here is cheap and turns a transient resolver hiccup into a
@@ -31,6 +37,56 @@ const DNS_RETRY_BACKOFF_MS: u64 = 250;
 /// HTTP call; subsequent calls are no-ops. Defaults to 60s if never called.
 pub fn set_timeout(secs: u64) {
     let _ = TIMEOUT_SECS.set(secs);
+}
+
+/// Record every HTTP call to `path` as ndjson (`--timings`). Appends, so a
+/// file can accumulate across invocations (fixture run, then the stressed
+/// leaves); delete it to start fresh. Must be called before the first HTTP
+/// call; subsequent calls are no-ops.
+pub fn set_timings_file(path: &std::path::Path) -> std::io::Result<()> {
+    let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let _ = TIMINGS.set(Mutex::new(file));
+    Ok(())
+}
+
+/// Append one timings record, if `--timings` is on. `code` is `None` when the
+/// request never got a response (connect/timeout error), so a stress run's
+/// failures show up in the data rather than silently thinning the sample.
+fn record_timing(
+    scope: &Scope,
+    method: &str,
+    url: &str,
+    code: Option<u16>,
+    elapsed_ms: f64,
+    error: Option<&str>,
+) {
+    let Some(sink) = TIMINGS.get() else { return };
+    let ts_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let line = serde_json::json!({
+        "ts": ts_ms,
+        "file": scope.file(),
+        "method": method,
+        "url": url,
+        "code": code,
+        "elapsedMs": elapsed_ms,
+        "error": error,
+    });
+    let mut f = match sink.lock() {
+        Ok(f) => f,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    // A failed write (disk full, file removed) is not a test failure; the
+    // suite's verdict must not depend on the side-channel.
+    let _ = writeln!(f, "{}", line);
+}
+
+/// Wall-clock for one request, in milliseconds to one decimal: from handing
+/// the request to the client through reading the whole body.
+fn elapsed_ms(started: Instant) -> f64 {
+    (started.elapsed().as_secs_f64() * 10_000.0).round() / 10.0
 }
 
 /// Configure the TCP connect timeout in seconds. Must be called before the
@@ -248,9 +304,18 @@ pub fn execute_http_call(
         }
     }
 
-    // Execute the request
-    let response = builder.send()
-        .map_err(|e| EvalError::new(format!("HTTP request failed: {}", e)))?;
+    // Execute the request. Timed from here through the full body read — the
+    // latency a caller actually experiences, surfaced as `_response.elapsedMs`
+    // and (with `--timings`) as one record per call.
+    let started = Instant::now();
+    let response = match builder.send() {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("HTTP request failed: {}", e);
+            record_timing(scope, method_str, &full_url, None, elapsed_ms(started), Some(&msg));
+            return Err(EvalError::new(msg));
+        }
+    };
 
     // Extract response metadata
     let status_code = response.status().as_u16();
@@ -259,8 +324,16 @@ pub fn execute_http_call(
 
     // Read body and decide format from the body itself (don't trust the
     // content-type header — services can lie, and that's exactly what we test).
-    let body_text = response.text()
-        .map_err(|e| EvalError::new(format!("failed to read response body: {}", e)))?;
+    let body_text = match response.text() {
+        Ok(t) => t,
+        Err(e) => {
+            let msg = format!("failed to read response body: {}", e);
+            record_timing(scope, method_str, &full_url, Some(status_code), elapsed_ms(started), Some(&msg));
+            return Err(EvalError::new(msg));
+        }
+    };
+    let took_ms = elapsed_ms(started);
+    record_timing(scope, method_str, &full_url, Some(status_code), took_ms, None);
     let (body_value, format) = parse_body(&body_text);
 
     // Populate _response with format included up front.
@@ -269,6 +342,7 @@ pub fn execute_http_call(
     response_meta.insert("headers".to_string(), Value::Object(response_headers));
     response_meta.insert("version".to_string(), Value::String(version));
     response_meta.insert("format".to_string(), Value::String(format.to_string()));
+    response_meta.insert("elapsedMs".to_string(), Value::Number(took_ms));
     scope.set("_response".to_string(), Value::Object(response_meta));
 
     // Check status if required (after _response is set so the message can

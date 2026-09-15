@@ -85,6 +85,13 @@ pub enum Commands {
         #[arg(long, default_value = "10", value_name = "SECONDS")]
         connect_timeout: u64,
 
+        /// Append one ndjson record per HTTP call to FILE: ts, file, method,
+        /// url, code, elapsedMs (and error, when the request failed). Under
+        /// --stress this captures every sample, so p50/p95/p99 for an
+        /// endpoint is a jq/sort away. Appends to an existing file.
+        #[arg(long, value_name = "FILE")]
+        timings: Option<PathBuf>,
+
         /// Verbose output (show logs, timing, scope changes)
         #[arg(short, long)]
         verbose: bool,
@@ -161,9 +168,15 @@ pub enum Commands {
 pub fn run(cli: Cli) {
     let config_override = cli.config.clone();
     match cli.command {
-        Commands::Run { target, url, set, continue_on_error, repeat, stress, timeout, connect_timeout, verbose, quiet, display, threads, skip_slow } => {
+        Commands::Run { target, url, set, continue_on_error, repeat, stress, timeout, connect_timeout, timings, verbose, quiet, display, threads, skip_slow } => {
             crate::http::set_timeout(timeout);
             crate::http::set_connect_timeout(connect_timeout);
+            if let Some(path) = timings {
+                if let Err(e) = crate::http::set_timings_file(&path) {
+                    eprintln!("error: --timings: cannot open {}: {}", path.display(), e);
+                    process::exit(1);
+                }
+            }
             // Note: the rayon pool is sized inside run_command, after config
             // loads — the `threads:` config value is a fallback for --threads,
             // so we can't build the pool until the config is known.

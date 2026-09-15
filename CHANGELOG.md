@@ -8,6 +8,44 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.12.4"></a>
+## [0.12.4] — 2026-09-15
+
+No action needed on existing suites. Every HTTP call now reports how long it
+took, and a run can write every call's timing to a file — enough to do a
+before/after latency comparison with tstr alone.
+
+### Added
+- **`_response.elapsedMs`** — wall-clock for the call, in milliseconds to one
+  decimal, measured from sending the request through reading the whole body.
+  A test can assert an SLO directly, not just a status:
+
+  ```
+  r = req.patch("/progress/{{ref}}") ? 200 | "heartbeat rejected";
+  _response.elapsedMs < 500 | "slow heartbeat: {{_response.elapsedMs}}ms";
+  ```
+
+  `$.now()` is seconds-granular, so timing an ~80 ms request around it was never
+  useful; the duration was already being measured internally and is now surfaced.
+
+- **`tstr run --timings <FILE>`** — appends one ndjson record per HTTP call:
+  `ts` (epoch ms), `file` (suite-relative), `method`, `url`, `code`, `elapsedMs`,
+  and `error`. A request that never got a response (connect refused, timeout) is
+  recorded with `code: null` and the error message, so a stress run's failures
+  appear in the data instead of silently thinning the sample. Under `--stress N`
+  this captures every sample, so p50/p95/p99 for an endpoint is a `jq`/`sort`
+  away:
+
+  ```
+  tstr run profile/progress-load/learners --stress 20 --timings before.ndjson
+  jq -r 'select(.method=="PATCH") | .elapsedMs' before.ndjson | sort -n
+  ```
+
+  Records are written whole under a lock, so concurrent copies never interleave.
+  The file is opened in append mode so a fixture run and the stressed leaves can
+  share one; delete it to start fresh. A write failure never fails a test, and an
+  unopenable path is reported before any test runs.
+
 <a id="v0.12.3"></a>
 ## [0.12.3] — 2026-09-03
 

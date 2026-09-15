@@ -62,6 +62,10 @@ pub struct Scope {
     /// the scope (not the process cwd) so resolution is location-independent and
     /// safe under the concurrent runner. `None` falls back to cwd-relative.
     base_dir: Option<std::sync::Arc<std::path::PathBuf>>,
+    /// Suite-relative path of the file this scope is executing, for tagging
+    /// per-request records (`--timings`). `None` outside the runner (unit
+    /// tests, ad-hoc scopes).
+    file: Option<std::sync::Arc<String>>,
     logs: RefCell<Vec<String>>,
     last_endpoint: RefCell<Option<String>>,
 }
@@ -74,6 +78,7 @@ impl Clone for Scope {
             constants: std::sync::Arc::clone(&self.constants),
             libs: std::sync::Arc::clone(&self.libs),
             base_dir: self.base_dir.clone(),
+            file: self.file.clone(),
             logs: RefCell::new(self.logs.borrow().clone()),
             last_endpoint: RefCell::new(self.last_endpoint.borrow().clone()),
         }
@@ -88,6 +93,7 @@ impl Scope {
             constants: std::sync::Arc::new(ValueMap::new()),
             libs: std::sync::Arc::new(HashMap::new()),
             base_dir: None,
+            file: None,
             logs: RefCell::new(Vec::new()),
             last_endpoint: RefCell::new(None),
         }
@@ -100,6 +106,7 @@ impl Scope {
             constants: std::sync::Arc::new(ValueMap::new()),
             libs: std::sync::Arc::new(HashMap::new()),
             base_dir: None,
+            file: None,
             logs: RefCell::new(Vec::new()),
             last_endpoint: RefCell::new(None),
         }
@@ -114,6 +121,17 @@ impl Scope {
     /// The suite root for resolving relative `@file` references, if set.
     pub fn base_dir(&self) -> Option<&std::path::Path> {
         self.base_dir.as_deref().map(|p| p.as_path())
+    }
+
+    /// Attach the suite-relative path of the file this scope executes.
+    pub fn with_file(mut self, file: String) -> Self {
+        self.file = Some(std::sync::Arc::new(file));
+        self
+    }
+
+    /// Suite-relative path of the executing file, if the runner set one.
+    pub fn file(&self) -> Option<&str> {
+        self.file.as_deref().map(|s| s.as_str())
     }
 
     /// Attach a constants namespace (yaml constants + future .const.tstr returns).

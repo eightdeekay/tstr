@@ -510,7 +510,16 @@ String escapes are `\n`, `\r`, `\t`, `\\`, `\"`. **Anything else is passed throu
 
 **Status patterns:** `200`, `2xx`, `200-204`, `>=200`, `<500`.
 
-**Response object** — `r` holds the parsed body; `_response` holds HTTP metadata (`.code`, `.headers`, `.version`, `.format`).
+**Response object** — `r` holds the parsed body; `_response` holds HTTP metadata (`.code`, `.headers`, `.version`, `.format`, `.elapsedMs`).
+
+`_response.elapsedMs` is the wall-clock for the call, from sending the request through reading the whole body, in milliseconds (one decimal). It lets a test assert an SLO directly, not just a status:
+
+```
+r = req.patch("/progress/{{ref}}") ? 200 | "heartbeat rejected";
+_response.elapsedMs < 500 | "slow heartbeat: {{_response.elapsedMs}}ms";
+```
+
+For a distribution rather than a single threshold — p50/p95/p99 before and after a change — see `--timings` under [CLI](#cli).
 
 Body parsing is determined by **sniffing the body itself**, not by trusting `Content-Type` (services lie — that's what we test):
 
@@ -1051,6 +1060,7 @@ tstr --version
 | `--continue-on-error` | keep running a leaf's remaining tests after one fails. By default a failure halts the rest of *that leaf* (sibling leaves and directories carry on regardless) — see [`blast-radius:`](#blast-radius--skip-downstream-collateral). A file's own `blast-radius:` wins in either mode. |
 | `--repeat <N>` | run the whole suite N times **sequentially** — one pass after another (default `1`). Good for soak / flushing out flaky failures. Totals accumulate; the summary shows `(N iterations x M tests)`. Mutually exclusive with `--stress`. |
 | `--stress <N>` | run the whole suite N times **at once, overlapping** (stress / load). Requires a suite that tolerates concurrent copies of itself (no colliding fixed-name resources). In a terminal, renders one bucketed bar per directory, each spanning that dir's `tests × N` cells and filling as passes complete; piped / off-terminal it's summary-only. |
+| `--timings <FILE>` | append one ndjson record per HTTP call to `FILE`: `ts` (epoch ms), `file` (suite-relative), `method`, `url`, `code`, `elapsedMs`, and `error` (non-null when the request never got a response — connect refused, timeout — with `code: null`). Every call is recorded, so under `--stress` this is every sample; percentiles are a `jq`/`sort` away. **Appends** to an existing file so a fixture run and the stressed leaves can share one — delete it to start fresh. |
 | `--display auto\|bars` | slot-display style (`bars` forces colored bucketed bar) |
 | `--timeout <SECONDS>` | per-request HTTP timeout (default: `60`). `0` disables the timeout. |
 | `--connect-timeout <SECONDS>` | TCP connect (and TLS) timeout (default: `10`). `0` disables it. Bounds only the connect phase, so a host that isn't accepting connections fails in seconds with a connect error instead of burning the whole `--timeout` and reading like a slow server. |
