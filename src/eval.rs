@@ -63,7 +63,7 @@ pub struct Scope {
     /// safe under the concurrent runner. `None` falls back to cwd-relative.
     base_dir: Option<std::sync::Arc<std::path::PathBuf>>,
     /// Suite-relative path of the file this scope is executing, for tagging
-    /// per-request records (`--timings`). `None` outside the runner (unit
+    /// per-request records (the run's `.ndjson`). `None` outside the runner (unit
     /// tests, ad-hoc scopes).
     file: Option<std::sync::Arc<String>>,
     logs: RefCell<Vec<String>>,

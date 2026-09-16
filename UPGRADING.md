@@ -3,6 +3,64 @@
 Migration steps for releases that need action on existing suites. Each section
 cross-links to the full change list in [CHANGELOG.md](CHANGELOG.md).
 
+<a id="v0.13.0"></a>
+## 0.13.0 — Timings always written; `--timings` → `--name`; no-tests is an error
+
+→ **Full change list:** [CHANGELOG § 0.13.0](CHANGELOG.md#v0.13.0)
+
+No codemod: no `.tstr` file changes at all. The flag removal only touches how
+you invoke `tstr`, and it fails loudly — `--timings` no longer parses, so one
+run of your CI command finds every place that passes it.
+
+### Drop `--timings <FILE>`
+
+```
+# before
+tstr run --timings timings.ndjson .
+jq -r .elapsedMs timings.ndjson | sort -n
+
+# after
+tstr run .
+jq -r .elapsedMs logs/tstr-last-run.ndjson | sort -n
+```
+
+Every run now writes its per-request records to `logs/<run>.ndjson`, next to
+the `logs/<run>.log` it belongs to, and `tstr-last-run.ndjson` points at the
+newest. The record format is unchanged. The pair is pruned by `log_retention`
+and removed by `tstr clean` together.
+
+If you pooled several runs into one file by passing the same `--timings` path
+repeatedly, concatenate the per-run files instead:
+
+```
+cat logs/tstr-0041.ndjson logs/tstr-0042.ndjson | jq -r .elapsedMs | sort -n
+```
+
+### Name a run instead of remembering its number
+
+```
+tstr run --name before .
+# ...make the change...
+tstr run --name after .
+```
+
+writes `logs/before.{log,ndjson}` and `logs/after.{log,ndjson}`. Named runs
+are never pruned by `log_retention`, and a name that already exists in `logs/`
+aborts the run before any test executes — rename or `tstr clean` first.
+
+### A directory with no tests is now an error
+
+```
+error: no tstr tests found under /path/to/dir
+```
+
+exits 1 and writes nothing — no `logs/`, no log file, no symlink. Previously
+this printed an all-zero summary and exited 0. A CI job that (accidentally)
+ran `tstr run` against a directory with no `.test.tstr` or `.fetch.tstr` files
+was passing on nothing; it now fails, which is almost certainly what you want.
+If every file present was skipped for a parse error, the message says so and
+points at `-v`.
+
 <a id="v0.12.0"></a>
 ## 0.12.0 — A failure halts its leaf; `--stop-on-error` → `--continue-on-error`
 

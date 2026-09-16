@@ -8,6 +8,40 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.13.0"></a>
+## [0.13.0] — 2026-09-16
+
+No action needed on existing suites. Every run now records its per-request
+timings next to its run log, so `--timings` is gone; runs can be named; and
+running in a directory with no tests is an error instead of an empty pass.
+
+### Changed
+- **Per-request timings are always written**, as `logs/<run>.ndjson` beside the
+  `logs/<run>.log` they belong to, with a `tstr-last-run.ndjson` symlink next to
+  `tstr-last-run.log`. The two are created, pruned, cleaned and linked as a
+  pair. The record format is unchanged from `--timings` in 0.12.4; the cost is
+  one small write per request. The `--timings <FILE>` flag is **removed** — to
+  pool several runs into one sample, `cat` their `.ndjson` files. (⚠️ CLI
+  only; no suite changes.)
+- **`tstr clean`** now removes named runs too, and the `tstr-last-run.ndjson`
+  symlink.
+
+### Added
+- **`tstr run --name <NAME>`** — write the run's pair as `logs/NAME.log` +
+  `logs/NAME.ndjson` instead of the numbered `tstr-NNNN` default, so a
+  before/after comparison reads as `before.ndjson` / `after.ndjson` rather than
+  two numbers you have to remember. Named runs are never pruned by
+  `log_retention`. If either file already exists the run aborts before any
+  test runs — a name is a promise not to overwrite.
+
+### Fixed
+- **`tstr run` in a directory with no tests passed with an all-zero summary**
+  and left a `logs/` directory, a log file and the symlink behind. It now stops
+  with `error: no tstr tests found under <dir>` (exit 1) before anything is
+  written — the usual cause is running from the wrong directory. If files were
+  present but all skipped for parse errors, the message says so and points at
+  `-v`.
+
 <a id="v0.12.5"></a>
 ## [0.12.5] — 2026-09-16
 

@@ -519,7 +519,7 @@ r = req.patch("/progress/{{ref}}") ? 200 | "heartbeat rejected";
 _response.elapsedMs < 500 | "slow heartbeat: {{_response.elapsedMs}}ms";
 ```
 
-For a distribution rather than a single threshold — p50/p95/p99 before and after a change — see `--timings` under [CLI](#cli).
+For a distribution rather than a single threshold — p50/p95/p99 before and after a change — every run also records each call to a `.ndjson` next to its run log; see [Run Log](#run-log).
 
 Body parsing is determined by **sniffing the body itself**, not by trusting `Content-Type` (services lie — that's what we test):
 
@@ -1046,7 +1046,7 @@ providers' signing schemes, build the header yourself from `$.hmacSha256()`.
 ```
 tstr run [dir]                    # run the suite, or scope to a subdirectory (default: cwd)
 tstr list [target]                # per-directory tables of files visible
-tstr clean [dir]                  # remove the logs/ dir + tstr-last-run.log under the suite root
+tstr clean [dir]                  # remove the logs/ dir + tstr-last-run.* under the suite root
 tstr -c path/to/yaml ...          # explicit config (overrides project tstr.yaml)
 tstr --version
 ```
@@ -1060,7 +1060,7 @@ tstr --version
 | `--continue-on-error` | keep running a leaf's remaining tests after one fails. By default a failure halts the rest of *that leaf* (sibling leaves and directories carry on regardless) — see [`blast-radius:`](#blast-radius--skip-downstream-collateral). A file's own `blast-radius:` wins in either mode. |
 | `--repeat <N>` | run the whole suite N times **sequentially** — one pass after another (default `1`). Good for soak / flushing out flaky failures. Totals accumulate; the summary shows `(N iterations x M tests)`. Mutually exclusive with `--stress`. |
 | `--stress <N>` | run the whole suite N times **at once, overlapping** (stress / load). Requires a suite that tolerates concurrent copies of itself (no colliding fixed-name resources). In a terminal, renders one bucketed bar per directory, each spanning that dir's `tests × N` cells and filling as passes complete; piped / off-terminal it's summary-only. |
-| `--timings <FILE>` | append one ndjson record per HTTP call to `FILE`: `ts` (epoch ms), `file` (suite-relative), `method`, `url`, `code`, `elapsedMs`, and `error` (non-null when the request never got a response — connect refused, timeout — with `code: null`). Every call is recorded, so under `--stress` this is every sample; percentiles are a `jq`/`sort` away. **Appends** to an existing file so a fixture run and the stressed leaves can share one — delete it to start fresh. |
+| `--name <NAME>` | write this run's log pair as `logs/NAME.log` + `logs/NAME.ndjson` instead of the numbered `tstr-NNNN` default. Named runs are never pruned by `log_retention`. Aborts before running anything if either file already exists. See [Run Log](#run-log). |
 | `--display auto\|bars` | slot-display style (`bars` forces colored bucketed bar) |
 | `--timeout <SECONDS>` | per-request HTTP timeout (default: `60`). `0` disables the timeout. |
 | `--connect-timeout <SECONDS>` | TCP connect (and TLS) timeout (default: `10`). `0` disables it. Bounds only the connect phase, so a host that isn't accepting connections fails in seconds with a connect error instead of burning the whole `--timeout` and reading like a slow server. |
@@ -1116,11 +1116,23 @@ profile/sso-user/crud
 
 ## Run Log
 
-Each run writes a numbered log under **`<suite-root>/logs/tstr-<NNNN>.log`** (not
-the current directory — so logs never litter wherever you happened to invoke
-`tstr`). A **`tstr-last-run.log`** symlink in the suite root always points at the
-most recent run. Every run is captured **regardless of pass/fail and verbosity**.
-Per-test entries include:
+Each run writes a pair of files under **`<suite-root>/logs/`** (not the current
+directory — so logs never litter wherever you happened to invoke `tstr`):
+
+- **`tstr-<NNNN>.log`** — the run log, described below
+- **`tstr-<NNNN>.ndjson`** — one record per HTTP call the run made (see
+  [Timings](#timings-ndjson))
+
+`--name <NAME>` replaces the `tstr-<NNNN>` stem with one you choose (`--name
+before`, `--name after`), and refuses to run if `logs/NAME.log` or
+`logs/NAME.ndjson` already exists. **`tstr-last-run.log`** and
+**`tstr-last-run.ndjson`** symlinks in the suite root always point at the most
+recent run's pair. Every run is captured **regardless of pass/fail and
+verbosity**. If the target directory holds no tests at all, nothing is written:
+`tstr run` stops with `no tstr tests found` and exit code 1 rather than passing
+an empty suite.
+
+Per-test entries in the run log include:
 
 - PASS / FAIL / SKIP / DISABLED / INCOMPATIBLE label, test name, source path
 - HTTP endpoint that was called
@@ -1132,10 +1144,35 @@ Per-test entries include:
 the run log records only `test`/`setup`/`cleanup` outcomes).
 
 History is kept so you can compare runs (handy for intermittent failures). The
-`logs/` directory is auto-pruned to the most recent **10** runs by default — set
-`log_retention:` in `tstr.yaml` to change it (`0` keeps everything). A
-`logs/.gitignore` is created automatically so run logs aren't committed. `tstr
-clean` removes the whole `logs/` directory and the symlink.
+numbered runs in `logs/` are auto-pruned to the most recent **10** by default —
+set `log_retention:` in `tstr.yaml` to change it (`0` keeps everything). A
+`.log` and its `.ndjson` are pruned together; named runs (`--name`) are never
+pruned — a name is a request to keep it. A `logs/.gitignore` is created
+automatically so run logs aren't committed. `tstr clean` removes every run
+(numbered and named), the symlinks, and the `logs/` directory itself if that
+leaves it empty.
+
+### Timings (`.ndjson`)
+
+The `.ndjson` beside each run log holds one JSON record per HTTP call: `ts`
+(epoch ms), `file` (suite-relative), `method`, `url`, `code`, `elapsedMs`, and
+`error` (non-null when the request never got a response — connect refused,
+timeout — with `code: null`, so a stress run's failures appear in the data
+instead of silently thinning the sample). Every call is recorded, so under
+`--stress` this is every sample and percentiles are a `jq`/`sort` away:
+
+```
+tstr run profile/progress-load/learners --stress 20 --name before
+# ...deploy the change...
+tstr run profile/progress-load/learners --stress 20 --name after
+jq -r 'select(.method=="PATCH") | .elapsedMs' logs/before.ndjson | sort -n
+jq -r 'select(.method=="PATCH") | .elapsedMs' logs/after.ndjson  | sort -n
+```
+
+Records are written whole under a lock, so concurrent copies never interleave.
+The cost is one small write per request — nothing you'll see in `elapsedMs` —
+and a write failure never fails a test. To pool several runs, `cat` their
+`.ndjson` files.
 
 ## Timing Stats & Scheduling
 

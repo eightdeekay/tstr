@@ -39,23 +39,34 @@ fn next_log_number(dir: &std::path::Path) -> u64 {
     existing_log_numbers(dir).iter().map(|(n, _)| *n).max().unwrap_or(0) + 1
 }
 
-/// Point `<root>/tstr-last-run.log` at this run's log (relative target, so the
-/// link survives the suite being moved). No-op on platforms without symlinks.
-fn update_last_run_symlink(root: &std::path::Path, file_name: &str) {
-    let link = root.join("tstr-last-run.log");
-    let _ = std::fs::remove_file(&link); // replace any prior link/file
-    let target = std::path::Path::new("logs").join(file_name);
-    #[cfg(unix)]
-    {
-        let _ = std::os::unix::fs::symlink(&target, &link);
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = &target; // no symlink support; leave only the numbered file
+/// The two files a run writes under `logs/`: `<name>.log` (the run log) and
+/// `<name>.ndjson` (one record per HTTP call). They share a stem so a run's
+/// timings are always found next to its log, and are created, pruned, cleaned
+/// and symlinked together.
+const RUN_FILE_EXTS: [&str; 2] = ["log", "ndjson"];
+
+/// Point `<root>/tstr-last-run.log` and `.ndjson` at this run's pair (relative
+/// targets, so the links survive the suite being moved). No-op on platforms
+/// without symlinks.
+fn update_last_run_symlinks(root: &std::path::Path, stem: &str) {
+    for ext in RUN_FILE_EXTS {
+        let link = root.join(format!("tstr-last-run.{}", ext));
+        let _ = std::fs::remove_file(&link); // replace any prior link/file
+        let target = std::path::Path::new("logs").join(format!("{}.{}", stem, ext));
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(&target, &link);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = &target; // no symlink support; leave only the files under logs/
+        }
     }
 }
 
-/// Delete all but the most recent `keep` run logs (by number).
+/// Delete all but the most recent `keep` numbered run logs (by number), each
+/// with its `.ndjson`. Named runs (`--name`) never match `tstr-<NNNN>` and so
+/// are never pruned — a name is a request to keep it.
 fn prune_logs(dir: &std::path::Path, keep: usize) {
     let mut nums = existing_log_numbers(dir);
     if nums.len() <= keep {
@@ -64,26 +75,48 @@ fn prune_logs(dir: &std::path::Path, keep: usize) {
     nums.sort_by_key(|(n, _)| *n);
     let remove = nums.len() - keep;
     for (_, path) in nums.into_iter().take(remove) {
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("ndjson"));
     }
 }
 
-/// Remove tstr's run-log artifacts under `root`: every `tstr-<NNNN>.log`, the
-/// `logs/.gitignore` we manage, and the `tstr-last-run.log` symlink — then the
-/// `logs/` dir itself, but only if it's left empty. Any non-tstr files in
-/// `logs/` are preserved. Returns how many numbered log files were removed.
+/// Remove tstr's run-log artifacts under `root`: every `*.log` / `*.ndjson`
+/// in `logs/` (numbered and named runs alike), the `logs/.gitignore` we
+/// manage, and the `tstr-last-run.*` symlinks — then the `logs/` dir itself,
+/// but only if it's left empty. Any other files in `logs/` are preserved.
+/// Returns how many run logs (`.log` files) were removed.
 pub fn clean_run_logs(root: &std::path::Path) -> usize {
     let logs_dir = root.join("logs");
     let mut removed = 0;
-    for (_, path) in existing_log_numbers(&logs_dir) {
-        if std::fs::remove_file(&path).is_ok() {
-            removed += 1;
+    if let Ok(entries) = std::fs::read_dir(&logs_dir) {
+        for e in entries.flatten() {
+            let path = e.path();
+            let Some(ext) = path.extension().and_then(|x| x.to_str()) else { continue };
+            if !RUN_FILE_EXTS.contains(&ext) {
+                continue;
+            }
+            if std::fs::remove_file(&path).is_ok() && ext == "log" {
+                removed += 1;
+            }
         }
     }
     let _ = std::fs::remove_file(logs_dir.join(".gitignore"));
-    let _ = std::fs::remove_file(root.join("tstr-last-run.log"));
+    for ext in RUN_FILE_EXTS {
+        let _ = std::fs::remove_file(root.join(format!("tstr-last-run.{}", ext)));
+    }
     let _ = std::fs::remove_dir(&logs_dir); // succeeds only if now empty
     removed
+}
+
+/// Validate a `--name` for the run's log pair: a bare file stem, not a path.
+fn validate_run_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(format!("--name: {:?} is not a usable file name", name));
+    }
+    if name.contains(['/', '\\']) {
+        return Err(format!("--name: {:?} must be a bare name, not a path (it goes under logs/)", name));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -116,6 +149,8 @@ pub struct Printer {
     matrix_stop: Arc<AtomicBool>,
     failure_log: Mutex<Option<Box<dyn Write + Send>>>,
     failure_log_path: Mutex<Option<String>>,
+    /// `<root>/logs/<stem>.ndjson`, the run log's per-request timings sibling.
+    timings_path: Mutex<Option<String>>,
     failure_count: Mutex<usize>,
     pending_summaries: Mutex<Vec<(String, Vec<(String, Option<String>, crate::value::Value)>)>>,
     /// Per-top-level-directory stats for the end-of-run table
@@ -359,6 +394,7 @@ impl Printer {
             matrix_stop: Arc::new(AtomicBool::new(false)),
             failure_log: Mutex::new(None),
             failure_log_path: Mutex::new(None),
+            timings_path: Mutex::new(None),
             failure_count: Mutex::new(0),
             pending_summaries: Mutex::new(Vec::new()),
             tld_stats: Mutex::new(HashMap::new()),
@@ -402,14 +438,28 @@ impl Printer {
             || self.matrix.lock().map(|s| s.initialized).unwrap_or(false)
     }
 
-    /// Open this run's log under `<root>/logs/tstr-<NNNN>.log`, point the
-    /// `<root>/tstr-last-run.log` symlink at it, and prune to the most recent
-    /// `retention` runs (`0` = keep all). Logs go under the *suite root*, not the
-    /// process cwd, so they never litter wherever the command happened to run.
-    pub fn init_failure_log(&self, root: &std::path::Path, retention: usize) {
+    /// Open this run's log pair under `<root>/logs/`: `<stem>.log` (the run
+    /// log) and `<stem>.ndjson` (per-request timings, handed to the HTTP
+    /// layer). The stem is `name` when given, else `tstr-<NNNN>`. Points the
+    /// `<root>/tstr-last-run.*` symlinks at the pair and prunes numbered runs
+    /// to the most recent `retention` (`0` = keep all). Logs go under the
+    /// *suite root*, not the process cwd, so they never litter wherever the
+    /// command happened to run.
+    ///
+    /// A `logs/` dir that can't be created means the run proceeds without
+    /// files, silently — the verdict doesn't depend on them. An explicit
+    /// `name` is different: it's a request, so a bad name or an existing
+    /// `logs/<name>.log` / `.ndjson` is an error, and the run must not start.
+    pub fn init_run_log(&self, root: &std::path::Path, retention: usize, name: Option<&str>) -> Result<(), String> {
+        if let Some(n) = name {
+            validate_run_name(n)?;
+        }
         let logs_dir = root.join("logs");
-        if std::fs::create_dir_all(&logs_dir).is_err() {
-            return; // can't create the logs dir — run without a log file
+        if let Err(e) = std::fs::create_dir_all(&logs_dir) {
+            return match name {
+                Some(_) => Err(format!("cannot create {}: {}", logs_dir.display(), e)),
+                None => Ok(()), // run without a log file
+            };
         }
         // Keep run logs out of version control if the suite is under git.
         let gitignore = logs_dir.join(".gitignore");
@@ -417,18 +467,48 @@ impl Printer {
             let _ = std::fs::write(&gitignore, "*\n");
         }
 
-        // Next run number = highest existing + 1. Pruning removes the lowest
-        // numbers, so the max is always the latest kept run — no reuse, no
-        // separate counter needed.
-        let next = next_log_number(&logs_dir);
-        let file_name = format!("tstr-{:04}.log", next);
-        let log_path = logs_dir.join(&file_name);
-        if let Ok(file) = std::fs::File::create(&log_path) {
-            *self.failure_log.lock().unwrap() = Some(Box::new(file));
-            *self.failure_log_path.lock().unwrap() = Some(log_path.to_string_lossy().to_string());
-            update_last_run_symlink(root, &file_name);
-            if retention > 0 {
-                prune_logs(&logs_dir, retention);
+        let stem = match name {
+            Some(n) => {
+                for ext in RUN_FILE_EXTS {
+                    let existing = logs_dir.join(format!("{}.{}", n, ext));
+                    if existing.exists() {
+                        return Err(format!("--name: {} already exists (pick another name, or delete it)", existing.display()));
+                    }
+                }
+                n.to_string()
+            }
+            // Next run number = highest existing + 1. Pruning removes the lowest
+            // numbers, so the max is always the latest kept run — no reuse, no
+            // separate counter needed.
+            None => format!("tstr-{:04}", next_log_number(&logs_dir)),
+        };
+
+        let log_path = logs_dir.join(format!("{}.log", stem));
+        let timings_path = logs_dir.join(format!("{}.ndjson", stem));
+        // `create_new` so a name that appeared between the check and the open
+        // (a concurrent run) still can't clobber it.
+        let opened = std::fs::File::create_new(&log_path)
+            .and_then(|log| std::fs::File::create_new(&timings_path).map(|t| (log, t)));
+        match opened {
+            Ok((log, timings)) => {
+                *self.failure_log.lock().unwrap() = Some(Box::new(log));
+                *self.failure_log_path.lock().unwrap() = Some(log_path.to_string_lossy().to_string());
+                crate::http::set_timings_sink(timings);
+                *self.timings_path.lock().unwrap() = Some(timings_path.to_string_lossy().to_string());
+                update_last_run_symlinks(root, &stem);
+                if retention > 0 {
+                    prune_logs(&logs_dir, retention);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                // Don't leave a half-made pair behind.
+                let _ = std::fs::remove_file(&log_path);
+                *self.failure_log.lock().unwrap() = None;
+                match name {
+                    Some(_) => Err(format!("cannot create {}: {}", log_path.display(), e)),
+                    None => Ok(()),
+                }
             }
         }
     }
@@ -533,6 +613,11 @@ impl Printer {
     /// Path to the run log, regardless of pass/fail count.
     pub fn log_path(&self) -> Option<String> {
         self.failure_log_path.lock().unwrap().clone()
+    }
+
+    /// Path to the run's per-request timings (`.ndjson`), if the pair opened.
+    pub fn timings_path(&self) -> Option<String> {
+        self.timings_path.lock().unwrap().clone()
     }
 
     /// Clean up the log file if there were no failures.
@@ -1912,6 +1997,91 @@ mod log_tests {
         std::fs::write(p.join("tstr-0001.log"), "").unwrap();
         prune_logs(p, 10);
         assert_eq!(existing_log_numbers(p).len(), 1);
+    }
+
+    #[test]
+    fn prune_takes_the_ndjson_sibling_and_spares_named_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        for n in 1..=3 {
+            std::fs::write(p.join(format!("tstr-{:04}.log", n)), "").unwrap();
+            std::fs::write(p.join(format!("tstr-{:04}.ndjson", n)), "").unwrap();
+        }
+        std::fs::write(p.join("before.log"), "").unwrap();
+        std::fs::write(p.join("before.ndjson"), "").unwrap();
+        prune_logs(p, 1);
+        assert!(!p.join("tstr-0001.log").exists());
+        assert!(!p.join("tstr-0001.ndjson").exists(), "timings go with their log");
+        assert!(!p.join("tstr-0002.ndjson").exists());
+        assert!(p.join("tstr-0003.ndjson").exists());
+        assert!(p.join("before.log").exists(), "named runs are never pruned");
+        assert!(p.join("before.ndjson").exists());
+    }
+
+    #[test]
+    fn clean_removes_numbered_and_named_pairs_but_not_other_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let logs = root.join("logs");
+        std::fs::create_dir(&logs).unwrap();
+        for stem in ["tstr-0001", "tstr-0002", "before"] {
+            std::fs::write(logs.join(format!("{}.log", stem)), "").unwrap();
+            std::fs::write(logs.join(format!("{}.ndjson", stem)), "").unwrap();
+        }
+        std::fs::write(logs.join(".gitignore"), "*\n").unwrap();
+        std::fs::write(logs.join("notes.txt"), "mine").unwrap();
+        update_last_run_symlinks(root, "before");
+
+        let removed = clean_run_logs(root);
+        assert_eq!(removed, 3, "one per .log, named runs included");
+        assert!(logs.join("notes.txt").exists(), "non-tstr files are preserved");
+        assert!(logs.exists(), "logs/ stays because notes.txt is in it");
+        assert!(!logs.join("before.ndjson").exists());
+        assert!(!logs.join(".gitignore").exists());
+        assert!(!root.join("tstr-last-run.log").exists());
+        assert!(!root.join("tstr-last-run.ndjson").exists());
+
+        std::fs::remove_file(logs.join("notes.txt")).unwrap();
+        assert_eq!(clean_run_logs(root), 0);
+        assert!(!logs.exists(), "an emptied logs/ is removed");
+    }
+
+    #[test]
+    fn run_name_must_be_a_bare_stem() {
+        assert!(validate_run_name("before").is_ok());
+        assert!(validate_run_name("v2.1-hot").is_ok());
+        assert!(validate_run_name("").is_err());
+        assert!(validate_run_name(".").is_err());
+        assert!(validate_run_name("..").is_err());
+        assert!(validate_run_name("sub/run").is_err());
+        assert!(validate_run_name("sub\\run").is_err());
+    }
+
+    #[test]
+    fn init_run_log_opens_a_pair_and_refuses_a_taken_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = Printer::new(OutputMode::Quiet, BarStyle::Auto);
+        p.init_run_log(root, 10, Some("first")).unwrap();
+        assert!(root.join("logs/first.log").exists());
+        assert!(root.join("logs/first.ndjson").exists());
+        assert_eq!(p.timings_path().as_deref(), root.join("logs/first.ndjson").to_str());
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::read_link(root.join("tstr-last-run.ndjson")).unwrap(),
+            std::path::Path::new("logs/first.ndjson")
+        );
+
+        let q = Printer::new(OutputMode::Quiet, BarStyle::Auto);
+        let err = q.init_run_log(root, 10, Some("first")).unwrap_err();
+        assert!(err.contains("already exists"), "{}", err);
+        assert!(q.log_path().is_none(), "nothing opened on refusal");
+
+        // A numbered run alongside a named one: numbering ignores the name.
+        let r = Printer::new(OutputMode::Quiet, BarStyle::Auto);
+        r.init_run_log(root, 10, None).unwrap();
+        assert!(root.join("logs/tstr-0001.log").exists());
+        assert!(root.join("logs/tstr-0001.ndjson").exists());
     }
 }
 

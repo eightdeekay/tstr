@@ -85,12 +85,11 @@ pub enum Commands {
         #[arg(long, default_value = "10", value_name = "SECONDS")]
         connect_timeout: u64,
 
-        /// Append one ndjson record per HTTP call to FILE: ts, file, method,
-        /// url, code, elapsedMs (and error, when the request failed). Under
-        /// --stress this captures every sample, so p50/p95/p99 for an
-        /// endpoint is a jq/sort away. Appends to an existing file.
-        #[arg(long, value_name = "FILE")]
-        timings: Option<PathBuf>,
+        /// Name this run's log pair logs/NAME.log + logs/NAME.ndjson instead
+        /// of the numbered tstr-NNNN default. Named runs are never pruned by
+        /// log_retention. Aborts if either file already exists.
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
 
         /// Verbose output (show logs, timing, scope changes)
         #[arg(short, long)]
@@ -157,7 +156,7 @@ pub enum Commands {
         check: bool,
     },
 
-    /// Remove all run logs (the `logs/` dir and `tstr-last-run.log`) under the suite root
+    /// Remove all run logs (the `logs/` dir and `tstr-last-run.*`) under the suite root
     Clean {
         /// Directory inside the suite (default: current directory)
         #[arg(default_value = ".")]
@@ -168,15 +167,9 @@ pub enum Commands {
 pub fn run(cli: Cli) {
     let config_override = cli.config.clone();
     match cli.command {
-        Commands::Run { target, url, set, continue_on_error, repeat, stress, timeout, connect_timeout, timings, verbose, quiet, display, threads, skip_slow } => {
+        Commands::Run { target, url, set, continue_on_error, repeat, stress, timeout, connect_timeout, name, verbose, quiet, display, threads, skip_slow } => {
             crate::http::set_timeout(timeout);
             crate::http::set_connect_timeout(connect_timeout);
-            if let Some(path) = timings {
-                if let Err(e) = crate::http::set_timings_file(&path) {
-                    eprintln!("error: --timings: cannot open {}: {}", path.display(), e);
-                    process::exit(1);
-                }
-            }
             // Note: the rayon pool is sized inside run_command, after config
             // loads — the `threads:` config value is a fallback for --threads,
             // so we can't build the pool until the config is known.
@@ -187,7 +180,7 @@ pub fn run(cli: Cli) {
                     process::exit(1);
                 })
             });
-            run_command(&target, url, set, continue_on_error, repeat, stress, verbose, quiet, display, threads, skip_slow_ms, config_override);
+            run_command(&target, url, set, continue_on_error, repeat, stress, name.as_deref(), verbose, quiet, display, threads, skip_slow_ms, config_override);
         }
         Commands::List { target, ty, flat, disabled } => {
             list_command(&target, &ty, flat, disabled);
@@ -246,8 +239,8 @@ fn stats_command(target: &str) {
     }
 }
 
-/// `tstr clean` — remove the `logs/` directory and the `tstr-last-run.log`
-/// symlink under the suite root. The auto-prune on each run usually makes this
+/// `tstr clean` — remove the `logs/` directory and the `tstr-last-run.*`
+/// symlinks under the suite root. The auto-prune on each run usually makes this
 /// unnecessary, but it's here to reclaim space or reset the run counter.
 fn clean_command(target: &str) {
     let path = Path::new(target);
@@ -343,6 +336,7 @@ fn run_command(
     continue_on_error: bool,
     repeat: usize,
     stress: Option<usize>,
+    run_name: Option<&str>,
     verbose: bool,
     quiet: bool,
     display: DisplayMode,
@@ -466,6 +460,18 @@ fn run_command(
         process::exit(1);
     }
 
+    // Nothing to run — almost always the wrong directory. Say so and stop
+    // before a log pair is opened, so a stray `tstr run` leaves nothing behind
+    // and doesn't pass with an all-zero summary.
+    if suite.test_count() == 0 {
+        let scope = target_dir.as_deref().unwrap_or(&root);
+        eprintln!("error: no tstr tests found under {}", scope.display());
+        if !warnings.is_empty() {
+            eprintln!("       ({} file(s) skipped for parse errors — use -v to see them)", warnings.len());
+        }
+        process::exit(1);
+    }
+
     // --stress N = N overlapping passes; --repeat N = N sequential passes (the
     // two are mutually exclusive, enforced by clap). `passes` is the count
     // either way; `concurrent` selects the runner and the display shape.
@@ -494,7 +500,10 @@ fn run_command(
     // its (tests × passes) cells; per-test glyphs wouldn't fit or read sensibly.
     let bar_style = if concurrent { BarStyle::Bars } else { display.to_bar_style() };
     let printer = Arc::new(Printer::new(mode, bar_style));
-    printer.init_failure_log(&root, config.log_retention());
+    if let Err(e) = printer.init_run_log(&root, config.log_retention(), run_name) {
+        eprintln!("error: {}", e);
+        process::exit(1);
+    }
     if !warnings.is_empty() {
         printer.log_parse_errors(&warnings);
     }
@@ -552,6 +561,9 @@ fn run_command(
         eprintln!("{} failure(s) logged to {}", count, path);
     } else if let Some(path) = printer.log_path() {
         eprintln!("Run log: {}", path);
+    }
+    if let Some(path) = printer.timings_path() {
+        eprintln!("Timings: {}", path);
     }
 
     // Last line before the exit code, so it survives a scrollback glance and

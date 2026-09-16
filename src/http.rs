@@ -21,9 +21,11 @@ static FALLBACK_CLIENT: OnceLock<Arc<Client>> = OnceLock::new();
 static TIMEOUT_SECS: OnceLock<u64> = OnceLock::new();
 static CONNECT_TIMEOUT_SECS: OnceLock<u64> = OnceLock::new();
 
-/// Optional per-request timings sink (`--timings <file>`): one ndjson line per
+/// Per-request timings sink (`<root>/logs/<run>.ndjson`): one ndjson line per
 /// HTTP call. Shared across the rayon pool, so writes take the mutex and emit a
-/// whole line at once — lines from concurrent `--stress` copies never interleave.
+/// whole line in one `write_all` — lines from concurrent `--stress` copies never
+/// interleave. `None` until the runner opens the run's log pair (unit tests,
+/// or a suite root where `logs/` can't be created).
 static TIMINGS: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
 
 /// Attempts for the once-per-host DNS lookup, and the backoff between them.
@@ -39,17 +41,14 @@ pub fn set_timeout(secs: u64) {
     let _ = TIMEOUT_SECS.set(secs);
 }
 
-/// Record every HTTP call to `path` as ndjson (`--timings`). Appends, so a
-/// file can accumulate across invocations (fixture run, then the stressed
-/// leaves); delete it to start fresh. Must be called before the first HTTP
-/// call; subsequent calls are no-ops.
-pub fn set_timings_file(path: &std::path::Path) -> std::io::Result<()> {
-    let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+/// Record every HTTP call to `file` as ndjson. The runner opens it next to the
+/// run log (`output::Printer::init_run_log`). Must be called before the first
+/// HTTP call; subsequent calls are no-ops.
+pub fn set_timings_sink(file: std::fs::File) {
     let _ = TIMINGS.set(Mutex::new(file));
-    Ok(())
 }
 
-/// Append one timings record, if `--timings` is on. `code` is `None` when the
+/// Append one timings record, if a sink is open. `code` is `None` when the
 /// request never got a response (connect/timeout error), so a stress run's
 /// failures show up in the data rather than silently thinning the sample.
 fn record_timing(
@@ -65,7 +64,11 @@ fn record_timing(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let line = serde_json::json!({
+    // Serialize outside the lock, then write the whole line at once. The
+    // `File` is unbuffered, so streaming the JSON through `Display` would be
+    // one syscall per token; one `write_all` per record is also what keeps
+    // concurrent writers from interleaving.
+    let mut line = serde_json::json!({
         "ts": ts_ms,
         "file": scope.file(),
         "method": method,
@@ -73,14 +76,15 @@ fn record_timing(
         "code": code,
         "elapsedMs": elapsed_ms,
         "error": error,
-    });
+    }).to_string();
+    line.push('\n');
     let mut f = match sink.lock() {
         Ok(f) => f,
         Err(poisoned) => poisoned.into_inner(),
     };
     // A failed write (disk full, file removed) is not a test failure; the
     // suite's verdict must not depend on the side-channel.
-    let _ = writeln!(f, "{}", line);
+    let _ = f.write_all(line.as_bytes());
 }
 
 /// Wall-clock for one request, in milliseconds to one decimal: from handing
@@ -306,7 +310,7 @@ pub fn execute_http_call(
 
     // Execute the request. Timed from here through the full body read — the
     // latency a caller actually experiences, surfaced as `_response.elapsedMs`
-    // and (with `--timings`) as one record per call.
+    // and, in the run's `.ndjson`, as one record per call.
     let started = Instant::now();
     let response = match builder.send() {
         Ok(r) => r,

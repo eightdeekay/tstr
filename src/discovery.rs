@@ -39,6 +39,16 @@ impl Suite {
             .filter(|e| e.file.file_type == *file_type)
             .collect()
     }
+
+    /// Runnable tests (`.test` / `.fetch`) in this suite and every suite
+    /// below it. Scaffolding (const/setup/cleanup/lib) doesn't count: a tree
+    /// with only those has nothing to run.
+    pub fn test_count(&self) -> usize {
+        let own = self.entries.values()
+            .filter(|e| matches!(e.file.file_type, FileType::Test | FileType::Fetch))
+            .count();
+        own + self.children.values().map(|c| c.test_count()).sum::<usize>()
+    }
 }
 
 /// Derive a display name from a filename stem.
