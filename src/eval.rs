@@ -275,7 +275,7 @@ pub fn eval_expr(expr: &Expr, scope: &Scope) -> Result<Value, EvalError> {
 
         Expr::PropertyAccess { object, key } => {
             let obj = eval_expr(object, scope)?;
-            let field_name = property_key_str(key);
+            let field_name = property_key_name(key, scope)?;
             Ok(obj.get_field(&field_name))
         }
 
@@ -284,7 +284,7 @@ pub fn eval_expr(expr: &Expr, scope: &Scope) -> Result<Value, EvalError> {
             if obj == Value::Null {
                 Ok(Value::Null)
             } else {
-                let field_name = property_key_str(key);
+                let field_name = property_key_name(key, scope)?;
                 Ok(obj.get_field(&field_name))
             }
         }
@@ -299,7 +299,7 @@ pub fn eval_expr(expr: &Expr, scope: &Scope) -> Result<Value, EvalError> {
 
         Expr::CollectAccess { object, key } => {
             let obj = eval_expr(object, scope)?;
-            let field_name = property_key_str(key);
+            let field_name = property_key_name(key, scope)?;
             Ok(obj.collect_field(&field_name))
         }
 
@@ -1218,13 +1218,13 @@ fn eval_pipe_expr(expr: &Expr, item: &Value, scope: &Scope) -> Result<Value, Eva
             if let Expr::Identifier(name) = object.as_ref() {
                 if name.is_empty() || name == "_" {
                     // This shouldn't happen with current parser, but handle it
-                    let field_name = property_key_str(key);
+                    let field_name = property_key_name(key, scope)?;
                     return Ok(item.get_field(&field_name));
                 }
             }
             // Regular property access — evaluate normally
             let obj = eval_pipe_expr(object, item, scope)?;
-            let field_name = property_key_str(key);
+            let field_name = property_key_name(key, scope)?;
             Ok(obj.get_field(&field_name))
         }
         // Binary ops: evaluate both sides in pipe context
@@ -1254,10 +1254,23 @@ fn is_guard_expr(expr: &Expr) -> bool {
     matches!(expr, Expr::Guard { .. })
 }
 
+/// The key's literal text. Used on the write path (`obj."x" = …`), where the
+/// key names the slot being created and is taken verbatim.
 fn property_key_str(key: &PropertyKey) -> String {
     match key {
         PropertyKey::Name(s) => s.clone(),
         PropertyKey::Quoted(s) => s.clone(),
+    }
+}
+
+/// The key to look up on a read. A quoted key is interpolated first, so
+/// `comps."{{ref}}"` reads the field named by `ref` — the only way to express
+/// a dynamic key, since `IndexAccess` is numeric. A bare `.name` never
+/// interpolates (it can't contain `{{` anyway).
+fn property_key_name(key: &PropertyKey, scope: &Scope) -> Result<String, EvalError> {
+    match key {
+        PropertyKey::Name(s) => Ok(s.clone()),
+        PropertyKey::Quoted(s) => interpolate_string(s, scope),
     }
 }
 
@@ -1944,6 +1957,57 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.clone()))
             .collect();
         Scope::new().with_constants(std::sync::Arc::new(map))
+    }
+
+    // --- Quoted property keys interpolate on read ---
+
+    fn obj(pairs: &[(&str, Value)]) -> Value {
+        Value::Object(pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect())
+    }
+
+    #[test]
+    fn quoted_key_interpolates_on_read() {
+        let mut scope = Scope::new();
+        scope.set("ref".into(), Value::String("mod-1".into()));
+        scope.set("comps".into(), obj(&[("mod-1", Value::Number(7.0))]));
+        assert_eq!(eval_with_scope(r#"comps."{{ref}}""#, &scope), Value::Number(7.0));
+        assert_eq!(eval_with_scope(r#"comps."{{ref}}".missing"#, &scope), Value::Null);
+    }
+
+    #[test]
+    fn quoted_key_interpolates_on_optional_and_collect() {
+        let mut scope = Scope::new();
+        scope.set("k".into(), Value::String("a-b".into()));
+        scope.set("o".into(), obj(&[("a-b", Value::Number(1.0))]));
+        scope.set("arr".into(), Value::Array(vec![
+            obj(&[("a-b", Value::Number(1.0))]),
+            obj(&[("a-b", Value::Number(2.0))]),
+        ]));
+        assert_eq!(eval_with_scope(r#"o?."{{k}}""#, &scope), Value::Number(1.0));
+        assert_eq!(
+            eval_with_scope(r#"arr[]."{{k}}""#, &scope),
+            Value::Array(vec![Value::Number(1.0), Value::Number(2.0)])
+        );
+    }
+
+    #[test]
+    fn quoted_key_without_braces_is_verbatim() {
+        let mut scope = Scope::new();
+        scope.set("o".into(), obj(&[("content-type", Value::String("json".into()))]));
+        assert_eq!(
+            eval_with_scope(r#"o."content-type""#, &scope),
+            Value::String("json".into())
+        );
+    }
+
+    #[test]
+    fn quoted_key_unknown_var_is_an_error() {
+        let mut input = r#"o."{{nope}}""#;
+        let expr = crate::parser::expr::expr(&mut input).unwrap();
+        let mut scope = Scope::new();
+        scope.set("o".into(), obj(&[]));
+        let msg = eval_expr(&expr, &scope).unwrap_err().message;
+        assert!(msg.contains("nope"), "{msg}");
     }
 
     #[test]

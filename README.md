@@ -981,12 +981,17 @@ Each service's libs are self-contained — they see only their own scope cascade
 ```
 r.id                            // dot notation
 r."hyphenated-field"            // quoted for special chars
+r.comps."{{moduleId}}"          // dynamic key — quoted keys interpolate on read
 r.user?.address?.city           // optional chaining (null-safe)
 r.items[0]                      // array index
 r.items[-1]                     // negative index (from end)
 r.items[0:3]                    // slice
 r.items[].id                    // collect field from all elements
 ```
+
+A quoted key is `{{…}}`-interpolated when it is *read* (`.`, `?.`, `[].`), so
+a variable can name the field. On the left of an assignment
+(`req.headers."content-type" = …`) the key is taken verbatim.
 
 ### Collection Properties
 

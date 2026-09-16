@@ -8,8 +8,22 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
-<a id="v0.13.0"></a>
-## [0.13.0] — 2026-09-16
+<a id="v0.13.1"></a>
+## [0.13.1] — 2026-09-16
+
+No action needed on existing suites.
+
+### Fixed
+- **A quoted property key is now `{{…}}`-interpolated on read.**
+  `comps."{{moduleRef}}"` looked up the literal key `{{moduleRef}}` and
+  returned `null`; it now reads the field named by `moduleRef`. Applies to
+  `.`, `?.` and `[].` access (and the same forms inside a pipe). This was the
+  only way to express a dynamic key — `[…]` is numeric — so nothing could have
+  depended on the old behaviour except by accident. The write side
+  (`req.headers."content-type" = …`) is unchanged: keys there are verbatim.
+  Note that any test already using this form has been asserting against
+  `null`; after upgrading it does real work, so a hidden failure may surface.
+
 
 No action needed on existing suites. Every run now records its per-request
 timings next to its run log, so `--timings` is gone; runs can be named; and
