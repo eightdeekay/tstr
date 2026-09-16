@@ -532,6 +532,7 @@ fn run_command(
         runner::run_repeated_sequential(passes, &suite_for_structural, &index, &overrides, &opts, &printer)
     };
     printer.set_wall_clock(run_start.elapsed());
+    printer.set_iterations(passes, concurrent);
 
     if let Err(e) = stats.save() {
         eprintln!("warning: could not write {}: {}", crate::stats::STATS_FILE, e);

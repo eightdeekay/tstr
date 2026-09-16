@@ -125,6 +125,24 @@ pub struct Printer {
     /// each file's own elapsed (work-time) and so reads the same whether
     /// the run was parallel or serial.
     wall_clock: Mutex<Option<std::time::Duration>>,
+    /// `--repeat` / `--stress` shape, set by the runner before `summary`.
+    /// The "Time" column divides summed work-time by the iteration count so
+    /// it reads as one pass of the suite, and the wall-clock line stops
+    /// calling overlapping stress copies a "speedup".
+    iterations: Mutex<Iterations>,
+}
+
+/// How many passes a run made and whether they overlapped.
+#[derive(Clone, Copy)]
+struct Iterations {
+    count: usize,
+    concurrent: bool,
+}
+
+impl Default for Iterations {
+    fn default() -> Self {
+        Iterations { count: 1, concurrent: false }
+    }
 }
 
 #[derive(Default, Clone)]
@@ -345,6 +363,7 @@ impl Printer {
             pending_summaries: Mutex::new(Vec::new()),
             tld_stats: Mutex::new(HashMap::new()),
             wall_clock: Mutex::new(None),
+            iterations: Mutex::new(Iterations::default()),
         }
     }
 
@@ -352,6 +371,27 @@ impl Printer {
     /// `summary`). Surfaced as a separate line so parallel speedup is visible.
     pub fn set_wall_clock(&self, d: std::time::Duration) {
         *self.wall_clock.lock().unwrap() = Some(d);
+    }
+
+    /// Redirect this printer's stdout into a shared buffer so tests can read
+    /// back what `summary` and friends rendered.
+    #[cfg(test)]
+    fn capture(&self) -> Arc<Mutex<Vec<u8>>> {
+        struct Shared(Arc<Mutex<Vec<u8>>>);
+        impl Write for Shared {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> { self.0.lock().unwrap().extend_from_slice(b); Ok(b.len()) }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        *self.out.lock().unwrap() = Box::new(Shared(Arc::clone(&buf)));
+        buf
+    }
+
+    /// Record the `--repeat` / `--stress` shape (pass count, overlapping or
+    /// not) so `summary` can show per-iteration time. Call before `summary`;
+    /// a count of 1 (the default) keeps the plain single-run layout.
+    pub fn set_iterations(&self, count: usize, concurrent: bool) {
+        *self.iterations.lock().unwrap() = Iterations { count: count.max(1), concurrent };
     }
 
     /// Whether a fixed-position live display currently owns the screen.
@@ -1427,6 +1467,14 @@ impl Printer {
             total.elapsed += s.elapsed;
         }
 
+        // Under --repeat/--stress the counts accumulate across passes but the
+        // time column shows ONE pass: summed work-time / iterations. Otherwise
+        // ten stress copies of a 140s suite read as "1400s" next to a 160s
+        // wall-clock, which is nonsense to anyone not reading the source.
+        let iters = *self.iterations.lock().unwrap();
+        let per_iter = |d: std::time::Duration| d / iters.count as u32;
+        let time_label = if iters.count > 1 { "Time/iter" } else { "Time" };
+
         // Column widths
         let name_w = rows.iter().map(|(n, _)| n.len()).max().unwrap_or(0)
             .max("Suite".len())
@@ -1440,14 +1488,14 @@ impl Printer {
         let total_col = total.passed + total.failed + total.skipped;
         let tot_w = rows.iter().map(|(_, s)| digits(s.passed + s.failed + s.skipped)).max().unwrap_or(1)
             .max(digits(total_col)).max("Total".len());
-        let time_strs: Vec<String> = rows.iter().map(|(_, s)| format_seconds(s.elapsed)).collect();
-        let total_time = format_seconds(total.elapsed);
+        let time_strs: Vec<String> = rows.iter().map(|(_, s)| format_seconds(per_iter(s.elapsed))).collect();
+        let total_time = format_seconds(per_iter(total.elapsed));
         let time_w = time_strs.iter().map(|s| s.len()).max().unwrap_or(0)
-            .max(total_time.len()).max("Time".len());
+            .max(total_time.len()).max(time_label.len());
 
         let _ = writeln!(out);
         let _ = writeln!(out, "{:<nw$}  {:>pw$}  {:>fw$}  {:>sw$}  {:>tw$}  {:>mw$}",
-            "Suite", "Pass", "Fail", "Skip", "Total", "Time",
+            "Suite", "Pass", "Fail", "Skip", "Total", time_label,
             nw = name_w, pw = pass_w, fw = fail_w, sw = skip_w, tw = tot_w, mw = time_w);
         let sep = format!("{}  {}  {}  {}  {}  {}",
             "-".repeat(name_w), "-".repeat(pass_w), "-".repeat(fail_w),
@@ -1482,12 +1530,17 @@ impl Printer {
 
         // Wall-clock line: the "Time" column above is summed work-time (so it
         // reads the same parallel or serial); this shows actual elapsed and,
-        // when meaningfully shorter, the parallel speedup.
+        // when meaningfully shorter, the parallel speedup. Under --stress the
+        // passes overlap by design, so the gap between work and wall-clock is
+        // just N copies stacking up — not a speedup — and we say that instead.
         if let Some(wall) = *self.wall_clock.lock().unwrap() {
             let work = total.elapsed.as_secs_f64();
             let wall_s = wall.as_secs_f64();
             let speedup = if wall_s > 0.0 { work / wall_s } else { 1.0 };
-            if speedup >= 1.5 {
+            if iters.concurrent {
+                let _ = writeln!(out, "{DIM}wall-clock: {} ({} overlapping iterations){RESET}",
+                    format_seconds(wall), iters.count);
+            } else if speedup >= 1.5 {
                 let _ = writeln!(out, "{DIM}wall-clock: {} ({:.1}x parallel speedup over {} of work){RESET}",
                     format_seconds(wall), speedup, format_seconds(total.elapsed));
             } else {
@@ -1987,5 +2040,92 @@ mod render_tests {
         assert!(line.contains("Passed: 3"));
         assert!(line.contains("Failed: 1"));
         assert!(line.contains("Skipped: 0"));
+    }
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for n in chars.by_ref() { if n == 'm' { break; } }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    fn passing(name: &str, secs: u64) -> crate::eval::FileResult {
+        crate::eval::FileResult {
+            name: name.to_string(),
+            skipped: false,
+            disabled: false,
+            incompatible: false,
+            skip_reason: None,
+            inputs: Vec::new(),
+            failures: Vec::new(),
+            endpoint: None,
+            exports: crate::value::ValueMap::new(),
+            logs: Vec::new(),
+            elapsed: Duration::from_secs(secs),
+            is_const: false,
+            matrices: Vec::new(),
+        }
+    }
+
+    /// 3 passes × 2 tests of 10s each = 60s of work; the table shows one pass.
+    fn three_pass_printer(concurrent: bool) -> (Printer, Arc<Mutex<Vec<u8>>>) {
+        let p = Printer::new(OutputMode::Quiet, BarStyle::Bars);
+        let buf = p.capture();
+        for _ in 0..3 {
+            p.file_result(&passing("a", 10), 0, Some("load/a.tstr"), false);
+            p.file_result(&passing("b", 10), 0, Some("load/b.tstr"), false);
+        }
+        p.set_wall_clock(Duration::from_secs(if concurrent { 22 } else { 60 }));
+        p.set_iterations(3, concurrent);
+        (p, buf)
+    }
+
+    #[test]
+    fn single_run_time_is_summed_work() {
+        let p = Printer::new(OutputMode::Quiet, BarStyle::Bars);
+        let buf = p.capture();
+        p.file_result(&passing("a", 10), 0, Some("load/a.tstr"), false);
+        p.file_result(&passing("b", 10), 0, Some("load/b.tstr"), false);
+        p.set_wall_clock(Duration::from_secs(11));
+        p.summary(2, 2, 0, 0, 0);
+        let out = strip_ansi(&String::from_utf8(buf.lock().unwrap().clone()).unwrap());
+        assert!(out.contains("Time\n"), "plain header without iterations:\n{out}");
+        assert!(out.contains("load      2     0     0      2  20.000s"), "{out}");
+        assert!(out.contains("wall-clock: 11.000s (1.8x parallel speedup over 20.000s of work)"), "{out}");
+    }
+
+    #[test]
+    fn repeat_shows_per_iteration_time_and_keeps_speedup() {
+        let (p, buf) = three_pass_printer(false);
+        p.summary(6, 6, 0, 0, 0);
+        let out = strip_ansi(&String::from_utf8(buf.lock().unwrap().clone()).unwrap());
+        assert!(out.contains("Time/iter"), "{out}");
+        assert!(out.contains("load      6     0     0      6    20.000s"), "counts accumulate, time is one pass:\n{out}");
+        assert!(out.contains("TOTAL     6     0     0      6    20.000s"), "{out}");
+        // Sequential: work == wall, so no speedup claim.
+        assert!(out.contains("wall-clock: 60.000s\n"), "{out}");
+    }
+
+    #[test]
+    fn stress_shows_per_iteration_time_and_no_speedup_claim() {
+        let (p, buf) = three_pass_printer(true);
+        p.summary(6, 6, 0, 0, 0);
+        let out = strip_ansi(&String::from_utf8(buf.lock().unwrap().clone()).unwrap());
+        assert!(out.contains("Time/iter"), "{out}");
+        assert!(out.contains("load      6     0     0      6    20.000s"), "{out}");
+        assert!(out.contains("wall-clock: 22.000s (3 overlapping iterations)"), "{out}");
+        assert!(!out.contains("speedup"), "overlapping passes are load, not a speedup:\n{out}");
     }
 }

@@ -8,6 +8,27 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.12.5"></a>
+## [0.12.5] — 2026-09-16
+
+No action needed on existing suites. The summary table under `--repeat` /
+`--stress` now shows the time for one pass of the suite instead of every pass
+stacked together.
+
+### Fixed
+- **Summary time under `--repeat` / `--stress` read as N× the suite's time.**
+  The per-suite **Time** column sums each file's own elapsed, and with ten
+  overlapping stress copies of a ~140s suite that summed to `1428.980s` next to
+  a `158s` wall-clock — followed by a `9.0x parallel speedup` claim that was
+  really just ten copies of the same work. The column is now **Time/iter**
+  whenever more than one pass ran: summed work-time divided by the pass count,
+  so it reads as one pass of the suite while the Pass/Fail/Total counts still
+  accumulate across passes. Under `--stress` the wall-clock line reports
+  `(N overlapping iterations)` rather than a speedup, since overlapping copies
+  are load, not parallelism. Sequential `--repeat` keeps the speedup line
+  (per-directory parallelism within a pass is still real). Single runs are
+  unchanged.
+
 <a id="v0.12.4"></a>
 ## [0.12.4] — 2026-09-15
 

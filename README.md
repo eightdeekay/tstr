@@ -1072,7 +1072,11 @@ tstr --version
 The summary's per-suite **Time** column is summed *work-time* (each file's own
 elapsed), so it reads the same whether the run was parallel or serial. A
 separate **wall-clock** line below the TOTAL shows actual elapsed time and the
-parallel speedup when one occurred.
+parallel speedup when one occurred. Under `--repeat` / `--stress` the counts
+accumulate across passes but the column becomes **Time/iter** — one pass of the
+suite, not N passes stacked — and the wall-clock line under `--stress` reports
+`(N overlapping iterations)` rather than a speedup, since overlapping copies
+are load, not parallelism.
 
 **`list` flags:**
 
