@@ -249,6 +249,12 @@ struct Slot {
     /// Number of tests completed so far in this dir; used to assign the
     /// next indicator position and to detect when the dir is done.
     completed: usize,
+    /// Wall-clock window of this slot's work: `started` is backdated from the
+    /// first result by that file's own elapsed (there's no start event), and
+    /// `last` is the most recent completion. `last - started` is the row's
+    /// time; it freezes once the slot is done.
+    started: Option<std::time::Instant>,
+    last: Option<std::time::Instant>,
 }
 
 
@@ -322,6 +328,9 @@ struct SlotDrawInfo {
     path: Option<String>,
     count: usize,
     indicators: Vec<Indicator>,
+    /// Wall-clock time the slot has spent so far; `None` until its first
+    /// result lands.
+    elapsed: Option<std::time::Duration>,
 }
 
 #[derive(Clone)]
@@ -695,7 +704,7 @@ impl Printer {
 
         // Bar width: term_width minus name column, brackets, margins, and
         // room for a trailing "  N/T" counter sized to the largest dir.
-        let counter_width = format!("  {0}/{0}", max_tests).len();
+        let counter_width = format!("  {0}/{0}", max_tests).len() + SLOT_TIME_WIDTH;
         let chrome = col_width + 2 /* "[" + "]" */ + 2 /* leading margin */;
         let bar_budget = term_w.saturating_sub(chrome).saturating_sub(counter_width);
         // Auto mode caps at max_tests so dirs with few tests don't render a
@@ -733,6 +742,8 @@ impl Printer {
                 count: *count,
                 indicators: vec![Indicator::Pending; *count],
                 completed: 0,
+                started: None,
+                last: None,
             });
             state.dir_to_slot.insert(dir_path.clone(), i);
         }
@@ -838,6 +849,11 @@ impl Printer {
                     slot.indicators[idx] = indicator;
                 }
                 slot.completed += 1;
+                let now = std::time::Instant::now();
+                if slot.started.is_none() {
+                    slot.started = Some(now.checked_sub(result.elapsed).unwrap_or(now));
+                }
+                slot.last = Some(now);
                 let just_finished = slot.completed >= slot.count;
 
                 if just_finished {
@@ -882,6 +898,10 @@ impl Printer {
             path: slot.dir_path.clone(),
             count: slot.count,
             indicators: slot.indicators.clone(),
+            elapsed: match (slot.started, slot.last) {
+                (Some(s), Some(l)) => Some(l.saturating_duration_since(s)),
+                _ => None,
+            },
         }
     }
 
@@ -1661,6 +1681,10 @@ fn iter_marker(iteration: usize, total_iterations: usize) -> String {
     }
 }
 
+/// Columns reserved after the `N/T` counter for the row's elapsed time
+/// (`"  " + fmt_duration_ms`, whose longest short form is `59m 59s`).
+const SLOT_TIME_WIDTH: usize = 2 + 7;
+
 fn write_slot_row(out: &mut Box<dyn Write + Send>, info: &SlotDrawInfo) {
     let _ = write!(out, "{}", render_slot_row(info));
 }
@@ -1762,6 +1786,9 @@ fn render_slot_row(info: &SlotDrawInfo) -> String {
         .filter(|i| !matches!(i, Indicator::Pending))
         .count();
     let _ = write!(s, "] {DIM}{}/{}{RESET}", completed, info.count);
+    if let Some(d) = info.elapsed {
+        let _ = write!(s, "  {DIM}{}{RESET}", crate::stats::fmt_duration_ms(d.as_millis() as u64));
+    }
     // Failures are routed to the dedicated errors panel below the
     // footer — keeping them off the row prevents the line-wrap that
     // corrupts the cursor-driven redraw.
@@ -2120,6 +2147,7 @@ mod render_tests {
             path: Some("crud".to_string()),
             count,
             indicators,
+            elapsed: None,
         }
     }
 
@@ -2140,6 +2168,16 @@ mod render_tests {
         let info = slot(vec![Pass, Pass, Pass], 3, 10, BarStyle::Auto);
         // 1:1 glyphs (count <= bar_width, Auto), counter shows 3/3 done.
         assert_eq!(rendered(&info), "crud [✓✓✓] 3/3");
+    }
+
+    #[test]
+    fn slot_row_shows_elapsed_once_it_has_one() {
+        let mut info = slot(vec![Indicator::Pass, Indicator::Pending], 2, 10, BarStyle::Auto);
+        assert_eq!(rendered(&info), "crud [✓·] 1/2");
+        info.elapsed = Some(std::time::Duration::from_millis(1_300));
+        assert_eq!(rendered(&info), "crud [✓·] 1/2  1.3s");
+        info.elapsed = Some(std::time::Duration::from_millis(125_000));
+        assert_eq!(rendered(&info), "crud [✓·] 1/2  2m 5s");
     }
 
     #[test]

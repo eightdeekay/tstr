@@ -110,8 +110,10 @@ pub fn run_structural(
     // freshly-constructed scope so cascading is explicit).
     let initial_ambient: ValueMap = cli_overrides.clone();
 
-    let display_root = opts.display_root.clone()
-        .unwrap_or_else(|| index.root.clone());
+    let display_root = effective_display_root(
+        suite,
+        opts.display_root.clone().unwrap_or_else(|| index.root.clone()),
+    );
 
     // Set up the interactive slot display: one slot per immediate child of
     // display_root, sized by its non-const file count. No-op outside
@@ -188,7 +190,10 @@ pub fn run_repeated_concurrent(
     // run's own internal `register_directories` then early-returns (already
     // initialized). No-op outside Interactive mode. Without the ×repeat sizing a
     // slot would "complete" after the first run and later runs would overflow it.
-    let display_root = opts.display_root.clone().unwrap_or_else(|| index.root.clone());
+    let display_root = effective_display_root(
+        suite,
+        opts.display_root.clone().unwrap_or_else(|| index.root.clone()),
+    );
     let scaled: Vec<(String, usize)> = compute_slot_totals(suite, &display_root)
         .into_iter()
         .map(|(dir, count)| (dir, count * repeat))
@@ -207,6 +212,29 @@ pub fn run_repeated_concurrent(
     // regardless of which concurrent run happened to draw last.
     printer.finalize_slots();
     totals
+}
+
+/// The directory the slot display is keyed from: `target`, descended through
+/// any chain of single-child directories below it. Rows should split where
+/// the suite actually branches — `tstr a` with `a/ra/…` and `a/rb/…` rows
+/// `ra` and `rb`, but `tstr a/ra` with only `a/ra/r1/r2/*.test.tstr` under it
+/// would otherwise show a single `r1` bar; descending to the leaf lists each
+/// test instead. Returns `target` unchanged if it isn't a suite directory.
+fn effective_display_root(suite: &Suite, target: std::path::PathBuf) -> std::path::PathBuf {
+    fn find<'a>(dir: &'a Suite, path: &std::path::Path) -> Option<&'a Suite> {
+        if dir.path == path {
+            return Some(dir);
+        }
+        dir.children.values().find_map(|c| find(c, path))
+    }
+    let mut node = match find(suite, &target) {
+        Some(n) => n,
+        None => return target,
+    };
+    while node.children.len() == 1 {
+        node = node.children.values().next().unwrap();
+    }
+    node.path.clone()
 }
 
 /// Count non-const files per display slot (immediate child of `display_root`,
@@ -1275,6 +1303,47 @@ mod tests {
         assert_eq!(slots.get("02 Verify Payment"), Some(&1));
         assert!(!slots.contains_key("(root)"));
         assert_eq!(slots.len(), 2);
+    }
+
+    /// `a/ra/r1/r2/{00,01}` and `a/rb/r3/r4/{00,01}`: from `a` the rows are
+    /// the branch point (`ra`, `rb`); from `a/ra` the single-child chain is
+    /// descended to the leaf, so each test gets its own row.
+    #[test]
+    fn display_root_descends_single_child_chains() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("tstr.yaml"), "constants: {}\n").unwrap();
+        for leaf in ["a/ra/r1/r2", "a/rb/r3/r4"] {
+            let d = root.join(leaf);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("00-xxx.test.tstr"), "--> { 1 == 1 | \"x\"; }\n").unwrap();
+            std::fs::write(d.join("01-yyy.test.tstr"), "--> { 1 == 1 | \"x\"; }\n").unwrap();
+        }
+        let suite = crate::discovery::discover(root).unwrap();
+
+        // `tstr a` — branches at ra/rb, so that's where the rows are.
+        let at_a = effective_display_root(&suite, root.join("a"));
+        assert_eq!(at_a, root.join("a"));
+        let slots = compute_slot_totals(&suite, &at_a);
+        assert_eq!(slots.get("ra"), Some(&2));
+        assert_eq!(slots.get("rb"), Some(&2));
+        assert_eq!(slots.len(), 2, "{slots:?}");
+
+        // The root itself has one child (`a`) — same rule applies.
+        assert_eq!(effective_display_root(&suite, root.to_path_buf()), root.join("a"));
+        // An unknown target is passed through untouched.
+        assert_eq!(effective_display_root(&suite, root.join("nope")), root.join("nope"));
+
+        // `tstr a/ra` — only one path down, so descend to the leaf. (Scoped
+        // discovery, as `run` uses: the `rb` branch isn't in the suite.)
+        let (suite, _) = crate::discovery::discover_lenient_scoped(root, Some(&root.join("a/ra")));
+        let at_ra = effective_display_root(&suite, root.join("a/ra"));
+        assert_eq!(at_ra, root.join("a/ra/r1/r2"));
+        let slots = compute_slot_totals(&suite, &at_ra);
+        assert_eq!(slots.get("00 Xxx"), Some(&1));
+        assert_eq!(slots.get("01 Yyy"), Some(&1));
+        assert_eq!(slots.len(), 2);
+
     }
 
     #[test]

@@ -8,8 +8,25 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
-<a id="v0.13.1"></a>
-## [0.13.1] — 2026-09-16
+<a id="v0.13.2"></a>
+## [0.13.2] — 2026-09-16
+
+No action needed on existing suites. Two interactive-display refinements.
+
+### Added
+- **Progress rows show their elapsed time** after the `done/total` counter —
+  `01 Enroll  [██████████] 10/10  12.4s`. It's wall-clock for the row (first
+  test start to latest completion, including scaffolding in between), so it
+  reads as "how long this group took", and it freezes when the row completes.
+
+### Changed
+- **Rows split where the suite branches.** The slot display keys rows off
+  the target directory descended through any chain of single-child
+  directories. With `a/ra/r1/r2/…` and `a/rb/r3/r4/…`, `tstr run a` still
+  rows `ra` and `rb`; `tstr run a/ra` — which used to show one lonely `r1`
+  bar — now lists each test in the leaf as its own row, the same view you
+  get by targeting the leaf directly.
+
 
 No action needed on existing suites.
 
