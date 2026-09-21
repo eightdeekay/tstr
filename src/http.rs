@@ -347,6 +347,10 @@ pub fn execute_http_call(
     response_meta.insert("version".to_string(), Value::String(version));
     response_meta.insert("format".to_string(), Value::String(format.to_string()));
     response_meta.insert("elapsedMs".to_string(), Value::Number(took_ms));
+    // The unparsed body, always. Sniffing is a heuristic with no ground truth
+    // (content-type is ignored by design), so a test must always be able to
+    // reach what the server actually sent, whatever `r` was parsed into.
+    response_meta.insert("text".to_string(), Value::String(body_text));
     scope.set("_response".to_string(), Value::Object(response_meta));
 
     // Check status if required (after _response is set so the message can
@@ -393,11 +397,12 @@ impl BodyFormat {
 /// SSE → JSON → ndjson → text. Detection is purely body-based; content-type
 /// headers are ignored (services may lie about them).
 fn parse_body(body: &str) -> (Value, BodyFormat) {
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
+    if body.trim().is_empty() {
         return (Value::String(String::new()), BodyFormat::Text);
     }
-    if looks_like_sse(trimmed) {
+    // Sniff the raw body, not a trimmed copy: trimming would strip the
+    // indentation off the first line and turn `  id:` into a field-line.
+    if looks_like_sse(body) {
         return (parse_sse(body), BodyFormat::Sse);
     }
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
@@ -410,16 +415,17 @@ fn parse_body(body: &str) -> (Value, BodyFormat) {
 }
 
 /// True if the body has at least one SSE field-line (`data:`, `event:`, `id:`,
-/// `retry:`) or a comment line (starting with `:`). One match is enough — SSE
-/// streams that don't carry any of these aren't SSE.
+/// `retry:`) or a comment line (`:`) at the start of a line. Per the spec a
+/// field name is read from column zero, so an indented `id:` — a schema
+/// property in a YAML document, a key in a JS object literal — is not one.
+/// One match is enough — SSE streams that don't carry any of these aren't SSE.
 fn looks_like_sse(body: &str) -> bool {
     body.lines().any(|line| {
-        let l = line.trim_start();
-        l.starts_with("data:")
-            || l.starts_with("event:")
-            || l.starts_with("id:")
-            || l.starts_with("retry:")
-            || l.starts_with(":")
+        line.starts_with("data:")
+            || line.starts_with("event:")
+            || line.starts_with("id:")
+            || line.starts_with("retry:")
+            || line.starts_with(":")
     })
 }
 
@@ -776,6 +782,25 @@ mod tests {
                 assert_eq!(e.get("id"), Some(&Value::String("42".to_string())));
             } else { panic!(); }
         } else { panic!(); }
+    }
+
+    #[test]
+    fn parse_body_indented_id_is_not_sse() {
+        // An SSE field name is read from column zero; an indented `id:` is a
+        // YAML/JS key, not a field-line. This OpenAPI fragment used to sniff
+        // as SSE via trim_start().
+        let body = "components:\n  schemas:\n    Thing:\n      properties:\n        id:\n";
+        let (v, f) = parse_body(body);
+        assert_eq!(f, BodyFormat::Text);
+        assert_eq!(v, Value::String(body.to_string()));
+    }
+
+    #[test]
+    fn parse_body_leading_whitespace_does_not_unindent_first_line() {
+        // parse_body must sniff the raw body: a whole-body trim() would strip
+        // the indentation off line one and turn `  id: x` into a field-line.
+        let (_, f) = parse_body("  id: 1\n  name: x\n");
+        assert_eq!(f, BodyFormat::Text);
     }
 
     #[test]

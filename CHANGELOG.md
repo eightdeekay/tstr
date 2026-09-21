@@ -8,6 +8,30 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.13.3"></a>
+## [0.13.3] — 2026-09-21
+
+No action needed on existing suites. A body-sniffing fix and a new
+`_response.text` field.
+
+### Fixed
+- **An indented `id:` / `data:` / `event:` / `retry:` no longer makes a body
+  sniff as SSE.** The detector was trimming leading whitespace off each line
+  before looking for a field name, so any YAML document with an `id:` property
+  (an OpenAPI spec, say) or a JS object literal with an `id:` key came back as
+  `_response.format == "sse"` with `r` an array of junk events. Per the SSE
+  spec a field name is read from column zero; the detector now reads it the
+  same way. Only bodies with *indented* field-lines change classification, and
+  those were never SSE.
+
+### Added
+- **`_response.text`** — the raw body exactly as the server sent it, set on
+  every response alongside `.code`, `.headers`, `.version`, `.format` and
+  `.elapsedMs`. Sniffing is a heuristic with no ground truth (content-type is
+  ignored by design), so a test can now go straight to the wire when it
+  matters — `_response.text ~? /x-scalar-edit-key/ | "…"` — instead of
+  depending on what `r` was parsed into. Purely additive; `r` is unchanged.
+
 <a id="v0.13.2"></a>
 ## [0.13.2] — 2026-09-16
 
@@ -27,6 +51,8 @@ No action needed on existing suites. Two interactive-display refinements.
   bar — now lists each test in the leaf as its own row, the same view you
   get by targeting the leaf directly.
 
+<a id="v0.13.1"></a>
+## [0.13.1] — 2026-09-16
 
 No action needed on existing suites.
 
@@ -41,6 +67,8 @@ No action needed on existing suites.
   Note that any test already using this form has been asserting against
   `null`; after upgrading it does real work, so a hidden failure may surface.
 
+<a id="v0.13.0"></a>
+## [0.13.0] — 2026-09-16
 
 No action needed on existing suites. Every run now records its per-request
 timings next to its run log, so `--timings` is gone; runs can be named; and

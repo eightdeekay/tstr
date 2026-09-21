@@ -510,7 +510,7 @@ String escapes are `\n`, `\r`, `\t`, `\\`, `\"`. **Anything else is passed throu
 
 **Status patterns:** `200`, `2xx`, `200-204`, `>=200`, `<500`.
 
-**Response object** — `r` holds the parsed body; `_response` holds HTTP metadata (`.code`, `.headers`, `.version`, `.format`, `.elapsedMs`).
+**Response object** — `r` holds the parsed body; `_response` holds HTTP metadata (`.code`, `.headers`, `.version`, `.format`, `.elapsedMs`) plus `.text`, the raw unparsed body.
 
 `_response.elapsedMs` is the wall-clock for the call, from sending the request through reading the whole body, in milliseconds (one decimal). It lets a test assert an SLO directly, not just a status:
 
@@ -525,13 +525,23 @@ Body parsing is determined by **sniffing the body itself**, not by trusting `Con
 
 | `_response.format` | When | `r` shape |
 |---|---|---|
-| `"sse"` | body has SSE field-lines (`data:`, `event:`, `id:`, `retry:`, or `:` comments) | array of event objects |
+| `"sse"` | body has SSE field-lines (`data:`, `event:`, `id:`, `retry:`, or `:` comments) at column zero | array of event objects |
 | `"json"` | body parses as a single JSON value | parsed JSON |
 | `"ndjson"` | every non-empty line parses as JSON, ≥2 lines | array of parsed objects |
 | `"text"` | none of the above | raw string |
 
 ```
 _response.format == "ndjson" | "expected stream";
+```
+
+Sniffing is a heuristic — it has no ground truth to check against, and it can
+guess wrong on an unusual body (a large minified JS bundle, say). `_response.text`
+is always the body exactly as the server sent it, whatever `r` was parsed into,
+so a test can go straight to the wire:
+
+```
+r = req.get("/bundle.js") ? 200 | "bundle missing";
+_response.text ~? /x-scalar-edit-key/ | "bundle does not carry the editing feature";
 ```
 
 ## Retry / Polling
