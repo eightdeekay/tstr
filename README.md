@@ -168,6 +168,28 @@ constants:
 Across layers, scalar settings replace and `import` appends (so a user config adds
 to the project's search path rather than replacing it).
 
+**Includes.** Any layer can pull in more config files with `include:`. Each included
+file merges *immediately after the file that includes it*, so it overrides that file
+(and everything before it), while later layers still override it:
+
+```yaml
+# ./tstr.yaml
+include:
+  - local-db.yaml     # one file
+  - conf.d            # a directory: every *.yaml / *.yml in it, by name
+  - "local/*.yaml"    # a glob (in the filename only)
+```
+
+- Relative entries resolve against the including file's directory; `~/` expands.
+- **An entry that matches nothing is skipped, not an error.** This means an
+  include only takes effect while its file exists. A script can drop `local-db.yaml` in
+  place to point the suite at a different database, and delete it to switch back.
+- Files matched by a directory or glob merge in sorted filename order, so a
+  numeric prefix (`10-db.yaml`, `20-kafka.yaml`) sets their order.
+- Included files may include further files. A file that is reached twice
+  merges only once.
+- `!secret` paths in an included file resolve against *that* file's directory.
+
 **Constants deep-merge.** When two layers define the same object constant, their
 keys union and the later layer wins only on the fields it actually sets. This lets
 a user config and a project config co-own one object — the developer supplies the
@@ -195,7 +217,8 @@ anyone means.
 
 Note the precedence direction: the project layer loads *after* the user layer, so
 it wins on any field it sets. A developer can **add** fields the project omits, but
-can't override one the project defines. Use `--set` or `--config` for that.
+can't override one the project defines. Use `--set`, `--config`, or a file the
+project `include:`s for that.
 
 ### Interpolation Inside `tstr.yaml`
 

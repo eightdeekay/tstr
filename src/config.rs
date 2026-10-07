@@ -5,6 +5,7 @@
 //! - `<suite-root>/tstr.yaml` — project local (presence marks suite root)
 //! - `--config <path>` — CLI override
 //! - Loaded in order; later overrides earlier. Repeatable lists append, scalars replace.
+//! - Any layer may `include:` more files; each merges right after its includer.
 
 use std::collections::HashMap;
 use std::fs;
@@ -39,6 +40,13 @@ pub struct Config {
     /// after each run). Defaults to 10; `0` disables pruning (keep everything).
     #[serde(default)]
     pub log_retention: Option<usize>,
+    /// Further config files merged right after this one (so they override it).
+    /// Each entry is a file, a directory (its `*.yaml` / `*.yml` files), or a
+    /// filename glob (`conf/*.yaml`). Relative entries resolve against this
+    /// file's directory. Entries that match nothing are skipped — an include
+    /// applies only while its file exists. Consumed at load; never merged.
+    #[serde(default)]
+    pub include: Vec<String>,
 }
 
 /// Default number of per-run log files kept under `<root>/logs/`.
@@ -74,23 +82,27 @@ impl Config {
         // from clobbering camelCase yaml constants (and vice versa).
         config.constants = env_constants();
 
+        // Canonical paths merged so far, so a file reached twice (two
+        // overlapping includes, or an include cycle) merges only once.
+        let mut loaded = Vec::new();
+
         if let Some(home) = std::env::var_os("HOME") {
             let user_path = PathBuf::from(home).join(".config/tstr/config.yaml");
             if user_path.is_file() {
-                config.merge(Config::load_from_path(&user_path)?);
+                config.merge_file(&user_path, &mut loaded)?;
             }
         }
 
         if let Some(root) = suite_root {
             let project_path = root.join("tstr.yaml");
             if project_path.is_file() {
-                config.merge(Config::load_from_path(&project_path)?);
+                config.merge_file(&project_path, &mut loaded)?;
             }
         }
 
         if let Some(cli_path) = cli_override {
             // --config errors loudly if its path is bad — user asked for it explicitly.
-            config.merge(Config::load_from_path(cli_path)?);
+            config.merge_file(cli_path, &mut loaded)?;
         }
 
         // `!secret` tags were already resolved per-layer in `load_from_path`,
@@ -104,6 +116,28 @@ impl Config {
         resolve_constant_refs(&mut config.constants)?;
 
         Ok(config)
+    }
+
+    /// Load `path`, merge it into `self`, then merge each of its `include`
+    /// entries in order — after the includer, so an included file overrides it.
+    fn merge_file(&mut self, path: &Path, loaded: &mut Vec<PathBuf>) -> Result<(), String> {
+        let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if loaded.contains(&canonical) {
+            return Ok(());
+        }
+        loaded.push(canonical);
+
+        let mut layer = Config::load_from_path(path)?;
+        let includes = std::mem::take(&mut layer.include);
+        self.merge(layer);
+        for entry in &includes {
+            for file in expand_include(entry, path.parent())
+                .map_err(|e| format!("{}: include `{}`: {}", path.display(), entry, e))?
+            {
+                self.merge_file(&file, loaded)?;
+            }
+        }
+        Ok(())
     }
 
     /// Merge `other` into `self`. Scalar fields: `other` wins when present.
@@ -182,6 +216,58 @@ pub(crate) fn expand_tilde(path: &str) -> PathBuf {
         },
         None => PathBuf::from(path),
     }
+}
+
+/// Expand one `include:` entry to the config files it names, in merge order.
+///
+/// `~/` expands against `$HOME`; a relative entry resolves against `base_dir`
+/// (the including file's directory). Then:
+/// - a directory → its `*.yaml` / `*.yml` files, sorted by name;
+/// - a final component containing `*` or `?` → the matching files in its
+///   (literal) parent directory, sorted by name;
+/// - anything else → that one file.
+///
+/// Matching nothing is not an error — that's what makes an include
+/// conditional on a file existing.
+fn expand_include(entry: &str, base_dir: Option<&Path>) -> Result<Vec<PathBuf>, String> {
+    let expanded = expand_tilde(entry);
+    let path = match base_dir {
+        Some(dir) if expanded.is_relative() => dir.join(expanded),
+        _ => expanded,
+    };
+
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    // `None` pattern = a directory include: take every yaml file in it.
+    let (dir, pattern) = if path.is_dir() {
+        (path.clone(), None)
+    } else if name.contains(['*', '?']) {
+        let re = format!(
+            "^{}$",
+            regex::escape(name).replace(r"\*", ".*").replace(r"\?", "."),
+        );
+        let re = regex::Regex::new(&re).map_err(|e| e.to_string())?;
+        (path.parent().unwrap_or(Path::new(".")).to_path_buf(), Some(re))
+    } else if path.is_file() {
+        return Ok(vec![path]);
+    } else {
+        return Ok(Vec::new());
+    };
+    let matches = |n: &str| match &pattern {
+        Some(re) => re.is_match(n),
+        None => n.ends_with(".yaml") || n.ends_with(".yml"),
+    };
+
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Ok(Vec::new());
+    };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .filter(|e| e.file_name().to_str().is_some_and(matches))
+        .map(|e| e.path())
+        .collect();
+    files.sort();
+    Ok(files)
 }
 
 /// Resolve a `!secret` path: `~/` expands against `$HOME`, an absolute path is
@@ -811,6 +897,81 @@ constants:
         assert!(found.is_none() || !found.unwrap().starts_with(tmp.path()));
     }
 
+    // --- include ---
+
+    fn load_with_includes(path: &Path) -> Result<Config, String> {
+        let mut cfg = Config::default();
+        cfg.merge_file(path, &mut Vec::new())?;
+        Ok(cfg)
+    }
+
+    fn db_host(cfg: &Config) -> String {
+        let db = cfg.constants.get("db").unwrap();
+        db.get("host").unwrap().as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn include_overrides_includer_and_deep_merges() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("tstr.yaml");
+        fs::write(&root, "include: [local-db.yaml]\nconstants:\n  db:\n    host: remote\n    sslmode: require\n").unwrap();
+        fs::write(tmp.path().join("local-db.yaml"), "constants:\n  db:\n    host: local\n").unwrap();
+        let cfg = load_with_includes(&root).unwrap();
+        assert_eq!(db_host(&cfg), "local");
+        let db = cfg.constants.get("db").unwrap();
+        assert_eq!(db.get("sslmode").unwrap().as_str(), Some("require"));
+    }
+
+    #[test]
+    fn include_of_missing_file_is_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("tstr.yaml");
+        fs::write(&root, "include: [local-db.yaml, conf.d, nope/*.yaml]\nconstants:\n  db:\n    host: remote\n").unwrap();
+        let cfg = load_with_includes(&root).unwrap();
+        assert_eq!(db_host(&cfg), "remote");
+        assert!(cfg.include.is_empty());
+    }
+
+    #[test]
+    fn include_directory_and_glob_merge_in_name_order() {
+        let tmp = TempDir::new().unwrap();
+        let conf = tmp.path().join("conf");
+        fs::create_dir(&conf).unwrap();
+        fs::write(conf.join("20-b.yaml"), "constants:\n  db:\n    host: b\n").unwrap();
+        fs::write(conf.join("10-a.yml"), "constants:\n  db:\n    host: a\n").unwrap();
+        fs::write(conf.join("README.md"), "not yaml: [").unwrap();
+
+        let root = tmp.path().join("tstr.yaml");
+        fs::write(&root, "include: [conf]\n").unwrap();
+        assert_eq!(db_host(&load_with_includes(&root).unwrap()), "b");
+
+        fs::write(&root, "include: [\"conf/*-a.*\"]\n").unwrap();
+        assert_eq!(db_host(&load_with_includes(&root).unwrap()), "a");
+    }
+
+    #[test]
+    fn include_cycle_merges_each_file_once() {
+        let tmp = TempDir::new().unwrap();
+        let a = tmp.path().join("a.yaml");
+        fs::write(&a, "include: [b.yaml]\nimport: [/a]\n").unwrap();
+        fs::write(tmp.path().join("b.yaml"), "include: [a.yaml]\nimport: [/b]\n").unwrap();
+        let cfg = load_with_includes(&a).unwrap();
+        assert_eq!(cfg.import, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
+    }
+
+    #[test]
+    fn included_file_resolves_secrets_against_its_own_dir() {
+        let tmp = TempDir::new().unwrap();
+        let conf = tmp.path().join("conf");
+        fs::create_dir(&conf).unwrap();
+        fs::write(conf.join("pgpass"), "hunter2-long\n").unwrap();
+        fs::write(conf.join("db.yaml"), "constants:\n  pw: !secret pgpass\n").unwrap();
+        let root = tmp.path().join("tstr.yaml");
+        fs::write(&root, "include: [conf]\n").unwrap();
+        let cfg = load_with_includes(&root).unwrap();
+        assert_eq!(cfg.constants.get("pw").unwrap().as_str(), Some("hunter2-long"));
+    }
+
     // --- constant interpolation ---
 
     fn cfg_from_yaml(s: &str) -> Result<Config, String> {
@@ -1018,6 +1179,7 @@ constants:
             threads: Some(4),
             constants: HashMap::new(),
             log_retention: None,
+            include: Vec::new(),
         };
         let b = Config {
             import: vec![PathBuf::from("/b")],
@@ -1025,6 +1187,7 @@ constants:
             threads: Some(16),
             constants: HashMap::new(),
             log_retention: Some(25),
+            include: Vec::new(),
         };
         a.merge(b);
         assert_eq!(a.import, vec![PathBuf::from("/a"), PathBuf::from("/b")]);

@@ -8,6 +8,30 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.13.4"></a>
+## [0.13.4] — 2026-10-07
+
+No action needed on existing suites. Config files can now include other
+config files.
+
+### Added
+- **`include:` in any config layer.** Lists more config files to merge in.
+  An entry can be one file (`local-db.yaml`), a directory (`conf.d` merges
+  its `*.yaml` / `*.yml` files by name), or a filename glob
+  (`"local/*.yaml"`). Relative entries resolve against the including file's
+  directory.
+- **Included files override the file that includes them.** Each one merges
+  right after its includer, using the usual deep merge. So a file that
+  `tstr.yaml` includes can override a value `tstr.yaml` sets, which
+  previously needed `--set` or `--config`.
+- **An entry that matches nothing is skipped, not an error.** An include
+  only applies while its file exists. A script can drop `local-db.yaml` in
+  place to point a suite at a different database, and delete it to switch
+  back.
+- **Includes can nest.** A file reached twice is merged only once, so a
+  cycle can't loop. `!secret` paths resolve against the included file's own
+  directory.
+
 <a id="v0.13.3"></a>
 ## [0.13.3] — 2026-09-21
 
