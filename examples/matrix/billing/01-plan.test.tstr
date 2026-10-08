@@ -1,0 +1,4 @@
+region, months --> {
+  months >= 1 | "months";
+  region == "us" || region == "eu" | "region";
+}

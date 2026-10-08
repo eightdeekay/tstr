@@ -47,6 +47,10 @@ pub struct Config {
     /// applies only while its file exists. Consumed at load; never merged.
     #[serde(default)]
     pub include: Vec<String>,
+    /// How a matrix's entries run: `parallel` (default) or `sequential`.
+    /// `--matrix-sequential` forces sequential for one run.
+    #[serde(default)]
+    pub matrix: Option<String>,
 }
 
 /// Default number of per-run log files kept under `<root>/logs/`.
@@ -154,6 +158,9 @@ impl Config {
         if other.log_retention.is_some() {
             self.log_retention = other.log_retention;
         }
+        if other.matrix.is_some() {
+            self.matrix = other.matrix;
+        }
         for (k, v) in other.constants {
             match self.constants.get_mut(&k) {
                 Some(existing) => merge_constant(existing, v),
@@ -161,6 +168,18 @@ impl Config {
                     self.constants.insert(k, v);
                 }
             }
+        }
+    }
+
+    /// Whether matrix entries run one at a time (`matrix: sequential`).
+    /// Anything other than `parallel`/`sequential` is an error.
+    pub fn matrix_sequential(&self) -> Result<bool, String> {
+        match self.matrix.as_deref() {
+            None | Some("parallel") => Ok(false),
+            Some("sequential") => Ok(true),
+            Some(other) => Err(format!(
+                "matrix: expected `parallel` or `sequential`, got `{}`", other
+            )),
         }
     }
 
@@ -1180,6 +1199,7 @@ constants:
             constants: HashMap::new(),
             log_retention: None,
             include: Vec::new(),
+            matrix: None,
         };
         let b = Config {
             import: vec![PathBuf::from("/b")],
@@ -1188,8 +1208,10 @@ constants:
             constants: HashMap::new(),
             log_retention: Some(25),
             include: Vec::new(),
+            matrix: Some("sequential".to_string()),
         };
         a.merge(b);
+        assert_eq!(a.matrix_sequential(), Ok(true));
         assert_eq!(a.import, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
         assert_eq!(a.display.as_deref(), Some("bars"));
         assert_eq!(a.threads, Some(16), "threads scalar override wins on merge");

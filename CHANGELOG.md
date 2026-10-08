@@ -8,6 +8,48 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.14.0"></a>
+## [0.14.0] — 2026-10-08
+
+⚠️ Action may be needed on suites that already contain a `matrix` statement —
+see [UPGRADING § 0.14.0](UPGRADING.md#v0.14.0). Matrix fan-out works again: a
+`matrix` in a `.const.tstr` runs the rest of its directory once per entry.
+
+### Added
+- **Matrix fan-out.** `matrix sites = [ "Site A": { ... }, ... ];` in a
+  `.const.tstr` runs that directory's setups, subdirectories, tests and
+  cleanups once per entry, with the entry's object added to scope. Each entry
+  starts from its own copy of the scope, so setups run again per entry and
+  exports never cross between entries. Several matrices in one directory run
+  every combination; a matrix in a subdirectory fans out again inside each
+  enclosing entry (`Site A × monthly`).
+- **Entries run concurrently.** `--matrix-sequential`, or `matrix: sequential`
+  in `tstr.yaml`, runs them one at a time.
+- **`tstr run --matrix <LABEL>`** (repeatable) runs only the named entries of
+  the matrix that has them; other matrices run all their entries.
+- **Results carry the entry label** — `01 Token [Site A]` in streamed lines,
+  the run log and the failure list. The live display gets one row per
+  directory and entry (`accounts [Site A]`), and timing stats are kept per
+  entry so one slow site doesn't skew the others.
+
+### Changed
+- **A suite with a `matrix` statement now fans out.** Before, the statement was
+  accepted and ignored, and the directory ran once. (⚠️)
+- **New errors, reported before anything runs** (⚠️): `matrix` inside an `if`
+  or `retry` block or outside a `.const.tstr`; a matrix with no entries or two
+  entries with the same label; two matrices in one directory setting the same
+  variable; an entry setting a variable also given with `--set`/`--url`; and a
+  `--matrix` label that matches no entry. An entry built from a computed value
+  is checked when its directory runs instead: the run fails and that directory
+  is skipped.
+- **`--skip-slow` skips a slow leaf after its consts run**, since the timing
+  key can depend on a matrix entry the consts declare. Consts are loads, so
+  this costs little.
+
+### Fixed
+- **`matrix` inside an `if` silently cut off the rest of that `if` body.** It's
+  now an error.
+
 <a id="v0.13.4"></a>
 ## [0.13.4] — 2026-10-07
 

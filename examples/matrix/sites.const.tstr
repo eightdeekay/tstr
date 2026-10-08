@@ -1,0 +1,8 @@
+--> {
+  // Each entry's object is injected into scope for that site's run.
+  // Try: tstr run examples/matrix --matrix "Site B"
+  matrix sites = [
+    "Site A": { siteId: "a", region: "us" },
+    "Site B": { siteId: "b", region: "eu" },
+  ];
+}

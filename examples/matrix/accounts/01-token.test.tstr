@@ -1,0 +1,3 @@
+siteId, token --> {
+  token == "tok-" + siteId | "token belongs to another site";
+}

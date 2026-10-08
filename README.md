@@ -148,6 +148,8 @@ threads: 16              # worker-thread pool size; --threads/-t overrides.
                          # unset → CPU count. It's a pool size — I/O-bound requests
                          # park a thread, so above core count often raises throughput.
 log_retention: 10        # per-run logs to keep under <root>/logs/ (0 = keep all; default 10)
+matrix: sequential       # run matrix entries one at a time (parallel | sequential;
+                         # default parallel). --matrix-sequential forces it per run.
 
 constants:
   apiVersion: v4
@@ -618,6 +620,55 @@ retry(max: 10, interval: 500ms, timeout: 30s) {
 
 Failures inside a retry report at the failing assertion's own line, annotated
 with the attempt count and elapsed time.
+
+## Matrix Fan-out
+
+A `matrix` statement in a `.const.tstr` runs the rest of its directory once
+per entry: the setups, every subdirectory, the tests and the cleanups. Each
+entry's object is added to scope for its run.
+
+```
+// sites.const.tstr
+--> {
+  matrix sites = [
+    "Site A": { siteId: "a", urlPrefix: "https://a.example.com" },
+    "Site B": { siteId: "b", urlPrefix: "https://b.example.com" },
+  ];
+}
+```
+
+- **Each entry is its own run.** It starts from its own copy of the scope, so
+  setups run again per entry and nothing one entry exports reaches another.
+  Entry variables are applied after the directory's consts, so they override
+  a const of the same name. Consts in the same directory run once, before the
+  fan-out, and don't see entry variables.
+- **Entries run concurrently** by default, like sibling directories. A suite
+  whose entries collide on shared resources can run them one at a time with
+  `--matrix-sequential` or `matrix: sequential` in `tstr.yaml`.
+- **Matrices multiply.** Several matrices in one directory run every
+  combination of their entries. A matrix in a subdirectory fans out again
+  inside each enclosing entry. Runs are labelled `Site A × monthly`.
+- **Results carry the label.** Streamed lines, the run log and the failure list
+  show `01 Token [Site A]`. The live display gets one row per directory and
+  entry (`accounts [Site A]`), and timing stats are kept per entry, so one
+  slow site doesn't skew the others.
+- **`--matrix <LABEL>`** (repeatable) picks entries: `--matrix "Site B"` runs
+  only Site B and leaves other matrices untouched.
+- **If a const fails before the fan-out,** every entry's files are reported as
+  skipped, the same as an ordinary blocked directory.
+
+These are errors, reported before anything runs:
+
+- `matrix` outside a `.const.tstr`, or inside an `if` / `retry` block. It must be
+  a top-level statement so every entry is known up front.
+- A matrix with no entries, or two entries with the same label.
+- An entry that sets a variable also given with `--set` / `--url`. Pick one
+  rather than having one silently win. An entry built from a computed value is
+  checked when it runs instead: the run fails and that directory is skipped.
+- Two matrices in one directory that set the same variable.
+- A `--matrix` label that matches no entry.
+
+See `examples/matrix/` for a runnable suite.
 
 ## Kafka
 
@@ -1098,6 +1149,8 @@ tstr --version
 | `--continue-on-error` | keep running a leaf's remaining tests after one fails. By default a failure halts the rest of *that leaf* (sibling leaves and directories carry on regardless) — see [`blast-radius:`](#blast-radius--skip-downstream-collateral). A file's own `blast-radius:` wins in either mode. |
 | `--repeat <N>` | run the whole suite N times **sequentially** — one pass after another (default `1`). Good for soak / flushing out flaky failures. Totals accumulate; the summary shows `(N iterations x M tests)`. Mutually exclusive with `--stress`. |
 | `--stress <N>` | run the whole suite N times **at once, overlapping** (stress / load). Requires a suite that tolerates concurrent copies of itself (no colliding fixed-name resources). In a terminal, renders one bucketed bar per directory, each spanning that dir's `tests × N` cells and filling as passes complete; piped / off-terminal it's summary-only. |
+| `--matrix <LABEL>` | run only the [matrix](#matrix-fan-out) entry with this label (repeatable). A matrix with a named entry runs just the named ones; a matrix with none named runs all of its entries. A label that matches no entry is an error. |
+| `--matrix-sequential` | run a matrix's entries one after another instead of concurrently (also config `matrix: sequential`). Each entry's own subdirectories still run in parallel. |
 | `--name <NAME>` | write this run's log pair as `logs/NAME.log` + `logs/NAME.ndjson` instead of the numbered `tstr-NNNN` default. Named runs are never pruned by `log_retention`. Aborts before running anything if either file already exists. See [Run Log](#run-log). |
 | `--display auto\|bars` | slot-display style (`bars` forces colored bucketed bar) |
 | `--timeout <SECONDS>` | per-request HTTP timeout (default: `60`). `0` disables the timeout. |
@@ -1284,7 +1337,6 @@ Tracked here for visibility; none are blockers:
   that subdirectory; a non-directory target is an error. There is no name/glob
   filtering and no single-file execution (by design — leaf tests aren't run in
   isolation). `tstr list` still supports a name pattern for searching.
-- **Matrix fan-out** — was DAG-coupled; needs reimplementation for the structural model.
 - **`.const.tstr` integration with `${name}`** — currently const returns flow into ambient scope; strict `${name}`-only access for const files is a follow-up.
 - **Library call caching** — every call re-executes; opt-in memoization will land when the semantics are pinned down.
 - **`--reachable`** for `tstr list --type lib` — call-graph analysis to limit listed libs to those actually invoked.

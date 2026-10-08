@@ -1,0 +1,7 @@
+--> {
+  // A nested matrix multiplies: billing runs Site A × monthly, Site A × annual, ...
+  matrix plans = [
+    "monthly": { months: 1 },
+    "annual": { months: 12 },
+  ];
+}

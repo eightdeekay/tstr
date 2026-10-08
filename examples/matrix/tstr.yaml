@@ -1,0 +1,5 @@
+# Marks this directory as a self-contained tstr suite root.
+# `sites.const.tstr` declares a matrix: everything below it — the setup and
+# both leaves — runs once per site, concurrently (`matrix: sequential` or
+# `--matrix-sequential` runs them one at a time).
+constants: {}

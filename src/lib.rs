@@ -5,6 +5,7 @@ pub mod scheduler;
 pub mod value;
 pub mod eval;
 pub mod http;
+pub mod matrix;
 pub mod runner;
 pub mod output;
 pub mod filter;

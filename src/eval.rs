@@ -1437,11 +1437,20 @@ pub fn exec_statement(stmt: &Statement, scope: &mut Scope) -> Result<StmtResult,
 
         Statement::If { condition, then_body, then_lines, else_body, else_lines } => {
             let cond = eval_expr(condition, scope)?;
-            if cond.is_truthy() {
-                exec_body(then_body, then_lines, scope)
+            let result = if cond.is_truthy() {
+                exec_body(then_body, then_lines, scope)?
             } else {
-                exec_body(else_body, else_lines, scope)
+                exec_body(else_body, else_lines, scope)?
+            };
+            // A matrix's entries must be known before the run starts (the
+            // runner sizes and validates the fan-out from the AST), so it
+            // can't be conditional.
+            if let StmtResult::MatrixDef(def) = &result {
+                return Err(EvalError::new(format!(
+                    "matrix '{}' must be a top-level statement, not inside a block", def.name
+                )));
             }
+            Ok(result)
         }
 
         Statement::HttpCall { target, method, url, request_obj, status_check } => {

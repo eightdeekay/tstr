@@ -119,6 +119,18 @@ pub enum Commands {
         #[arg(long, value_name = "DURATION", num_args = 0..=1,
               require_equals = true, default_missing_value = "10s")]
         skip_slow: Option<String>,
+
+        /// Run only the matrix entry with this label (repeatable). A matrix
+        /// with a named entry runs just the named ones; a matrix with none
+        /// named runs all of its entries.
+        #[arg(long = "matrix", value_name = "LABEL")]
+        matrix: Vec<String>,
+
+        /// Run a matrix's entries one after another instead of concurrently
+        /// (also config `matrix: sequential`). Each entry's own subdirectories
+        /// still run in parallel.
+        #[arg(long)]
+        matrix_sequential: bool,
     },
 
     /// List tests matching a pattern
@@ -167,7 +179,7 @@ pub enum Commands {
 pub fn run(cli: Cli) {
     let config_override = cli.config.clone();
     match cli.command {
-        Commands::Run { target, url, set, continue_on_error, repeat, stress, timeout, connect_timeout, name, verbose, quiet, display, threads, skip_slow } => {
+        Commands::Run { target, url, set, continue_on_error, repeat, stress, timeout, connect_timeout, name, verbose, quiet, display, threads, skip_slow, matrix, matrix_sequential } => {
             crate::http::set_timeout(timeout);
             crate::http::set_connect_timeout(connect_timeout);
             // Note: the rayon pool is sized inside run_command, after config
@@ -180,7 +192,7 @@ pub fn run(cli: Cli) {
                     process::exit(1);
                 })
             });
-            run_command(&target, url, set, continue_on_error, repeat, stress, name.as_deref(), verbose, quiet, display, threads, skip_slow_ms, config_override);
+            run_command(&target, url, set, continue_on_error, repeat, stress, name.as_deref(), verbose, quiet, display, threads, skip_slow_ms, matrix, matrix_sequential, config_override);
         }
         Commands::List { target, ty, flat, disabled } => {
             list_command(&target, &ty, flat, disabled);
@@ -342,6 +354,8 @@ fn run_command(
     display: DisplayMode,
     threads: Option<usize>,
     skip_slow_ms: Option<u64>,
+    matrix_select: Vec<String>,
+    matrix_sequential: bool,
     config_override: Option<PathBuf>,
 ) {
     // Kick the update check off before any work: it gets the length of the run
@@ -460,6 +474,21 @@ fn run_command(
         process::exit(1);
     }
 
+    // Matrix checks: malformed declarations, `--matrix` labels that name no
+    // entry, and entries that set a variable also given via --set/--url.
+    let override_keys: std::collections::HashSet<String> = overrides.keys().cloned().collect();
+    let matrix_errors = crate::matrix::validate(&suite, &root, &matrix_select, &override_keys);
+    if !matrix_errors.is_empty() {
+        for e in &matrix_errors {
+            eprintln!("error: {}", e);
+        }
+        process::exit(1);
+    }
+    let matrix_sequential = matrix_sequential || config.matrix_sequential().unwrap_or_else(|e| {
+        eprintln!("config error: {}", e);
+        process::exit(1);
+    });
+
     // Nothing to run — almost always the wrong directory. Say so and stop
     // before a log pair is opened, so a stray `tstr run` leaves nothing behind
     // and doesn't pass with an all-zero summary.
@@ -530,6 +559,8 @@ fn run_command(
         constants,
         stats: Some(Arc::clone(&stats)),
         skip_slow_ms,
+        matrix_sequential,
+        matrix_select,
     };
 
     let run_start = std::time::Instant::now();

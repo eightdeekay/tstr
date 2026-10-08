@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::Arc;
 
 use crate::eval::FileResult;
 
@@ -145,8 +146,6 @@ pub struct Printer {
     pub bar_style: BarStyle,
     pending_headers: Mutex<Vec<(usize, String)>>,
     interactive: Mutex<InteractiveState>,
-    matrix: Mutex<MatrixDisplayState>,
-    matrix_stop: Arc<AtomicBool>,
     failure_log: Mutex<Option<Box<dyn Write + Send>>>,
     failure_log_path: Mutex<Option<String>>,
     /// `<root>/logs/<stem>.ndjson`, the run log's per-request timings sibling.
@@ -258,61 +257,6 @@ struct Slot {
 }
 
 
-/// Matrix-specific interactive display state.
-struct MatrixDisplayState {
-    rows: Vec<MatrixRow>,
-    /// Column width for label alignment
-    label_width: usize,
-    /// Number of test groups (directories) per combination
-    num_groups: usize,
-    /// Group names for column reference
-    group_names: Vec<String>,
-    /// Number of iteration columns (≥1). 1 = no --repeat; N = --repeat N.
-    num_iters: usize,
-    /// Visual column width of each iter cell (including brackets + padding).
-    iter_col_width: usize,
-    /// Total display lines (header + rows)
-    display_lines: usize,
-    /// Spinner frame counter
-    spinner_frame: usize,
-    initialized: bool,
-}
-
-struct MatrixRow {
-    label: String,
-    total: usize,
-    passed: usize,
-    failed: usize,
-    skipped: usize,
-    /// Per-iteration, per-group progress: `iters[iter_idx][group_idx]`
-    iters: Vec<Vec<GroupProgress>>,
-}
-
-#[derive(Clone)]
-enum GroupProgress {
-    Pending,
-    InProgress { completed: usize, total: usize, has_failure: bool },
-    Done { all_passed: bool },
-}
-
-const SPINNER_CHARS: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-
-impl MatrixDisplayState {
-    fn new() -> Self {
-        MatrixDisplayState {
-            rows: Vec::new(),
-            label_width: 0,
-            num_groups: 0,
-            group_names: Vec::new(),
-            num_iters: 1,
-            iter_col_width: 0,
-            display_lines: 0,
-            spinner_frame: 0,
-            initialized: false,
-        }
-    }
-}
-
 #[derive(Clone)]
 struct SlotDrawInfo {
     slot_idx: usize,
@@ -399,8 +343,6 @@ impl Printer {
             bar_style,
             pending_headers: Mutex::new(Vec::new()),
             interactive: Mutex::new(InteractiveState::new()),
-            matrix: Mutex::new(MatrixDisplayState::new()),
-            matrix_stop: Arc::new(AtomicBool::new(false)),
             failure_log: Mutex::new(None),
             failure_log_path: Mutex::new(None),
             timings_path: Mutex::new(None),
@@ -444,7 +386,6 @@ impl Printer {
     /// silent or their writes will corrupt the cursor-driven redraw.
     fn live_display_active(&self) -> bool {
         self.interactive.lock().map(|s| s.initialized).unwrap_or(false)
-            || self.matrix.lock().map(|s| s.initialized).unwrap_or(false)
     }
 
     /// Open this run's log pair under `<root>/logs/`: `<stem>.log` (the run
@@ -1250,304 +1191,6 @@ impl Printer {
         let mut out = self.out.lock().unwrap();
         let indent = "  ".repeat(depth);
         let _ = writeln!(out, "{}{RED}  ** Halted on error **{RESET}", indent);
-    }
-
-    // --- Matrix display methods ---
-
-    /// Initialize matrix display mode. Called by the runner when matrices are discovered.
-    /// `entries` is a list of (label, test_count) for each combination.
-    /// `groups` is a list of directory names (test groups).
-    /// Enter matrix display mode. Returns `true` if this call initialized the
-    /// display (and the caller owns the spinner lifecycle), `false` if the
-    /// display was already initialized (e.g., pre-setup by cli.rs for --repeat).
-    pub fn enter_matrix_mode(&self, entries: Vec<(String, usize)>, groups: Vec<String>) -> bool {
-        if self.mode != OutputMode::Interactive {
-            return false;
-        }
-
-        let mut state = self.matrix.lock().unwrap();
-        if state.initialized {
-            return false;
-        }
-        let mut out = self.out.lock().unwrap();
-
-        let num_groups = groups.len();
-        let num_iters = state.num_iters.max(1);
-        state.label_width = entries.iter().map(|(l, _)| l.len()).max().unwrap_or(0).max(6) + 2;
-        state.num_groups = num_groups;
-        state.group_names = groups;
-
-        for (label, total) in &entries {
-            state.rows.push(MatrixRow {
-                label: label.clone(),
-                total: *total * num_iters,
-                passed: 0,
-                failed: 0,
-                skipped: 0,
-                iters: vec![vec![GroupProgress::Pending; num_groups]; num_iters],
-            });
-        }
-
-        // header + rows + footer
-        state.display_lines = entries.len() + 2;
-
-        // Column width for each iter cell — max of the cell's visible width
-        // (`[...groups...]`) and its header label width.
-        let cell_visible = num_groups + 2; // brackets + one char per group
-        let label_len = if num_iters > 1 {
-            format!("Iter {}", num_iters).len()
-        } else {
-            "Progress".len()
-        };
-        let col_width = cell_visible.max(label_len);
-        state.iter_col_width = col_width;
-
-        // Print header — each cell left-aligned into col_width, joined by one space.
-        let header_cells: String = if num_iters > 1 {
-            (0..num_iters)
-                .map(|i| format!("{:<cw$}", format!("Iter {}", i + 1), cw = col_width))
-                .collect::<Vec<_>>()
-                .join(" ")
-        } else {
-            format!("{:<cw$}", "Progress", cw = col_width)
-        };
-        let _ = writeln!(out, "{DIM}{:<lw$}  Tests  Pass  Fail  Skip  {}{RESET}",
-            "Matrix", header_cells, lw = state.label_width);
-
-        // Print initial rows
-        for row in &state.rows {
-            self.write_matrix_row(&mut out, row, &state);
-        }
-
-        // Footer
-        let _ = writeln!(out, "");
-        let _ = out.flush();
-
-        state.initialized = true;
-        true
-    }
-
-    /// Set the number of iteration columns before matrix mode is entered.
-    /// Call this from cli.rs when `--repeat N` is used.
-    pub fn set_repeat_iters(&self, n: usize) {
-        let mut state = self.matrix.lock().unwrap();
-        state.num_iters = n.max(1);
-    }
-
-    fn write_matrix_row(&self, out: &mut Box<dyn Write + Send>, row: &MatrixRow, state: &MatrixDisplayState) {
-        let label_color = if row.failed > 0 { RED } else if row.passed == row.total && row.total > 0 { GREEN } else { "" };
-        let reset = if !label_color.is_empty() { RESET } else { "" };
-
-        let _ = write!(out, "{}{:<lw$}{}  {:>5}  {:>4}  {:>4}  {:>4}  ",
-            label_color, row.label, reset,
-            row.total, row.passed, row.failed, row.skipped,
-            lw = state.label_width);
-
-        // Render one bracketed cell per iteration column, each padded to
-        // iter_col_width so it aligns with its header label above.
-        let cell_visible = state.num_groups + 2;
-        let pad = state.iter_col_width.saturating_sub(cell_visible);
-        for (i, iter_groups) in row.iters.iter().enumerate() {
-            if i > 0 { let _ = write!(out, " "); }
-            let _ = write!(out, "[");
-            for g in iter_groups {
-                match g {
-                    GroupProgress::Pending => { let _ = write!(out, "{DIM}·{RESET}"); }
-                    GroupProgress::InProgress { has_failure, .. } => {
-                        let ch = SPINNER_CHARS[state.spinner_frame % SPINNER_CHARS.len()];
-                        if *has_failure {
-                            let _ = write!(out, "{RED}{}{RESET}", ch);
-                        } else {
-                            let _ = write!(out, "{CYAN}{}{RESET}", ch);
-                        }
-                    }
-                    GroupProgress::Done { all_passed: true } => { let _ = write!(out, "{GREEN}✓{RESET}"); }
-                    GroupProgress::Done { all_passed: false } => { let _ = write!(out, "{RED}✗{RESET}"); }
-                }
-            }
-            let _ = write!(out, "]");
-            if pad > 0 { let _ = write!(out, "{}", " ".repeat(pad)); }
-        }
-        let _ = writeln!(out);
-    }
-
-    /// Start the spinner refresh thread. Returns a join handle.
-    pub fn start_matrix_spinner(self: &Arc<Self>) -> std::thread::JoinHandle<()> {
-        let printer = Arc::clone(self);
-        std::thread::spawn(move || {
-            while !printer.matrix_stop.load(Ordering::Relaxed) {
-                std::thread::sleep(std::time::Duration::from_millis(120));
-                if printer.matrix_stop.load(Ordering::Relaxed) {
-                    break;
-                }
-
-                let state = printer.matrix.lock().unwrap();
-                if !state.initialized {
-                    continue;
-                }
-                // Check if any group is still in progress
-                let has_active = state.rows.iter().any(|r|
-                    r.iters.iter().any(|it|
-                        it.iter().any(|g| matches!(g, GroupProgress::InProgress { .. }))
-                    )
-                );
-                if !has_active {
-                    continue;
-                }
-                drop(state);
-
-                printer.redraw_matrix();
-            }
-        })
-    }
-
-    /// Stop the spinner thread.
-    pub fn stop_matrix_spinner(&self) {
-        self.matrix_stop.store(true, Ordering::Relaxed);
-    }
-
-    /// Force a final redraw of the matrix display. Call this after
-    /// `stop_matrix_spinner` to flush any pending row updates that the
-    /// spinner thread may not have picked up.
-    pub fn finalize_matrix(&self) {
-        if self.mode != OutputMode::Interactive { return; }
-        self.redraw_matrix();
-    }
-
-    /// Redraw all matrix rows (called by spinner thread).
-    fn redraw_matrix(&self) {
-        let mut state = self.matrix.lock().unwrap();
-        if !state.initialized { return; }
-
-        state.spinner_frame += 1;
-        let mut out = self.out.lock().unwrap();
-
-        // Move up to first row (skip footer)
-        let rows = state.rows.len();
-        let up = rows + 1; // rows + footer
-        let _ = write!(out, "\x1b[{}A\r", up);
-
-        for row in &state.rows {
-            let _ = write!(out, "\x1b[2K");
-            self.write_matrix_row(&mut out, row, &state);
-        }
-
-        // Redraw footer
-        let _ = write!(out, "\x1b[2K");
-        let _ = writeln!(out, "");
-        let _ = out.flush();
-    }
-
-    /// Update matrix display when a test group starts for a combination.
-    pub fn matrix_group_start(&self, combo_label: &str, iter_index: usize, group_index: usize, test_count: usize) {
-        if self.mode != OutputMode::Interactive { return; }
-
-        let mut state = self.matrix.lock().unwrap();
-        if !state.initialized { return; }
-
-        if let Some(row) = state.rows.iter_mut().find(|r| r.label == combo_label) {
-            if let Some(groups) = row.iters.get_mut(iter_index) {
-                if group_index < groups.len() {
-                    groups[group_index] = GroupProgress::InProgress {
-                        completed: 0,
-                        total: test_count,
-                        has_failure: false,
-                    };
-                }
-            }
-        }
-    }
-
-    /// Look up the group index for a given group key (rel_path of the test file).
-    pub fn matrix_group_index(&self, key: &str) -> Option<usize> {
-        let state = self.matrix.lock().unwrap();
-        state.group_names.iter().position(|n| n == key)
-    }
-
-    /// Update matrix display when a test completes within a group.
-    /// Handles Pending → Done directly when each "group" is a single test
-    /// (the new plan-driven runner doesn't pre-call matrix_group_start).
-    pub fn matrix_test_complete(&self, combo_label: &str, iter_index: usize, group_index: usize, passed: bool) {
-        if self.mode != OutputMode::Interactive { return; }
-
-        let mut state = self.matrix.lock().unwrap();
-        if !state.initialized { return; }
-
-        if let Some(row) = state.rows.iter_mut().find(|r| r.label == combo_label) {
-            if passed {
-                row.passed += 1;
-            } else {
-                row.failed += 1;
-            }
-
-            if let Some(groups) = row.iters.get_mut(iter_index) {
-                if group_index < groups.len() {
-                    match &mut groups[group_index] {
-                        GroupProgress::Pending => {
-                            groups[group_index] = GroupProgress::Done { all_passed: passed };
-                        }
-                        GroupProgress::InProgress { completed, total, has_failure } => {
-                            *completed += 1;
-                            if !passed { *has_failure = true; }
-                            let has_fail = *has_failure;
-                            if *completed >= *total {
-                                groups[group_index] = GroupProgress::Done { all_passed: !has_fail };
-                            }
-                        }
-                        GroupProgress::Done { .. } => {}
-                    }
-                }
-            }
-        }
-    }
-
-    /// Update matrix display when a test is skipped.
-    pub fn matrix_test_skip(&self, combo_label: &str, iter_index: usize, group_index: usize) {
-        if self.mode != OutputMode::Interactive { return; }
-
-        let mut state = self.matrix.lock().unwrap();
-        if !state.initialized { return; }
-
-        if let Some(row) = state.rows.iter_mut().find(|r| r.label == combo_label) {
-            row.skipped += 1;
-
-            if let Some(groups) = row.iters.get_mut(iter_index) {
-                if group_index < groups.len() {
-                    match &mut groups[group_index] {
-                        GroupProgress::Pending => {
-                            groups[group_index] = GroupProgress::Done { all_passed: true };
-                        }
-                        GroupProgress::InProgress { completed, total, has_failure } => {
-                            *completed += 1;
-                            let is_done = *completed >= *total;
-                            let all_ok = !*has_failure;
-                            if is_done {
-                                groups[group_index] = GroupProgress::Done { all_passed: all_ok };
-                            }
-                        }
-                        GroupProgress::Done { .. } => {}
-                    }
-                }
-            }
-        }
-    }
-
-    /// Mark a group as done for a combination (when it had no tests to run).
-    pub fn matrix_group_done(&self, combo_label: &str, iter_index: usize, group_index: usize) {
-        if self.mode != OutputMode::Interactive { return; }
-
-        let mut state = self.matrix.lock().unwrap();
-        if !state.initialized { return; }
-
-        if let Some(row) = state.rows.iter_mut().find(|r| r.label == combo_label) {
-            if let Some(groups) = row.iters.get_mut(iter_index) {
-                if group_index < groups.len() {
-                    if matches!(groups[group_index], GroupProgress::Pending) {
-                        groups[group_index] = GroupProgress::Done { all_passed: true };
-                    }
-                }
-            }
-        }
     }
 
     pub fn summary(&self, _total: usize, _passed: usize, _failed: usize, _skipped: usize, parse_errors: usize) {

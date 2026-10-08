@@ -3,6 +3,43 @@
 Migration steps for releases that need action on existing suites. Each section
 cross-links to the full change list in [CHANGELOG.md](CHANGELOG.md).
 
+<a id="v0.14.0"></a>
+## 0.14.0 — `matrix` fans out again
+
+→ **Full change list:** [CHANGELOG § 0.14.0](CHANGELOG.md#v0.14.0)
+
+No codemod: only suites that already contain a `matrix` statement are
+affected, and every case either fans out as written or fails loudly at
+startup. Find them with:
+
+```
+grep -rln '^\s*matrix ' --include='*.tstr' .
+```
+
+### A matrix now runs once per entry
+
+Before 0.14.0 a `matrix` statement was parsed and then ignored — its
+directory ran once, without any entry's variables. Now everything below it
+runs once per entry, **concurrently**. Check that:
+
+- the tests don't depend on the variables being absent (they now get them);
+- the entries don't collide on shared resources (fixed names, a shared
+  account). If they do, run them one at a time with `matrix: sequential` in
+  `tstr.yaml` or `--matrix-sequential`;
+- your CI expects the larger counts — a 3-entry matrix triples the work below
+  it. `--matrix <LABEL>` narrows a run to particular entries.
+
+### Fix declarations the startup check rejects
+
+| Error | Fix |
+|---|---|
+| `matrix '…' must be a top-level statement` | Move it out of the `if`/`retry`. A matrix can't be conditional; use `--matrix` to pick entries per run. |
+| `matrix '…' is only allowed in a .const.tstr file` | Move it into the directory's `.const.tstr`. |
+| `matrix '…' has no entries` | Remove it, or add entries. |
+| `matrix '…' has two entries labelled '…'` | Rename one; labels key display rows and stats. |
+| `entry '…' sets '…', which is also given on the command line` | Drop the variable from the entry or stop passing it with `--set`/`--url`. |
+| `variable '…' is set by both matrix '…' and matrix '…'` | Keep the variable in one matrix. |
+
 <a id="v0.13.0"></a>
 ## 0.13.0 — Timings always written; `--timings` → `--name`; no-tests is an error
 

@@ -11,6 +11,7 @@ use crate::ast::FileType;
 use crate::config::Config;
 use crate::discovery::{Suite, TestEntry};
 use crate::eval::{self, FileResult};
+use crate::matrix;
 use crate::output::Printer;
 use crate::scheduler::FileIndex;
 use crate::stats::fmt_duration_ms;
@@ -40,6 +41,12 @@ pub struct RunOptions {
     /// `--skip-slow` threshold: leaves whose recorded average exceeds this
     /// many milliseconds are skipped wholesale. None runs everything.
     pub skip_slow_ms: Option<u64>,
+    /// `--matrix-sequential` / config `matrix: sequential`: run a matrix's
+    /// entries one after another instead of concurrently.
+    pub matrix_sequential: bool,
+    /// `--matrix LABEL` selectors (repeatable). A matrix with a named label
+    /// runs only its named entries; one with none named runs them all.
+    pub matrix_select: Vec<String>,
 }
 
 impl Default for RunOptions {
@@ -51,6 +58,8 @@ impl Default for RunOptions {
             constants: Arc::new(ValueMap::new()),
             stats: None,
             skip_slow_ms: None,
+            matrix_sequential: false,
+            matrix_select: Vec::new(),
         }
     }
 }
@@ -118,21 +127,20 @@ pub fn run_structural(
     // Set up the interactive slot display: one slot per immediate child of
     // display_root, sized by its non-const file count. No-op outside
     // Interactive mode (register_directories guards on mode).
-    let dir_totals = compute_slot_totals(suite, &display_root);
+    let dir_totals = compute_slot_totals(suite, &display_root, &opts.matrix_select);
     let summaries: Vec<(String, usize)> = dir_totals.iter()
         .map(|(k, v)| (k.clone(), *v))
         .collect();
     printer.register_directories(summaries);
 
-    totals.merge(run_dir_structural(
-        suite,
-        &initial_ambient,
-        None,
+    let walk = Walk {
         index,
         opts,
         printer,
-        &display_root,
-    ));
+        display_root: &display_root,
+        cli_keys: cli_overrides.keys().cloned().collect(),
+    };
+    totals.merge(run_dir_structural(suite, &initial_ambient, None, None, &walk));
 
     // Race-proof final redraw so the last file's outcome is on screen.
     printer.finalize_slots();
@@ -194,7 +202,7 @@ pub fn run_repeated_concurrent(
         suite,
         opts.display_root.clone().unwrap_or_else(|| index.root.clone()),
     );
-    let scaled: Vec<(String, usize)> = compute_slot_totals(suite, &display_root)
+    let scaled: Vec<(String, usize)> = compute_slot_totals(suite, &display_root, &opts.matrix_select)
         .into_iter()
         .map(|(dir, count)| (dir, count * repeat))
         .collect();
@@ -239,21 +247,34 @@ fn effective_display_root(suite: &Suite, target: std::path::PathBuf) -> std::pat
 
 /// Count non-const files per display slot (immediate child of `display_root`,
 /// or "(root)" for files directly under it). Sizes the slot progress bars.
+/// Under a matrix each run gets its own slot (`api [Site A]`), so the walk
+/// carries the set of runs a directory executes in.
 fn compute_slot_totals(
     suite: &Suite,
     display_root: &std::path::Path,
+    select: &[String],
 ) -> HashMap<String, usize> {
     let mut totals = HashMap::new();
-    collect_slot_totals(suite, display_root, &mut totals);
+    collect_slot_totals(suite, display_root, select, &[None], &mut totals);
     totals
 }
 
 fn collect_slot_totals(
     dir: &Suite,
     display_root: &std::path::Path,
+    select: &[String],
+    outer: &[Option<String>],
     totals: &mut HashMap<String, usize>,
 ) {
     let is_leaf = dir.children.is_empty();
+    let labels = matrix::combo_labels(&matrix::dir_matrices(dir, &dir.path), select);
+    let runs: Vec<Option<String>> = if labels.is_empty() {
+        outer.to_vec()
+    } else {
+        outer.iter()
+            .flat_map(|o| labels.iter().map(move |l| Some(matrix::join(o.as_deref(), l))))
+            .collect()
+    };
     for entry in dir.entries.values() {
         // Consts are loads and libs are callable definitions — neither is a
         // test. Scaffolding (non-leaf setup/cleanup) never claims a slot.
@@ -263,11 +284,13 @@ fn collect_slot_totals(
         {
             continue;
         }
-        let key = slot_key(entry, display_root);
-        *totals.entry(key).or_insert(0) += 1;
+        for run in &runs {
+            let key = with_combo(slot_key(entry, display_root), run.as_deref());
+            *totals.entry(key).or_insert(0) += 1;
+        }
     }
     for child in dir.children.values() {
-        collect_slot_totals(child, display_root, totals);
+        collect_slot_totals(child, display_root, select, &runs, totals);
     }
 }
 
@@ -288,6 +311,26 @@ fn slot_key(entry: &TestEntry, display_root: &std::path::Path) -> String {
     }
 }
 
+/// `key [combo]` — a slot, file name, or stats key qualified by the matrix
+/// run it belongs to; unchanged outside a matrix.
+fn with_combo(key: String, combo: Option<&str>) -> String {
+    match combo {
+        Some(c) => format!("{} [{}]", key, c),
+        None => key,
+    }
+}
+
+/// Per-run context threaded through the directory walk.
+struct Walk<'a> {
+    index: &'a FileIndex,
+    opts: &'a RunOptions,
+    printer: &'a Arc<Printer>,
+    display_root: &'a std::path::Path,
+    /// Variables given on the command line (`--set`/`--url`). A matrix entry
+    /// may not set one of these — which value wins would be a guess.
+    cli_keys: std::collections::HashSet<String>,
+}
+
 /// Recursive walk: each dir builds its scope (parent + this dir's
 /// const + setup), then children run **in parallel**, then this dir's
 /// tests + cleanups. Returns this subtree's accumulated totals.
@@ -306,35 +349,129 @@ fn slot_key(entry: &TestEntry, display_root: &std::path::Path) -> String {
 /// complete cleanly. When set, this dir's const/setup/test/cleanup files are
 /// all skipped (not run) — their inputs were never established, so running
 /// them would just emit a pile of cascading failures.
-// The Phase-3 loop re-arms `blast` at the end of every iteration; on the final
-// pass that write is never read back. That dead store is inherent to the
-// carry-state-forward pattern, not a bug — so we quiet the lint here.
-#[allow(unused_assignments)]
+///
+/// `combo` labels the matrix run this dir executes under (None outside one).
+/// When this dir's consts declare a matrix, phases 2–4 fan out once per entry
+/// — concurrently, or in order under `--matrix-sequential`.
 fn run_dir_structural(
     dir: &Suite,
     parent_ambient: &ValueMap,
     blocked_in: Option<String>,
-    index: &FileIndex,
-    opts: &RunOptions,
-    printer: &Arc<Printer>,
-    display_root: &std::path::Path,
+    combo: Option<&str>,
+    w: &Walk,
+) -> RunTotals {
+    let mut totals = RunTotals::new();
+    let is_leaf = dir.children.is_empty();
+
+    let mut consts: Vec<&TestEntry> = dir.entries.values()
+        .filter(|e| e.file.file_type == FileType::Const)
+        .collect();
+    consts.sort_by_key(lex_key);
+
+    // Phase 1 for this dir: run the consts, accumulating their outputs into
+    // the ambient scope. Sequential — they cascade. If one doesn't complete
+    // cleanly, `blocked` is set: its scope was never published, so every
+    // dependent file (here and in descendants) is skipped instead of run into
+    // a cascade of null-reference failures.
+    let mut dir_ambient = parent_ambient.clone();
+    let mut blocked: Option<String> = blocked_in;
+    let mut consts_clean = true;
+    let mut evaluated: Vec<eval::MatrixDef> = Vec::new();
+
+    for entry in &consts {
+        let mut result = run_or_skip(entry, &dir_ambient, blocked.as_deref(), w.index, w.opts);
+        consts_clean &= is_clean_outcome(&result);
+        if blocked.is_none() && (!result.failures.is_empty() || result.skipped) {
+            blocked = Some(block_reason(&result, entry));
+        }
+        merge_exports_into(&mut dir_ambient, &result.exports);
+        evaluated.append(&mut result.matrices);
+        report_file(entry, result, combo, is_scaffold(entry, is_leaf), w, &mut totals);
+    }
+
+    // Matrix fan-out: the rest of the dir runs once per entry (or combination
+    // of entries), each from its own copy of the scope. Labels come from the
+    // AST so a blocked dir still reports one skipped run per entry and the
+    // display rows line up; the variables come from the evaluated consts.
+    let declared = matrix::dir_matrices(dir, &dir.path);
+    if declared.is_empty() {
+        totals.merge(run_dir_body(dir, dir_ambient, blocked, consts_clean, combo, w));
+        return totals;
+    }
+
+    let runs: Vec<matrix::Combo> = match &blocked {
+        Some(_) => matrix::combo_labels(&declared, &w.opts.matrix_select).into_iter()
+            .map(|label| matrix::Combo { label, vars: ValueMap::new() })
+            .collect(),
+        None => match matrix::combos(&declared, &evaluated, &w.opts.matrix_select, &w.cli_keys) {
+            Ok(runs) => runs,
+            Err(msg) => {
+                // Static validation catches literal entries at startup; this
+                // is the computed-value backstop. It's a failure of the run,
+                // and everything under this dir is skipped with the reason.
+                let msg = format!("{}: {}", rel_path_of(&dir.path, &w.index.root), msg);
+                w.printer.error(&msg, depth_of_path(&dir.path.join("_"), &w.index.root));
+                totals.failed += 1;
+                blocked = Some(msg);
+                matrix::combo_labels(&declared, &w.opts.matrix_select).into_iter()
+                    .map(|label| matrix::Combo { label, vars: ValueMap::new() })
+                    .collect()
+            }
+        },
+    };
+
+    let run_one = |run: &matrix::Combo| {
+        let mut ambient = dir_ambient.clone();
+        merge_exports_into(&mut ambient, &run.vars);
+        let label = matrix::join(combo, &run.label);
+        run_dir_body(dir, ambient, blocked.clone(), consts_clean, Some(&label), w)
+    };
+    let fanned = if w.opts.matrix_sequential {
+        runs.iter().map(run_one).fold(RunTotals::new(), |mut a, b| { a.merge(b); a })
+    } else {
+        use rayon::prelude::*;
+        runs.par_iter().map(run_one).reduce(RunTotals::new, |mut a, b| { a.merge(b); a })
+    };
+    totals.merge(fanned);
+    totals
+}
+
+/// Filename sort key — the lex order every phase runs in.
+fn lex_key(e: &&TestEntry) -> std::ffi::OsString {
+    e.path.file_name().map(|n| n.to_os_string()).unwrap_or_default()
+}
+
+/// Phases 2–4 of a dir — setup, children, tests, cleanup — from `ambient`
+/// (the scope after this dir's consts, plus any matrix entry's variables).
+/// Runs once per dir, or once per matrix run when the dir fans out; `combo`
+/// labels the run (and qualifies its slots and stats key).
+// The Phase-3 loop re-arms `blast` at the end of every iteration; on the final
+// pass that write is never read back. That dead store is inherent to the
+// carry-state-forward pattern, not a bug — so we quiet the lint here.
+#[allow(unused_assignments)]
+fn run_dir_body(
+    dir: &Suite,
+    mut dir_ambient: ValueMap,
+    mut blocked: Option<String>,
+    consts_clean: bool,
+    combo: Option<&str>,
+    w: &Walk,
 ) -> RunTotals {
     use rayon::prelude::*;
 
+    let (index, opts) = (w.index, w.opts);
     let mut totals = RunTotals::new();
     let is_leaf = dir.children.is_empty();
+    let leaf_key = leaf_key(&dir.path, &index.root, combo);
 
     // Leaf timing for the stats ledger. `leaf_clean` tracks whether every file
     // ran to a deterministic outcome — pass, or a disabled/incompatible skip.
     // Failures and anomalous skips (blocked scope, missing inputs, blast
     // collateral) fast-fail or no-op, which would poison the duration sample.
     let leaf_start = std::time::Instant::now();
-    let mut leaf_clean = true;
+    let mut leaf_clean = consts_clean;
 
     // Sort entries into phase buckets, each by filename for lex order.
-    let mut consts: Vec<&TestEntry> = dir.entries.values()
-        .filter(|e| e.file.file_type == FileType::Const)
-        .collect();
     let mut setups: Vec<&TestEntry> = dir.entries.values()
         .filter(|e| e.file.file_type == FileType::Setup)
         .collect();
@@ -348,22 +485,9 @@ fn run_dir_structural(
     // Setup/cleanup are scaffolding and only ever appear in non-leaf dirs (a
     // leaf one is rejected at startup, see cli.rs), so there's no leaf-folding:
     // every dir runs const → setup → (children) → test → cleanup uniformly.
-
-    let lex_key = |e: &&TestEntry| e.path.file_name()
-        .map(|n| n.to_os_string())
-        .unwrap_or_default();
-    consts.sort_by_key(lex_key);
     setups.sort_by_key(lex_key);
     tests.sort_by_key(lex_key);
     cleanups.sort_by_key(lex_key);
-
-    // Phase 1+2 for this dir: run const + setup, accumulating their
-    // outputs into the ambient scope. Sequential — they cascade. If one
-    // doesn't complete cleanly, `blocked` is set: its scope was never
-    // published, so every dependent file (here and in descendants) is
-    // skipped instead of run into a cascade of null-reference failures.
-    let mut dir_ambient = parent_ambient.clone();
-    let mut blocked: Option<String> = blocked_in;
 
     // --skip-slow: a leaf whose recorded average exceeds the threshold is
     // excluded wholesale — every file in it reports SKIP with this reason,
@@ -372,7 +496,7 @@ fn run_dir_structural(
     // instead of "improving" toward zero.
     if is_leaf && blocked.is_none() {
         if let (Some(threshold_ms), Some(stats)) = (opts.skip_slow_ms, &opts.stats) {
-            if let Some(avg_ms) = stats.expected_ms(&leaf_key(&dir.path, &index.root)) {
+            if let Some(avg_ms) = stats.expected_ms(&leaf_key) {
                 if avg_ms > threshold_ms {
                     blocked = Some(format!(
                         "slow: avg {} exceeds --skip-slow {}",
@@ -384,14 +508,15 @@ fn run_dir_structural(
         }
     }
 
-    for entry in consts.iter().chain(setups.iter()) {
+    // Phase 2: setups, cascading into the scope like the consts did.
+    for entry in &setups {
         let result = run_or_skip(entry, &dir_ambient, blocked.as_deref(), index, opts);
         leaf_clean &= is_clean_outcome(&result);
         if blocked.is_none() && (!result.failures.is_empty() || result.skipped) {
             blocked = Some(block_reason(&result, entry));
         }
         merge_exports_into(&mut dir_ambient, &result.exports);
-        report_file(entry, &result, index, display_root, printer, &mut totals, is_scaffold(entry, is_leaf));
+        report_file(entry, result, combo, is_scaffold(entry, is_leaf), w, &mut totals);
     }
 
     // Children read the dir scope immutably and run concurrently. The shared
@@ -408,11 +533,11 @@ fn run_dir_structural(
     let mut children: Vec<&Suite> = dir.children.values().collect();
     if let Some(stats) = &opts.stats {
         children.sort_by_cached_key(|c| {
-            (std::cmp::Reverse(subtree_cost_ms(c, stats, &index.root)), c.path.clone())
+            (std::cmp::Reverse(subtree_cost_ms(c, stats, &index.root, combo)), c.path.clone())
         });
     }
     let child_totals = children.par_iter()
-        .map(|child| run_dir_structural(child, &dir_ambient, blocked.clone(), index, opts, printer, display_root))
+        .map(|child| run_dir_structural(child, &dir_ambient, blocked.clone(), combo, w))
         .reduce(RunTotals::new, |mut a, b| { a.merge(b); a });
     totals.merge(child_totals);
 
@@ -439,7 +564,7 @@ fn run_dir_structural(
                 Some(reason) => {
                     let result = skipped_result(entry, &reason);
                     leaf_clean = false; // collateral skip — timing is void
-                    report_file(entry, &result, index, display_root, printer, &mut totals, is_scaffold(entry, is_leaf));
+                    report_file(entry, result, combo, is_scaffold(entry, is_leaf), w, &mut totals);
                     if active.spent() {
                         blast = None;
                     }
@@ -452,9 +577,9 @@ fn run_dir_structural(
         let result = run_or_skip(entry, &dir_ambient, blocked.as_deref(), index, opts);
         leaf_clean &= is_clean_outcome(&result);
         merge_exports_into(&mut dir_ambient, &result.exports);
-        report_file(entry, &result, index, display_root, printer, &mut totals, is_scaffold(entry, is_leaf));
         // Arm a radius if this test is a culprit (disabled or failed).
         blast = Blast::arm(entry, &result, opts.continue_on_error);
+        report_file(entry, result, combo, is_scaffold(entry, is_leaf), w, &mut totals);
     }
 
     // Phase 4 — cleanups in this dir (sequential, lex order). They see the
@@ -463,7 +588,7 @@ fn run_dir_structural(
     for entry in cleanups {
         let result = run_or_skip(entry, &dir_ambient, blocked.as_deref(), index, opts);
         merge_exports_into(&mut dir_ambient, &result.exports);
-        report_file(entry, &result, index, display_root, printer, &mut totals, is_scaffold(entry, is_leaf));
+        report_file(entry, result, combo, is_scaffold(entry, is_leaf), w, &mut totals);
     }
 
     // Clean leaf run → record its wall-clock in the stats ledger. Scaffolding
@@ -471,10 +596,7 @@ fn run_dir_structural(
     // measured directly), and a leaf of only consts has nothing to time.
     if is_leaf && leaf_clean && totals.total() > 0 {
         if let Some(stats) = &opts.stats {
-            stats.record(
-                &leaf_key(&dir.path, &index.root),
-                leaf_start.elapsed().as_millis() as u64,
-            );
+            stats.record(&leaf_key, leaf_start.elapsed().as_millis() as u64);
         }
     }
 
@@ -489,26 +611,30 @@ fn is_clean_outcome(result: &FileResult) -> bool {
 }
 
 /// Stats-ledger key for a leaf: its path relative to the suite root, or "."
-/// when the root itself is the leaf.
-fn leaf_key(dir: &std::path::Path, root: &std::path::Path) -> String {
+/// when the root itself is the leaf. A matrix run gets its own key
+/// (`api [Site A]`) so one slow site doesn't skew the others' numbers.
+fn leaf_key(dir: &std::path::Path, root: &std::path::Path, combo: Option<&str>) -> String {
     let rel = dir.strip_prefix(root).unwrap_or(dir);
-    if rel.as_os_str().is_empty() {
+    let key = if rel.as_os_str().is_empty() {
         ".".to_string()
     } else {
         rel.to_string_lossy().to_string()
-    }
+    };
+    with_combo(key, combo)
 }
 
 /// Expected wall-clock of a subtree, from the stats ledger: a leaf is its
 /// recorded EWMA (0 when unmeasured); a scaffolding dir is the max over its
 /// children — they run in parallel, so the critical path is what matters.
 /// (Scaffolding's own const/setup files aren't tracked; assumed cheap.)
-fn subtree_cost_ms(dir: &Suite, stats: &crate::stats::StatsBook, root: &std::path::Path) -> u64 {
+/// Under a matrix run, leaves are looked up by their run-qualified key; a
+/// matrix declared further down isn't expanded here (its leaves cost 0).
+fn subtree_cost_ms(dir: &Suite, stats: &crate::stats::StatsBook, root: &std::path::Path, combo: Option<&str>) -> u64 {
     if dir.children.is_empty() {
-        return stats.expected_ms(&leaf_key(&dir.path, root)).unwrap_or(0);
+        return stats.expected_ms(&leaf_key(&dir.path, root, combo)).unwrap_or(0);
     }
     dir.children.values()
-        .map(|c| subtree_cost_ms(c, stats, root))
+        .map(|c| subtree_cost_ms(c, stats, root, combo))
         .max()
         .unwrap_or(0)
 }
@@ -714,23 +840,27 @@ fn is_scaffold(entry: &TestEntry, dir_is_leaf: bool) -> bool {
 /// only passing/skipped scaffolding is invisible.
 fn report_file(
     entry: &TestEntry,
-    result: &eval::FileResult,
-    index: &FileIndex,
-    display_root: &std::path::Path,
-    printer: &Arc<Printer>,
-    totals: &mut RunTotals,
+    mut result: eval::FileResult,
+    combo: Option<&str>,
     scaffold: bool,
+    w: &Walk,
+    totals: &mut RunTotals,
 ) {
-    printer.file_result(
-        result,
-        depth_of_path(&entry.path, &index.root),
-        Some(&rel_path_of(&entry.path, &index.root)),
+    // Inside a matrix run the name carries the run label, so streamed lines,
+    // the log and the failure list all say which entry they belong to.
+    if let Some(c) = combo {
+        result.name = with_combo(std::mem::take(&mut result.name), Some(c));
+    }
+    w.printer.file_result(
+        &result,
+        depth_of_path(&entry.path, &w.index.root),
+        Some(&rel_path_of(&entry.path, &w.index.root)),
         scaffold,
     );
     if !scaffold {
-        printer.record_test(&slot_key(entry, display_root), 0, result);
+        w.printer.record_test(&with_combo(slot_key(entry, w.display_root), combo), 0, &result);
     }
-    totals.record(result);
+    totals.record(&result);
 }
 
 /// Execute one file under structural rules. The file sees:
@@ -1040,10 +1170,10 @@ mod tests {
         stats.record("api/fast", 100);
         stats.record("api/slow", 44_000);
 
-        assert_eq!(subtree_cost_ms(&suite, &stats, root), 44_000);
+        assert_eq!(subtree_cost_ms(&suite, &stats, root, None), 44_000);
         let api = suite.children.get("api").unwrap();
-        assert_eq!(subtree_cost_ms(api, &stats, root), 44_000);
-        assert_eq!(subtree_cost_ms(api.children.get("fast").unwrap(), &stats, root), 100);
+        assert_eq!(subtree_cost_ms(api, &stats, root, None), 44_000);
+        assert_eq!(subtree_cost_ms(api.children.get("fast").unwrap(), &stats, root, None), 100);
     }
 
     /// Run a discovered suite under default options, returning just the totals.
@@ -1276,7 +1406,7 @@ mod tests {
         .unwrap();
 
         let suite = crate::discovery::discover(root).unwrap();
-        let slots = compute_slot_totals(&suite, root);
+        let slots = compute_slot_totals(&suite, root, &[]);
 
         assert_eq!(slots.get("child"), Some(&1), "the leaf test sizes a 'child' slot");
         assert!(!slots.contains_key("(root)"), "non-leaf setup must not create a (root) slot");
@@ -1296,7 +1426,7 @@ mod tests {
         std::fs::write(root.join("02-verify-payment.test.tstr"), "--> { 1 == 1 | \"x\"; }\n").unwrap();
 
         let suite = crate::discovery::discover(root).unwrap();
-        let slots = compute_slot_totals(&suite, root);
+        let slots = compute_slot_totals(&suite, root, &[]);
 
         // One slot per test, labeled by display name — not a single "(root)".
         assert_eq!(slots.get("01 Create Product"), Some(&1));
@@ -1324,7 +1454,7 @@ mod tests {
         // `tstr a` — branches at ra/rb, so that's where the rows are.
         let at_a = effective_display_root(&suite, root.join("a"));
         assert_eq!(at_a, root.join("a"));
-        let slots = compute_slot_totals(&suite, &at_a);
+        let slots = compute_slot_totals(&suite, &at_a, &[]);
         assert_eq!(slots.get("ra"), Some(&2));
         assert_eq!(slots.get("rb"), Some(&2));
         assert_eq!(slots.len(), 2, "{slots:?}");
@@ -1339,7 +1469,7 @@ mod tests {
         let (suite, _) = crate::discovery::discover_lenient_scoped(root, Some(&root.join("a/ra")));
         let at_ra = effective_display_root(&suite, root.join("a/ra"));
         assert_eq!(at_ra, root.join("a/ra/r1/r2"));
-        let slots = compute_slot_totals(&suite, &at_ra);
+        let slots = compute_slot_totals(&suite, &at_ra, &[]);
         assert_eq!(slots.get("00 Xxx"), Some(&1));
         assert_eq!(slots.get("01 Yyy"), Some(&1));
         assert_eq!(slots.len(), 2);
@@ -1368,4 +1498,146 @@ mod tests {
         assert!(!is_scaffold(&c, true));
         assert!(!is_scaffold(&t, true));
     }
+
+    // --- matrix fan-out ---
+
+    const SITES: &str = "--> {\n  matrix sites = [\n    \"A\": { site: \"a\" },\n    \"B\": { site: \"b\" },\n  ];\n}\n";
+
+    /// Root const declares a 2-entry matrix; a setup re-runs per entry and its
+    /// export is built from that entry's variable; the leaf test sees both.
+    fn matrix_suite(root: &std::path::Path) {
+        std::fs::write(root.join("tstr.yaml"), "constants: {}\n").unwrap();
+        std::fs::write(root.join("00-sites.const.tstr"), SITES).unwrap();
+        std::fs::write(root.join("00-login.setup.tstr"),
+            "site --> { token = site + \"-tok\"; export token; }\n").unwrap();
+        std::fs::create_dir(root.join("api")).unwrap();
+        std::fs::write(root.join("api/01-a.test.tstr"),
+            "site, token --> { token == site + \"-tok\" | \"token from another entry\"; }\n").unwrap();
+    }
+
+    fn run_matrix(root: &std::path::Path, opts: &RunOptions, cli: &ValueMap) -> RunTotals {
+        use crate::output::{BarStyle, OutputMode, Printer};
+        let suite = crate::discovery::discover(root).unwrap();
+        let index = crate::scheduler::FileIndex::build(suite.clone(), root.to_path_buf());
+        let printer = Arc::new(Printer::new(OutputMode::Quiet, BarStyle::Auto));
+        run_structural(&suite, &index, cli, opts, &printer)
+    }
+
+    #[test]
+    fn matrix_fans_out_setup_and_tests_per_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        matrix_suite(dir.path());
+        let totals = run_totals_in(dir.path());
+        // (1 setup + 1 test) × 2 entries; the const runs once and isn't counted.
+        assert_eq!((totals.passed, totals.failed, totals.skipped), (4, 0, 0));
+    }
+
+    #[test]
+    fn matrix_sequential_runs_the_same_work() {
+        let dir = tempfile::tempdir().unwrap();
+        matrix_suite(dir.path());
+        let opts = RunOptions { matrix_sequential: true, ..RunOptions::default() };
+        let totals = run_totals_with(dir.path(), &opts);
+        assert_eq!((totals.passed, totals.failed, totals.skipped), (4, 0, 0));
+    }
+
+    #[test]
+    fn matrix_select_runs_only_named_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        matrix_suite(dir.path());
+        let opts = RunOptions { matrix_select: vec!["B".to_string()], ..RunOptions::default() };
+        let totals = run_totals_with(dir.path(), &opts);
+        assert_eq!((totals.passed, totals.failed, totals.skipped), (2, 0, 0));
+    }
+
+    /// A matrix in a nested dir fans out inside each enclosing entry: 2 × 3.
+    #[test]
+    fn nested_matrices_multiply() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("tstr.yaml"), "constants: {}\n").unwrap();
+        std::fs::write(root.join("00-sites.const.tstr"), SITES).unwrap();
+        std::fs::create_dir(root.join("api")).unwrap();
+        std::fs::write(root.join("api/00-envs.const.tstr"),
+            "--> { matrix envs = [ \"dev\": { env: 1 }, \"qa\": { env: 2 }, \"prod\": { env: 3 } ]; }\n").unwrap();
+        std::fs::write(root.join("api/01-a.test.tstr"),
+            "site, env --> { env > 0 | \"env\"; }\n").unwrap();
+        let totals = run_totals_in(root);
+        assert_eq!((totals.passed, totals.failed, totals.skipped), (6, 0, 0));
+    }
+
+    /// A failing const before the matrix blocks the fan-out, but each entry
+    /// still reports its (skipped) run so counts and display rows line up.
+    #[test]
+    fn blocked_matrix_dir_skips_every_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        matrix_suite(root);
+        std::fs::write(root.join("00-boom.const.tstr"), "--> { 1 == 2 | \"boom\"; }\n").unwrap();
+        let totals = run_totals_in(root);
+        assert_eq!((totals.passed, totals.failed, totals.skipped), (0, 0, 4));
+    }
+
+    /// A computed entry that sets a `--set` variable slips past the startup
+    /// check; the runner catches it, fails the run, and skips the fan-out.
+    #[test]
+    fn computed_entry_colliding_with_cli_var_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("tstr.yaml"), "constants: {}\n").unwrap();
+        std::fs::write(root.join("00-sites.const.tstr"),
+            "--> { a = { urlPrefix: \"x\" }; matrix sites = [ \"A\": a ]; }\n").unwrap();
+        std::fs::create_dir(root.join("api")).unwrap();
+        std::fs::write(root.join("api/01-a.test.tstr"), "{ 1 == 1 | \"x\"; }\n").unwrap();
+        let mut cli = ValueMap::new();
+        cli.insert("urlPrefix".to_string(), Value::String("http://h".to_string()));
+        let totals = run_matrix(root, &RunOptions::default(), &cli);
+        assert_eq!((totals.passed, totals.failed, totals.skipped), (0, 1, 1));
+    }
+
+    #[test]
+    fn matrix_slots_are_keyed_per_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        matrix_suite(root);
+        let suite = crate::discovery::discover(root).unwrap();
+        let slots = compute_slot_totals(&suite, root, &[]);
+        assert_eq!(slots.get("api [A]"), Some(&1));
+        assert_eq!(slots.get("api [B]"), Some(&1));
+        assert_eq!(slots.len(), 2, "setup is scaffolding — no slot: {:?}", slots);
+    }
+
+    #[test]
+    fn matrix_stats_record_per_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        matrix_suite(dir.path());
+        let stats = run_with_stats(dir.path());
+        assert!(stats.expected_ms("api [A]").is_some());
+        assert!(stats.expected_ms("api [B]").is_some());
+        assert_eq!(stats.expected_ms("api"), None);
+    }
+
+    #[test]
+    fn matrix_validation_reports_each_problem() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("tstr.yaml"), "constants: {}\n").unwrap();
+        std::fs::write(root.join("00-a.const.tstr"),
+            "--> { matrix sites = [ \"A\": { urlPrefix: 1 }, \"A\": { x: 2 } ]; matrix none = []; }\n").unwrap();
+        std::fs::create_dir(root.join("api")).unwrap();
+        std::fs::write(root.join("api/00-c.const.tstr"),
+            "--> { if (true) { matrix inner = [ \"x\": { y: 1 } ]; } }\n").unwrap();
+        std::fs::write(root.join("api/01-a.test.tstr"),
+            "--> { matrix bad = [ \"x\": { y: 1 } ]; }\n").unwrap();
+        let suite = crate::discovery::discover(root).unwrap();
+        let cli: std::collections::HashSet<String> = ["urlPrefix".to_string()].into_iter().collect();
+        let errors = matrix::validate(&suite, root, &["nope".to_string()], &cli);
+        let all = errors.join("\n");
+        for needle in ["two entries labelled 'A'", "'none' has no entries", "sets 'urlPrefix'",
+                       "'inner' must be a top-level", "'bad' is only allowed in a .const.tstr",
+                       "--matrix 'nope' matches no"] {
+            assert!(all.contains(needle), "missing {:?} in:\n{}", needle, all);
+        }
+    }
+
 }

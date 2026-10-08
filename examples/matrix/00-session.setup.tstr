@@ -1,0 +1,5 @@
+// Runs once per site — each entry gets its own setup and its own exports.
+siteId --> {
+  token = "tok-" + siteId;
+  export token;
+}
