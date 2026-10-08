@@ -949,6 +949,42 @@ fn eval_builtin(name: &str, args: &[Expr], scope: &Scope) -> Result<Value, EvalE
             Ok(Value::Null)
         }
 
+        "cookies" => {
+            // $.cookies(jar, more, ...) -> merged cookie map (later wins,
+            // Max-Age<=0 / empty value deletes). See crate::browser.
+            let maps = args.iter()
+                .map(|a| eval_expr(a, scope))
+                .collect::<Result<Vec<_>, _>>()?;
+            crate::browser::merge_cookies(&maps)
+                .map(Value::Object)
+                .map_err(EvalError::new)
+        }
+
+        "form" => {
+            // $.form(html)              -> first form
+            // $.form(html, index | id)  -> that form (0-based index, or id/name)
+            if args.is_empty() || args.len() > 2 {
+                return Err(EvalError::new("$.form() takes 1 or 2 arguments (html, [index or id])"));
+            }
+            let html = match eval_expr(&args[0], scope)? {
+                Value::String(s) => s,
+                other => return Err(EvalError::new(format!(
+                    "$.form(html) expects a string (e.g. _response.text), got {}", other.type_name()
+                ))),
+            };
+            let pick = match args.get(1).map(|a| eval_expr(a, scope)).transpose()? {
+                None => crate::browser::FormPick::First,
+                Some(Value::Number(n)) if n >= 0.0 && n.fract() == 0.0 => crate::browser::FormPick::Index(n as usize),
+                Some(Value::String(id)) => crate::browser::FormPick::Id(id),
+                Some(other) => return Err(EvalError::new(format!(
+                    "$.form(html, which) expects a 0-based index or an id, got {}", other.to_display_string()
+                ))),
+            };
+            crate::browser::extract_form(&html, &pick)
+                .map(Value::Object)
+                .map_err(|e| EvalError::new(format!("$.form(): {}", e)))
+        }
+
         "hmacSha256" => {
             // $.hmacSha256(key, message)            -> lowercase hex digest
             // $.hmacSha256(key, message, encoding)  -> "hex" (default) or "base64"

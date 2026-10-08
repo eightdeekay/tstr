@@ -8,6 +8,39 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.14.1"></a>
+## [0.14.1] — 2026-10-08
+
+No action needed on existing suites. A test can now act as a browser: see
+redirects instead of following them, read and send cookies, and read and
+submit HTML forms. That's enough to drive an OAuth/OIDC login (authorization
+code with `response_mode=form_post`) step by step and assert on each hop.
+
+### Added
+- **`req.follow = false`** stops redirects being followed, so the test sees
+  the 3xx, its `Location` header and the cookies it sets. The default stays
+  `true`.
+- **`_response.cookies`** parses every `Set-Cookie` header into
+  `name → { value, path, domain, maxAge, expires, sameSite, secure, httpOnly }`.
+- **`req.cookies = { name: value }`** sends a `Cookie` header. Entries can be
+  plain values or parsed cookies, so a response's cookies can be passed
+  straight back.
+- **`$.cookies(jar, more, …)`** merges cookie maps: later entries win, and an
+  empty value or `Max-Age<=0` deletes. Cookies stay plain values, with no jar
+  object and no domain matching.
+- **`$.form(html[, idOrIndex])`** reads an HTML form into
+  `{ action, method, fields }`, with entities decoded and only the inputs a
+  browser would submit.
+- **`req.form = { … }`** sends a URL-encoded body and sets `content-type`
+  unless `headers` does. Using it with `req.body` is an error.
+- **`_response.url`** — the URL the response came from (the last hop when
+  redirects were followed).
+
+### Fixed
+- **A header sent more than once kept only its last value** in
+  `_response.headers`. All values are now kept, joined with `, `, or with a
+  newline for `set-cookie` (its `Expires` dates contain commas).
+
 <a id="v0.14.0"></a>
 ## [0.14.0] — 2026-10-08
 

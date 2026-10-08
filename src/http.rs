@@ -5,19 +5,29 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reqwest::blocking::{Client, Response};
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE, COOKIE, SET_COOKIE};
 use serde_json;
 
 use crate::ast::*;
 use crate::eval::{self, EvalError, Scope};
 use crate::value::{Value, ValueMap};
 
-/// Process-wide HTTP clients, keyed by target host. One client per host so each
+/// Process-wide HTTP clients, keyed by target host. One entry per host so each
 /// can carry that host's pinned DNS answer (see `client_for`); hosts we don't
-/// pin share `FALLBACK_CLIENT`. Built lazily on first use; timeouts must be
+/// pin share the fallback clients. Built lazily on first use; timeouts must be
 /// configured before the first request.
-static CLIENTS: OnceLock<Mutex<HashMap<String, Arc<Client>>>> = OnceLock::new();
-static FALLBACK_CLIENT: OnceLock<Arc<Client>> = OnceLock::new();
+///
+/// The redirect policy is a client setting in reqwest, so each host has up to
+/// two clients — following (the default) and not (`req.follow = false`) —
+/// built from the same pinned addresses. Index with `follow as usize`.
+static CLIENTS: OnceLock<Mutex<HashMap<String, PinnedHost>>> = OnceLock::new();
+static FALLBACK_CLIENTS: [OnceLock<Arc<Client>>; 2] = [OnceLock::new(), OnceLock::new()];
+
+/// One host's DNS answer and the clients built on it, by redirect policy.
+struct PinnedHost {
+    addrs: Vec<SocketAddr>,
+    clients: [Option<Arc<Client>>; 2],
+}
 static TIMEOUT_SECS: OnceLock<u64> = OnceLock::new();
 static CONNECT_TIMEOUT_SECS: OnceLock<u64> = OnceLock::new();
 
@@ -103,8 +113,10 @@ pub fn set_connect_timeout(secs: u64) {
     let _ = CONNECT_TIMEOUT_SECS.set(secs);
 }
 
-/// The settings every client shares, whatever its DNS pinning.
-fn base_builder() -> reqwest::blocking::ClientBuilder {
+/// The settings every client shares, whatever its DNS pinning. `follow`
+/// picks the redirect policy: reqwest's default (up to 10 hops) or none, so a
+/// test can see a 302 itself.
+fn base_builder(follow: bool) -> reqwest::blocking::ClientBuilder {
     let secs = *TIMEOUT_SECS.get_or_init(|| 60);
     let connect_secs = *CONNECT_TIMEOUT_SECS.get_or_init(|| 10);
     // Do not reuse idle keep-alive connections. Services reached through the
@@ -116,6 +128,9 @@ fn base_builder() -> reqwest::blocking::ClientBuilder {
     // connection per request makes the reuse race structurally impossible —
     // correctness over throughput for a test runner.
     let mut builder = Client::builder().pool_max_idle_per_host(0);
+    if !follow {
+        builder = builder.redirect(reqwest::redirect::Policy::none());
+    }
     if secs > 0 {
         builder = builder.timeout(Duration::from_secs(secs));
     }
@@ -127,9 +142,9 @@ fn base_builder() -> reqwest::blocking::ClientBuilder {
 }
 
 /// Client for hosts we deliberately don't pin (IP literals, unparseable URLs).
-fn fallback_client() -> Arc<Client> {
-    Arc::clone(FALLBACK_CLIENT.get_or_init(|| {
-        Arc::new(base_builder().build().expect("failed to build HTTP client"))
+fn fallback_client(follow: bool) -> Arc<Client> {
+    Arc::clone(FALLBACK_CLIENTS[follow as usize].get_or_init(|| {
+        Arc::new(base_builder(follow).build().expect("failed to build HTTP client"))
     }))
 }
 
@@ -174,34 +189,38 @@ fn resolve_host(host: &str) -> Result<Vec<SocketAddr>, String> {
 /// starting at once would fire the same lookup simultaneously, which is the
 /// stampede we're removing. After the first request per host it's a pure cache
 /// hit.
-fn client_for(url: &str) -> Result<Arc<Client>, EvalError> {
+fn client_for(url: &str, follow: bool) -> Result<Arc<Client>, EvalError> {
     let host = match reqwest::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_string)) {
         // An IP literal never reaches the resolver, and a URL we can't parse is
         // reqwest's problem to report with its own error. Neither gets pinned.
         Some(h) if h.parse::<IpAddr>().is_err() => h,
-        _ => return Ok(fallback_client()),
+        _ => return Ok(fallback_client(follow)),
     };
 
     let clients = CLIENTS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = clients.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(c) = guard.get(&host) {
-        return Ok(Arc::clone(c));
+    if !guard.contains_key(&host) {
+        let addrs = resolve_host(&host).map_err(|e| {
+            EvalError::new(format!(
+                "DNS lookup for '{}' failed after {} attempts: {} — the host is unresolvable from here (VPN/tunnel down?), not a slow server",
+                host, DNS_ATTEMPTS, e
+            ))
+        })?;
+        guard.insert(host.clone(), PinnedHost { addrs, clients: [None, None] });
     }
-
-    let addrs = resolve_host(&host).map_err(|e| {
-        EvalError::new(format!(
-            "DNS lookup for '{}' failed after {} attempts: {} — the host is unresolvable from here (VPN/tunnel down?), not a slow server",
-            host, DNS_ATTEMPTS, e
-        ))
-    })?;
-    let client = Arc::new(
-        base_builder()
-            .resolve_to_addrs(&host, &addrs)
-            .build()
-            .expect("failed to build HTTP client"),
-    );
-    guard.insert(host, Arc::clone(&client));
-    Ok(client)
+    // The second policy's client for a host reuses the first one's answer, so
+    // it's still one lookup per host.
+    let pinned = guard.get_mut(&host).expect("inserted above");
+    let slot = &mut pinned.clients[follow as usize];
+    if slot.is_none() {
+        *slot = Some(Arc::new(
+            base_builder(follow)
+                .resolve_to_addrs(&host, &pinned.addrs)
+                .build()
+                .expect("failed to build HTTP client"),
+        ));
+    }
+    Ok(Arc::clone(slot.as_ref().expect("built above")))
 }
 
 /// Execute an HTTP call statement and return the response body as a Value.
@@ -253,8 +272,19 @@ pub fn execute_http_call(
     };
     scope.set_endpoint(format!("{} {}", method_str, full_url));
 
+    // `req.follow = false` sends this request through a client that doesn't
+    // follow redirects, so the test sees the 3xx, its `Location` and the
+    // cookies it sets. Default true: existing suites are unchanged.
+    let follow = match req_val.get_field("follow") {
+        Value::Null => true,
+        Value::Bool(b) => b,
+        other => return Err(EvalError::new(format!(
+            "req.follow must be true or false, got {}", other.to_display_string()
+        ))),
+    };
+
     // Build request
-    let c = client_for(&full_url)?;
+    let c = client_for(&full_url, follow)?;
     let mut builder = match method {
         HttpMethod::Get => c.get(&full_url),
         HttpMethod::Post => c.post(&full_url),
@@ -269,9 +299,8 @@ pub fn execute_http_call(
     // `req = {}` works and reads each field as Null/missing.
     {
         // Headers
-        let headers_val = req_val.get_field("headers");
-        if let Value::Object(headers_map) = headers_val {
-            let mut header_map = HeaderMap::new();
+        let mut header_map = HeaderMap::new();
+        if let Value::Object(headers_map) = req_val.get_field("headers") {
             for (k, v) in &headers_map {
                 if let Ok(name) = HeaderName::from_bytes(k.as_bytes()) {
                     if let Ok(val) = HeaderValue::from_str(&v.to_display_string()) {
@@ -279,13 +308,47 @@ pub fn execute_http_call(
                     }
                 }
             }
-            builder = builder.headers(header_map);
         }
 
-        // Body
+        // Cookies → a `Cookie` header, appended to one set by hand in `headers`.
+        match req_val.get_field("cookies") {
+            Value::Null => {}
+            Value::Object(cookies) if cookies.is_empty() => {}
+            Value::Object(cookies) => {
+                let mut line = crate::browser::cookie_header(&cookies)
+                    .map_err(|e| EvalError::new(format!("req.cookies: {}", e)))?;
+                if let Some(existing) = header_map.get(COOKIE).and_then(|v| v.to_str().ok()) {
+                    line = format!("{}; {}", existing, line);
+                }
+                let val = HeaderValue::from_str(&line).map_err(|_| {
+                    EvalError::new("req.cookies: a cookie value contains characters a header can't carry")
+                })?;
+                header_map.insert(COOKIE, val);
+            }
+            other => return Err(EvalError::new(format!(
+                "req.cookies must be an object of name: value, got {}", other.type_name()
+            ))),
+        }
+
+        // Body — `body` as given, or `form` URL-encoded. Not both.
         let body_val = req_val.get_field("body");
+        let form_val = req_val.get_field("form");
+        match (&body_val, &form_val) {
+            (_, Value::Null) => {}
+            (Value::Null, Value::Object(form)) => {
+                builder = builder.body(form_urlencode(form)?);
+                if !header_map.contains_key(CONTENT_TYPE) {
+                    header_map.insert(CONTENT_TYPE, HeaderValue::from_static("application/x-www-form-urlencoded"));
+                }
+            }
+            (Value::Null, other) => return Err(EvalError::new(format!(
+                "req.form must be an object of name: value, got {}", other.type_name()
+            ))),
+            _ => return Err(EvalError::new("req.body and req.form are both set — use one")),
+        }
+        builder = builder.headers(header_map);
         match body_val {
-            Value::Null => {} // no body
+            Value::Null => {} // no body (or a form body, set above)
             Value::String(s) => {
                 builder = builder.body(s);
             }
@@ -324,6 +387,10 @@ pub fn execute_http_call(
     // Extract response metadata
     let status_code = response.status().as_u16();
     let response_headers = extract_headers(&response);
+    let cookies = crate::browser::parse_set_cookies(
+        response.headers().get_all(SET_COOKIE).iter().filter_map(|v| v.to_str().ok()),
+    );
+    let final_url = response.url().to_string();
     let version = format!("{:?}", response.version());
 
     // Read body and decide format from the body itself (don't trust the
@@ -344,6 +411,10 @@ pub fn execute_http_call(
     let mut response_meta = ValueMap::new();
     response_meta.insert("code".to_string(), Value::Number(status_code as f64));
     response_meta.insert("headers".to_string(), Value::Object(response_headers));
+    response_meta.insert("cookies".to_string(), Value::Object(cookies));
+    // Where the response actually came from: the request URL, or the last hop
+    // when redirects were followed.
+    response_meta.insert("url".to_string(), Value::String(final_url));
     response_meta.insert("version".to_string(), Value::String(version));
     response_meta.insert("format".to_string(), Value::String(format.to_string()));
     response_meta.insert("elapsedMs".to_string(), Value::Number(took_ms));
@@ -585,15 +656,60 @@ pub(crate) fn value_to_json_string(val: &Value) -> String {
     }
 }
 
-/// Extract response headers into a Value::Object.
+/// Extract response headers into a Value::Object. A header sent more than
+/// once is kept whole: values join with `, ` (the HTTP list form), except
+/// `set-cookie`, which joins with a newline — its `Expires` dates contain
+/// commas, so a comma join would be ambiguous. `_response.cookies` has those
+/// parsed.
 fn extract_headers(response: &Response) -> ValueMap {
+    collect_headers(response.headers())
+}
+
+fn collect_headers(headers: &HeaderMap) -> ValueMap {
     let mut map = ValueMap::new();
-    for (name, value) in response.headers() {
-        if let Ok(v) = value.to_str() {
-            map.insert(name.as_str().to_string(), Value::String(v.to_string()));
+    for (name, value) in headers {
+        let Ok(v) = value.to_str() else { continue };
+        let sep = if name == SET_COOKIE { "\n" } else { ", " };
+        match map.get_mut(name.as_str()) {
+            Some(Value::String(existing)) => {
+                existing.push_str(sep);
+                existing.push_str(v);
+            }
+            _ => {
+                map.insert(name.as_str().to_string(), Value::String(v.to_string()));
+            }
         }
     }
     map
+}
+
+/// `req.form` as an `application/x-www-form-urlencoded` body, in map order.
+/// An array value repeats its key (`scope=a&scope=b`).
+fn form_urlencode(form: &ValueMap) -> Result<String, EvalError> {
+    let mut ser = url::form_urlencoded::Serializer::new(String::new());
+    for (k, v) in form {
+        match v {
+            Value::Array(items) => {
+                for item in items {
+                    ser.append_pair(k, &form_scalar(k, item)?);
+                }
+            }
+            other => {
+                ser.append_pair(k, &form_scalar(k, other)?);
+            }
+        }
+    }
+    Ok(ser.finish())
+}
+
+fn form_scalar(key: &str, v: &Value) -> Result<String, EvalError> {
+    match v {
+        Value::Object(_) | Value::Array(_) => Err(EvalError::new(format!(
+            "req.form field '{}' must be a string, number or boolean, got {}", key, v.type_name()
+        ))),
+        Value::Null => Ok(String::new()),
+        other => Ok(other.to_display_string()),
+    }
 }
 
 #[cfg(test)]
@@ -605,22 +721,63 @@ mod tests {
     /// carries the pinned address, so nothing after the first call resolves.
     #[test]
     fn client_for_pins_a_host_and_reuses_it() {
-        let a = client_for("http://localhost:1/one").expect("localhost resolves");
-        let b = client_for("http://localhost:2/two").expect("localhost resolves");
+        let a = client_for("http://localhost:1/one", true).expect("localhost resolves");
+        let b = client_for("http://localhost:2/two", true).expect("localhost resolves");
         assert!(
             Arc::ptr_eq(&a, &b),
             "same host should hand back the same pinned client, not re-resolve"
         );
     }
 
+    /// `req.follow = false` needs a client with a different redirect policy;
+    /// it's a separate client for the same host, cached the same way.
+    #[test]
+    fn redirect_policies_get_separate_cached_clients() {
+        let follow = client_for("http://localhost:1/a", true).expect("localhost resolves");
+        let manual = client_for("http://localhost:1/b", false).expect("localhost resolves");
+        let again = client_for("http://localhost:3/c", false).expect("localhost resolves");
+        assert!(!Arc::ptr_eq(&follow, &manual));
+        assert!(Arc::ptr_eq(&manual, &again));
+        assert!(!Arc::ptr_eq(&fallback_client(true), &fallback_client(false)));
+    }
+
+    /// Repeated headers join instead of the last one winning; set-cookie joins
+    /// on newlines because its Expires dates contain commas.
+    #[test]
+    fn repeated_headers_are_kept() {
+        let mut h = HeaderMap::new();
+        h.append("vary", HeaderValue::from_static("origin"));
+        h.append("vary", HeaderValue::from_static("accept"));
+        h.append(SET_COOKIE, HeaderValue::from_static("a=1; Expires=Wed, 21 Oct 2026 07:28:00 GMT"));
+        h.append(SET_COOKIE, HeaderValue::from_static("b=2"));
+        h.insert("x-one", HeaderValue::from_static("only"));
+        let m = collect_headers(&h);
+        assert_eq!(m.get("vary"), Some(&Value::String("origin, accept".into())));
+        assert_eq!(m.get("set-cookie"), Some(&Value::String("a=1; Expires=Wed, 21 Oct 2026 07:28:00 GMT\nb=2".into())));
+        assert_eq!(m.get("x-one"), Some(&Value::String("only".into())));
+    }
+
+    #[test]
+    fn form_bodies_encode_in_order_and_repeat_arrays() {
+        let mut f = ValueMap::new();
+        f.insert("username".into(), Value::String("doug".into()));
+        f.insert("password".into(), Value::String("p@ss w&rd".into()));
+        f.insert("scope".into(), Value::Array(vec![Value::String("a".into()), Value::String("b".into())]));
+        f.insert("credentialId".into(), Value::Null);
+        assert_eq!(form_urlencode(&f).unwrap(), "username=doug&password=p%40ss+w%26rd&scope=a&scope=b&credentialId=");
+        let mut bad = ValueMap::new();
+        bad.insert("x".into(), Value::Object(ValueMap::new()));
+        assert!(form_urlencode(&bad).is_err());
+    }
+
     /// An IP literal never reaches a resolver, so there is nothing to pin and
     /// it shares the unpinned fallback client.
     #[test]
     fn ip_literals_share_the_fallback_client() {
-        let a = client_for("http://127.0.0.1:8080/x").expect("no lookup needed");
-        let b = client_for("http://127.0.0.1:9090/y").expect("no lookup needed");
+        let a = client_for("http://127.0.0.1:8080/x", true).expect("no lookup needed");
+        let b = client_for("http://127.0.0.1:9090/y", true).expect("no lookup needed");
         assert!(Arc::ptr_eq(&a, &b), "IP literals should share one client");
-        assert!(Arc::ptr_eq(&a, &fallback_client()));
+        assert!(Arc::ptr_eq(&a, &fallback_client(true)));
     }
 
     /// A host that can't be resolved has to say so in those words. It used to
@@ -628,7 +785,7 @@ mod tests {
     /// which read like a slow server rather than a down tunnel.
     #[test]
     fn unresolvable_host_reports_dns_not_a_generic_failure() {
-        let err = client_for("http://no-such-host.invalid/x")
+        let err = client_for("http://no-such-host.invalid/x", true)
             .expect_err("`.invalid` is reserved and never resolves");
         let msg = err.to_string();
         assert!(msg.contains("DNS lookup"), "got: {}", msg);

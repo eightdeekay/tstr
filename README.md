@@ -510,7 +510,7 @@ r = req.get("/v4/groups") ? 2xx | "Failed";
 r = req.post("/v4/groups") ? 201 | "Failed";
 ```
 
-**Request object** must contain the things the call needs. Recognized fields: `urlPrefix`, `headers`, `body`, `query`.
+**Request object** must contain the things the call needs. Recognized fields: `urlPrefix`, `headers`, `body`, `form`, `query`, `cookies`, `follow`. `form`, `cookies` and `follow` are covered in [Cookies, redirects and forms](#cookies-redirects-and-forms).
 
 ```
 req.headers = { "content-type": "application/json", "authorization": "Bearer {{token}}" };
@@ -535,7 +535,13 @@ String escapes are `\n`, `\r`, `\t`, `\\`, `\"`. **Anything else is passed throu
 
 **Status patterns:** `200`, `2xx`, `200-204`, `>=200`, `<500`.
 
-**Response object** — `r` holds the parsed body; `_response` holds HTTP metadata (`.code`, `.headers`, `.version`, `.format`, `.elapsedMs`) plus `.text`, the raw unparsed body.
+**Response object** — `r` holds the parsed body; `_response` holds HTTP metadata (`.code`, `.headers`, `.cookies`, `.url`, `.version`, `.format`, `.elapsedMs`) plus `.text`, the raw unparsed body.
+
+`_response.headers` keeps every value of a header the server sent more than
+once: they join with `, `, except `set-cookie`, which joins with a newline
+(cookie `Expires` dates contain commas). Use `_response.cookies` for cookies
+rather than parsing that string. `_response.url` is the URL the response came
+from: the request URL, or the last hop when redirects were followed.
 
 `_response.elapsedMs` is the wall-clock for the call, from sending the request through reading the whole body, in milliseconds (one decimal). It lets a test assert an SLO directly, not just a status:
 
@@ -568,6 +574,82 @@ so a test can go straight to the wire:
 r = req.get("/bundle.js") ? 200 | "bundle missing";
 _response.text ~? /x-scalar-edit-key/ | "bundle does not carry the editing feature";
 ```
+
+### Cookies, redirects and forms
+
+These let a test act as a browser, for example to drive an OAuth/OIDC login
+step by step and assert on each hop. There is no login command; a suite
+writes the flow itself (typically as a `.lib.tstr`).
+
+**`req.follow = false`** stops redirects being followed, so the test sees the
+3xx, its `Location` header and the cookies it sets. The default is `true`:
+up to 10 hops are followed and only the last response is visible.
+
+```
+req = { urlPrefix: sso, follow: false };
+r = req.get("/auth/{{clientId}}/authorize") ? 302 | "should redirect to the IdP";
+idpUrl = _response.headers.location;
+```
+
+**`_response.cookies`** parses every `Set-Cookie` header into
+`name → { value, path, domain, maxAge, expires, sameSite, secure, httpOnly }`.
+Absent attributes are `null`; `secure` and `httpOnly` are booleans.
+
+```
+state = _response.cookies."layer_login_{{st}}";
+state.sameSite == "None" | "state cookie must be SameSite=None";
+state.secure | "state cookie must be Secure";
+```
+
+**`req.cookies`** sends a `Cookie` header, in map order. Each entry is a
+value, or a parsed cookie object (its `value` is used), so a response's
+cookies can be passed straight back. It's appended to a `cookie` set by hand
+in `headers`.
+
+**`$.cookies(jar, more, …)`** merges cookie maps left to right. Later entries
+win, and an entry with an empty value or `maxAge <= 0` removes the cookie.
+`null` arguments are skipped. Cookies stay plain values: there's no jar
+object and no domain or path matching, so the test decides which cookies go
+to which host. That's deliberate, since a suite may rewrite a public host to a
+direct service URL.
+
+```
+kcJar = $.cookies(null, _response.cookies);
+// ... later, after another response from the same server:
+kcJar = $.cookies(kcJar, _response.cookies);
+```
+
+**`$.form(html)`** reads an HTML form into `{ action, method, fields }`.
+`$.form(html, 1)` picks a form by 0-based index, `$.form(html, "kc-form-login")`
+by `id` (or `name`); without one it reads the first form. `action` has entities
+decoded (`&amp;` → `&`) and is returned as written, so a relative action stays
+relative; it's `""` if absent. `method` is upper-cased, default `GET`. `fields`
+holds the named `<input>`s a browser would submit without a click: submit,
+button, image, reset and file inputs are left out, and a checkbox or radio is
+included only when `checked`. A name that repeats becomes an array. Only
+`<input>` elements are read, not `<select>` or `<textarea>`.
+
+**`req.form = { … }`** sends an `application/x-www-form-urlencoded` body and
+sets `content-type` unless `headers` already does. An array value repeats
+its key. Setting both `form` and `body` is an error.
+
+Put together, the `response_mode=form_post` hops of a login look like this:
+
+```
+page = $.form(_response.text, "kc-form-login");
+fields = page.fields;
+fields.username = "doug";
+fields.password = ${password};
+creds = { follow: false, cookies: kcJar, form: fields };
+r = creds.post(page.action) ? 200 | "login rejected";
+
+back = $.form(_response.text);            // the auto-submitting form_post page
+cb = { follow: false, cookies: ssoJar, form: back.fields };
+r = cb.post(back.action) ? 302 | "callback rejected";
+_response.cookies.layer_account != null | "no account cookie";
+```
+
+`tests/oauth_flow.rs` runs this whole flow against local fake servers.
 
 ## Retry / Polling
 
@@ -1112,7 +1194,13 @@ sig = $.hmacSha256(secret, payload);            // HMAC-SHA256, lowercase hex
 sig = $.hmacSha256(secret, payload, "base64");  // ...or standard base64
 header = $.stripeSign(whsec, body);             // "t=<now>,v1=<hex>"
 header = $.stripeSign(whsec, body, 1700000000); // ...with explicit timestamp
+
+jar = $.cookies(jar, _response.cookies);        // merge cookie maps (later wins, Max-Age<=0 deletes)
+f = $.form(_response.text);                     // first HTML form → { action, method, fields }
+f = $.form(_response.text, "kc-form-login");    // ...by id/name, or by 0-based index
 ```
+
+`$.cookies` and `$.form` are covered in [Cookies, redirects and forms](#cookies-redirects-and-forms).
 
 `$.log()` messages are collected per-test and shown for failures (normal mode) or always (verbose mode).
 

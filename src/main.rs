@@ -7,6 +7,7 @@ mod scheduler;
 mod value;
 mod eval;
 mod http;
+mod browser;
 mod matrix;
 mod runner;
 mod output;
