@@ -1171,7 +1171,33 @@ match = r.items.find({ item --> item.name == "test" });
 active = r.items.filter({ item --> item.active == true });
 ids = r.items.map({ item --> result = item.id; <-- result; });
 r.items.each({ item --> item.id != null | "null id found"; });
+r.items.each({ i, item --> item.position == i | "out of order at {{i}}"; });
 ```
+
+`.find`, `.filter` and `.map` work on arrays. To search or transform an object
+(e.g. a map keyed by id), first turn it into an array. Each of these returns
+the keys in the order they appear in the parsed response:
+
+```
+ids   = g.components.keys();      // ["c1", "c2", ...]
+comps = g.components.values();    // [{...}, {...}, ...]
+pairs = g.components.entries();   // [{ key: "c1", value: {...} }, ...]
+c = g.components.values().find({ c --> c.entityId == entityId });
+```
+
+`.each` works on objects directly. A one-parameter block gets each value; a
+two-parameter block gets the key and the value. On an array, a two-parameter
+block gets the index and the value.
+
+```
+g.components.each({ c --> c.entityId != null | "component missing entityId"; });
+g.components.each({ id, c --> c.id == id | "component {{id}} has the wrong id"; });
+```
+
+A failing `| "message"` assertion inside a `.each`, `.filter`, `.find` or
+`.map` block fails the statement that contains it, just as it would at top
+level. A bare predicate such as `{ item --> item.active }` is not an
+assertion: when it is false, the item just doesn't match.
 
 ### Pipe Operations
 

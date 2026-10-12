@@ -8,6 +8,42 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.14.2"></a>
+## [0.14.2] — 2026-10-12
+
+Objects can now be iterated: `.keys()`, `.values()` and `.entries()` turn an
+object (such as a map keyed by id) into an array that `.find`/`.filter`/`.map`
+can search, and `.each` walks an object directly. Most suites need no action,
+but a `| "message"` inside a `.filter`/`.find` block now fails the test (see
+Changed).
+
+### Added
+- **`.keys()`, `.values()`, `.entries()`** on objects, each returning an array
+  in the parsed response's key order. `.entries()` gives
+  `[{ key, value }, …]`, e.g.
+  `g.components.values().find({ c --> c.entityId == x })`.
+- **`.each` on objects.** `{ v --> … }` gets each value; `{ k, v --> … }` gets
+  the key and value.
+- **Two-parameter `.each` on arrays.** `{ i, v --> … }` gets the index and
+  value.
+
+### Fixed
+- **A failing assertion inside `.each`, `.filter` or `.find` never failed the
+  file.** A `| "message"` inside any of these blocks now fails the statement
+  that contains it, the same as at top level.
+
+### Changed
+- **`|` in a `.filter`/`.find` block is now a real assertion.** It used to
+  decide whether an item matched. Blocks now match on their last bare
+  expression or `return`. A bare predicate such as `{ i --> i.active }` still
+  just means "no match" when it is false.
+- **A failing assertion inside a `.map` block** is now reported as an
+  assertion failure rather than a runtime error, and the rest of the file
+  still runs.
+- **`.map` with a bare-expression block** (`{ i --> i.id }`) now returns the
+  expression's value. Before, it returned `null` and checked the value was
+  truthy.
+
 <a id="v0.14.1"></a>
 ## [0.14.1] — 2026-10-08
 

@@ -245,11 +245,10 @@ fn parse_tstr_block_body(inputs: Vec<String>, input: &mut &str) -> ModalResult<E
         // If we hit `}` right after, it's a predicate block
         if input.starts_with('}') {
             *input = &input[1..];
-            // Wrap the expression as an assertion statement so the evaluator can use it
-            let body = vec![Statement::Assertion {
-                expr: predicate_expr.clone(),
-                message: format!("block predicate failed"),
-            }];
+            // A bare trailing expression is the block's value (see
+            // `call_block`) — not an assertion, so a false predicate just
+            // means "no match".
+            let body = vec![Statement::ExprStatement { expr: predicate_expr }];
             return Ok(Expr::Block { inputs, body, outputs: Vec::new() });
         }
         // Didn't hit `}` — backtrack and try as statements

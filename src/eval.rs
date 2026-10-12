@@ -10,11 +10,21 @@ use crate::value::{Value, ValueMap};
 #[derive(Debug)]
 pub struct EvalError {
     pub message: String,
+    /// True when this error is a failed `|` assertion raised inside a block
+    /// (`.each`/`.filter`/`.find`/`.map` callbacks, standalone blocks).
+    /// `exec_statement` turns it back into an assertion failure of the
+    /// enclosing statement rather than a runtime error.
+    pub assertion: bool,
 }
 
 impl EvalError {
     pub fn new(msg: impl Into<String>) -> Self {
-        EvalError { message: msg.into() }
+        EvalError { message: msg.into(), assertion: false }
+    }
+
+    /// An assertion failure travelling through expression evaluation.
+    pub fn assertion(msg: impl Into<String>) -> Self {
+        EvalError { message: msg.into(), assertion: true }
     }
 }
 
@@ -342,7 +352,7 @@ pub fn eval_expr(expr: &Expr, scope: &Scope) -> Result<Value, EvalError> {
                 match exec_statement(stmt, &mut block_scope)? {
                     StmtResult::Ok => {}
                     StmtResult::AssertionFailed(f) => {
-                        return Err(EvalError::new(f.message));
+                        return Err(EvalError::assertion(f.message));
                     }
                     StmtResult::MatrixDef(_) => {
                         return Err(EvalError::new("matrix statements are only allowed in const files"));
@@ -610,7 +620,7 @@ fn resolve_dotted_path(path: &str, scope: &Scope) -> Result<Value, EvalError> {
     )))
 }
 
-/// Evaluate a method call: .filter(), .find(), .map(), .each()
+/// Evaluate a method call: .filter(), .find(), .map(), .each(), .keys(), .values(), .entries()
 fn eval_method_call(object: &Expr, method: &str, args: &[Expr], scope: &Scope) -> Result<Value, EvalError> {
     let obj = eval_expr(object, scope)?;
 
@@ -645,7 +655,7 @@ fn eval_method_call(object: &Expr, method: &str, args: &[Expr], scope: &Scope) -
             let predicate = expect_block_arg(args, "filter")?;
             let mut result = Vec::new();
             for item in arr {
-                if eval_block_predicate(predicate, item, scope)? {
+                if call_block(predicate, std::slice::from_ref(item), scope)?.is_truthy() {
                     result.push(item.clone());
                 }
             }
@@ -656,7 +666,7 @@ fn eval_method_call(object: &Expr, method: &str, args: &[Expr], scope: &Scope) -
             let arr = expect_array(&obj, "find")?;
             let predicate = expect_block_arg(args, "find")?;
             for item in arr {
-                if eval_block_predicate(predicate, item, scope)? {
+                if call_block(predicate, std::slice::from_ref(item), scope)?.is_truthy() {
                     return Ok(item.clone());
                 }
             }
@@ -668,19 +678,66 @@ fn eval_method_call(object: &Expr, method: &str, args: &[Expr], scope: &Scope) -
             let block = expect_block_arg(args, "map")?;
             let mut result = Vec::new();
             for item in arr {
-                let val = eval_block_transform(block, item, scope)?;
-                result.push(val);
+                result.push(call_block(block, std::slice::from_ref(item), scope)?);
             }
             Ok(Value::Array(result))
         }
 
+        // Arrays: `{ v --> }` or `{ i, v --> }` (index, value).
+        // Objects: `{ v --> }` or `{ k, v --> }` (key, value), in key order.
         "each" => {
-            let arr = expect_array(&obj, "each")?;
             let block = expect_block_arg(args, "each")?;
-            for item in arr {
-                eval_block_predicate(block, item, scope)?;
+            let pairs: Vec<(Value, &Value)> = match &obj {
+                Value::Array(arr) => arr.iter().enumerate()
+                    .map(|(i, v)| (Value::Number(i as f64), v))
+                    .collect(),
+                Value::Object(map) => map.iter()
+                    .map(|(k, v)| (Value::String(k.clone()), v))
+                    .collect(),
+                _ => return Err(EvalError::new(format!(
+                    ".each() requires an array or object, got {}", obj.type_name()
+                ))),
+            };
+            let two_params = match block {
+                Expr::Block { inputs, .. } if inputs.len() > 2 => {
+                    return Err(EvalError::new(format!(
+                        ".each() block takes one or two parameters, got {}", inputs.len()
+                    )));
+                }
+                Expr::Block { inputs, .. } => inputs.len() == 2,
+                _ => false,
+            };
+            for (key, val) in pairs {
+                if two_params {
+                    call_block(block, &[key, val.clone()], scope)?;
+                } else {
+                    call_block(block, std::slice::from_ref(val), scope)?;
+                }
             }
             Ok(Value::Null)
+        }
+
+        "keys" | "values" | "entries" => {
+            if !args.is_empty() {
+                return Err(EvalError::new(format!(".{}() takes no arguments", method)));
+            }
+            let map = match &obj {
+                Value::Object(map) => map,
+                _ => return Err(EvalError::new(format!(
+                    ".{}() requires an object, got {}", method, obj.type_name()
+                ))),
+            };
+            let items = match method {
+                "keys" => map.keys().map(|k| Value::String(k.clone())).collect(),
+                "values" => map.values().cloned().collect(),
+                _ => map.iter().map(|(k, v)| {
+                    let mut entry = ValueMap::new();
+                    entry.insert("key".to_string(), Value::String(k.clone()));
+                    entry.insert("value".to_string(), v.clone());
+                    Value::Object(entry)
+                }).collect(),
+            };
+            Ok(Value::Array(items))
         }
 
         _ => {
@@ -792,91 +849,56 @@ fn expect_block_arg<'a>(args: &'a [Expr], method_name: &str) -> Result<&'a Expr,
     }
 }
 
-/// Evaluate a block as a predicate — returns true/false based on the last expression's truthiness.
-/// For predicate blocks, the body is a single Assertion whose expression is the predicate.
-/// We evaluate the expression but DON'T fail on false — just return the truthiness.
-fn eval_block_predicate(block: &Expr, item: &Value, scope: &Scope) -> Result<bool, EvalError> {
-    match block {
-        Expr::Block { inputs, body, outputs: _ } => {
-            let mut block_scope = scope.clone();
-            if let Some(name) = inputs.first() {
-                block_scope.set(name.clone(), item.clone());
-            }
-
-            let mut last_value = Value::Null;
-            for stmt in body {
-                match stmt {
-                    // In predicate context, assertions are just expressions —
-                    // false means "doesn't match," not "test failed"
-                    crate::ast::Statement::Assertion { expr, .. } => {
-                        last_value = eval_expr(expr, &block_scope)?;
-                    }
-                    _ => {
-                        match exec_statement(stmt, &mut block_scope)? {
-                            StmtResult::Ok => {}
-                            StmtResult::AssertionFailed(_) => {
-                                return Ok(false);
-                            }
-                            StmtResult::MatrixDef(_) => {
-                                return Err(EvalError::new("matrix statements are only allowed in const files"));
-                            }
-                            StmtResult::Return(v) => {
-                                // `return v;` in a predicate block: treat the value's
-                                // truthiness as the predicate result.
-                                return Ok(v.is_truthy());
-                            }
-                        }
-                    }
-                }
-            }
-
-            Ok(last_value.is_truthy())
-        }
-        _ => Err(EvalError::new("expected block")),
+/// Run a callback block (`.filter`/`.find`/`.map`/`.each`, pipe `any`/`all`)
+/// with `args` bound positionally to its inputs, in a child scope.
+///
+/// The block's value is a `return`ed value, else its `<--` outputs, else the
+/// value of a trailing bare expression — which is how the predicate form
+/// `{ item --> item.active }` yields its result. A failing `|` assertion inside
+/// the block is raised as an assertion error, so it fails the enclosing
+/// statement exactly as it would at top level.
+fn call_block(block: &Expr, args: &[Value], scope: &Scope) -> Result<Value, EvalError> {
+    let Expr::Block { inputs, body, outputs } = block else {
+        return Err(EvalError::new("expected block"));
+    };
+    let mut block_scope = scope.clone();
+    for (name, val) in inputs.iter().zip(args) {
+        block_scope.set(name.clone(), val.clone());
     }
-}
 
-/// Evaluate a block as a transform — returns the value of the outputs or last expression.
-fn eval_block_transform(block: &Expr, item: &Value, scope: &Scope) -> Result<Value, EvalError> {
-    match block {
-        Expr::Block { inputs, body, outputs } => {
-            let mut block_scope = scope.clone();
-            if let Some(name) = inputs.first() {
-                block_scope.set(name.clone(), item.clone());
-            }
-
-            for stmt in body {
-                match exec_statement(stmt, &mut block_scope)? {
-                    StmtResult::Ok => {}
-                    StmtResult::AssertionFailed(f) => {
-                        return Err(EvalError::new(f.message));
-                    }
-                    StmtResult::MatrixDef(_) => {
-                        return Err(EvalError::new("matrix statements are only allowed in const files"));
-                    }
-                    StmtResult::Return(v) => {
-                        // `return` inside a block expression terminates the
-                        // block with that value.
-                        return Ok(v);
-                    }
-                }
-            }
-
-            if !outputs.is_empty() {
-                if outputs.len() == 1 {
-                    Ok(block_scope.get(&outputs[0]))
-                } else {
-                    let mut map = ValueMap::new();
-                    for name in outputs {
-                        map.insert(name.clone(), block_scope.get(name));
-                    }
-                    Ok(Value::Object(map))
-                }
-            } else {
-                Ok(Value::Null)
+    let mut last_value = Value::Null;
+    for (i, stmt) in body.iter().enumerate() {
+        if let Statement::ExprStatement { expr } = stmt {
+            if i + 1 == body.len() {
+                last_value = eval_expr(expr, &block_scope)?;
+                continue;
             }
         }
-        _ => Err(EvalError::new("expected block")),
+        match exec_statement(stmt, &mut block_scope)? {
+            StmtResult::Ok => {}
+            StmtResult::AssertionFailed(f) => {
+                return Err(EvalError::assertion(f.message));
+            }
+            StmtResult::MatrixDef(_) => {
+                return Err(EvalError::new("matrix statements are only allowed in const files"));
+            }
+            StmtResult::Return(v) => {
+                // `return` inside a block terminates it with that value.
+                return Ok(v);
+            }
+        }
+    }
+
+    if outputs.len() == 1 {
+        Ok(block_scope.get(&outputs[0]))
+    } else if !outputs.is_empty() {
+        let mut map = ValueMap::new();
+        for name in outputs {
+            map.insert(name.clone(), block_scope.get(name));
+        }
+        Ok(Value::Object(map))
+    } else {
+        Ok(last_value)
     }
 }
 
@@ -1232,7 +1254,7 @@ fn load_file_ref(path: &str, base_dir: Option<&std::path::Path>) -> Result<Value
 /// - A shorthand expression with `.field` referring to current item: `.active == true`
 fn eval_pipe_predicate(predicate: &Expr, item: &Value, scope: &Scope) -> Result<bool, EvalError> {
     match predicate {
-        Expr::Block { .. } => eval_block_predicate(predicate, item, scope),
+        Expr::Block { .. } => Ok(call_block(predicate, std::slice::from_ref(item), scope)?.is_truthy()),
         // For non-block predicates, evaluate with a scope that has a special `.` context
         // Shorthand: `.field` expressions. We need to resolve `.field` against the current item.
         // Simple approach: create a temporary scope with the item accessible
@@ -1431,8 +1453,17 @@ fn exec_body(body: &[Statement], lines: &[usize], scope: &mut Scope) -> Result<S
     Ok(StmtResult::Ok)
 }
 
-/// Execute a single statement, mutating the scope.
+/// Execute a single statement, mutating the scope. An assertion that failed
+/// inside a nested block (e.g. a `.each` callback) surfaces as a failure of
+/// this statement, not a runtime error.
 pub fn exec_statement(stmt: &Statement, scope: &mut Scope) -> Result<StmtResult, EvalError> {
+    match exec_statement_inner(stmt, scope) {
+        Err(e) if e.assertion => Ok(StmtResult::AssertionFailed(AssertionFailure::new(e.message))),
+        other => other,
+    }
+}
+
+fn exec_statement_inner(stmt: &Statement, scope: &mut Scope) -> Result<StmtResult, EvalError> {
     match stmt {
         Statement::Assignment { target, value } => {
             // Guard expressions (expr | "message") return EvalError on null —
@@ -2680,6 +2711,124 @@ mod tests {
         );
         assert!(failures.is_empty());
         assert_eq!(scope.get("result"), Value::Number(2.0));
+    }
+
+    // --- Object iteration ---
+
+    const COMPONENTS: &str = "g = { components: { c1: { entityId: \"a\" }, c2: { entityId: \"b\" } } };";
+
+    #[test]
+    fn test_object_keys_values_entries() {
+        let (scope, failures) = exec(&format!("{} \
+            ks = g.components.keys(); \
+            vs = g.components.values(); \
+            es = g.components.entries(); \
+            hit = g.components.values().find({{ c --> c.entityId == \"b\" }});",
+            COMPONENTS));
+        assert!(failures.is_empty(), "{:?}", failures);
+        assert_eq!(scope.get("ks"), Value::Array(vec![
+            Value::String("c1".to_string()), Value::String("c2".to_string()),
+        ]));
+        let vs = scope.get("vs");
+        assert_eq!(vs.get_index(0).get_field("entityId"), Value::String("a".to_string()));
+        assert_eq!(vs.get_index(1).get_field("entityId"), Value::String("b".to_string()));
+        let es = scope.get("es");
+        assert_eq!(es.get_index(1).get_field("key"), Value::String("c2".to_string()));
+        assert_eq!(es.get_index(1).get_field("value").get_field("entityId"), Value::String("b".to_string()));
+        assert_eq!(scope.get("hit").get_field("entityId"), Value::String("b".to_string()));
+    }
+
+    #[test]
+    fn test_keys_on_array_errors() {
+        let (_, failures) = exec("xs = [1, 2]; ks = xs.keys();");
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].message.contains(".keys() requires an object, got array"), "{}", failures[0].message);
+    }
+
+    #[test]
+    fn test_each_object_one_param() {
+        let (_, failures) = exec(&format!("{} \
+            g.components.each({{ c --> c.entityId != null | \"missing id\"; }});",
+            COMPONENTS));
+        assert!(failures.is_empty(), "{:?}", failures);
+
+        let (_, failures) = exec(&format!("{} \
+            g.components.each({{ c --> c.entityId == \"a\" | \"unexpected {{{{c.entityId}}}}\"; }});",
+            COMPONENTS));
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].message.contains("unexpected b"), "{}", failures[0].message);
+    }
+
+    #[test]
+    fn test_each_object_two_params_asserts() {
+        let (_, failures) = exec(&format!("{} \
+            g.components.each({{ k, v --> k == \"c1\" || v.entityId == \"b\" | \"pair mismatch\"; }});",
+            COMPONENTS));
+        assert!(failures.is_empty(), "{:?}", failures);
+
+        let (_, failures) = exec(&format!("{} \
+            g.components.each({{ k, v --> k == \"c1\" | \"unexpected key {{{{k}}}}\"; }});",
+            COMPONENTS));
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].message.contains("unexpected key c2"), "{}", failures[0].message);
+    }
+
+    #[test]
+    fn test_each_array_one_and_two_params() {
+        let (_, failures) = exec("xs = [10, 20]; xs.each({ x --> x >= 10 | \"too small\"; });");
+        assert!(failures.is_empty(), "{:?}", failures);
+
+        let (_, failures) = exec("xs = [10, 20]; xs.each({ i, x --> x == (i + 1) * 10 | \"index mismatch\"; });");
+        assert!(failures.is_empty(), "{:?}", failures);
+
+        let (_, failures) = exec("xs = [10, 20]; xs.each({ i, x --> i == 0 | \"bad index {{i}}\"; });");
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].message.contains("bad index 1"), "{}", failures[0].message);
+    }
+
+    #[test]
+    fn test_each_rejects_three_params() {
+        let (_, failures) = exec("xs = [1]; xs.each({ a, b, c --> a == a | \"x\"; });");
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].message.contains("one or two parameters"), "{}", failures[0].message);
+    }
+
+    // --- Assertions inside callback blocks ---
+
+    #[test]
+    fn test_assertion_fails_inside_each() {
+        let (scope, failures) = exec(
+            "items = [{ id: 1 }, { id: null }];\nitems.each({ item --> item.id != null | \"null id found\"; });\nafter = 1;"
+        );
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].message.starts_with("line 2:"), "{}", failures[0].message);
+        assert!(failures[0].message.contains("null id found"), "{}", failures[0].message);
+        assert!(!failures[0].message.contains("runtime error"), "{}", failures[0].message);
+        // Like a top-level assertion, it doesn't halt the file.
+        assert_eq!(scope.get("after"), Value::Number(1.0));
+    }
+
+    #[test]
+    fn test_assertion_fails_inside_filter_and_find() {
+        let (_, failures) = exec(
+            "items = [{ id: 1 }, { id: null }]; xs = items.filter({ i --> i.id != null | \"filter saw null\"; i.id; });"
+        );
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].message.contains("filter saw null"), "{}", failures[0].message);
+
+        let (_, failures) = exec(
+            "items = [{ id: null }]; x = items.find({ i --> i.id != null | \"find saw null\"; true; });"
+        );
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].message.contains("find saw null"), "{}", failures[0].message);
+    }
+
+    #[test]
+    fn test_predicate_false_is_not_a_failure() {
+        let (scope, failures) = exec("items = [{ a: 1 }, { a: 2 }]; xs = items.filter({ i --> i.a == 2 }); n = items.find({ i --> i.a == 9 });");
+        assert!(failures.is_empty(), "{:?}", failures);
+        assert_eq!(scope.get("xs").get_index(0).get_field("a"), Value::Number(2.0));
+        assert_eq!(scope.get("n"), Value::Null);
     }
 
     // --- Pipe operations (any/all) ---
