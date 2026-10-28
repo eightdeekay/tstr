@@ -8,6 +8,20 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.14.3"></a>
+## [0.14.3] — 2026-10-28
+
+`tstr run` takes more than one directory, so several leaves or subtrees of the
+same suite run together in one pass.
+
+### Added
+- **Multiple `run` targets.** `tstr run a/x b/y c` scopes the run to each named
+  directory. A setup in an ancestor shared by several targets runs once, and
+  untargeted siblings are skipped as before. Every target must be in the same
+  suite. A target nested inside another is dropped, and naming the suite root
+  runs everything. The interactive display groups rows from the deepest
+  directory containing all the targets.
+
 <a id="v0.14.2"></a>
 ## [0.14.2] — 2026-10-12
 

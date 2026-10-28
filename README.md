@@ -63,6 +63,7 @@ output isn't a terminal, so it won't appear in CI logs. Set
 ```bash
 tstr run                          # run all tests (walks up to find tstr.yaml)
 tstr run notify                   # scope the run to the notify/ subdirectory
+tstr run notify billing/invoices  # scope to several subdirectories in one run
 tstr list                         # per-directory tables
 tstr list --type lib              # libraries instead of tests
 tstr list --disabled              # disabled tests + their reasons
@@ -1247,7 +1248,7 @@ providers' signing schemes, build the header yourself from `$.hmacSha256()`.
 ## CLI
 
 ```
-tstr run [dir]                    # run the suite, or scope to a subdirectory (default: cwd)
+tstr run [dir...]                 # run the suite, or scope to one or more subdirectories (default: cwd)
 tstr list [target]                # per-directory tables of files visible
 tstr clean [dir]                  # remove the logs/ dir + tstr-last-run.* under the suite root
 tstr -c path/to/yaml ...          # explicit config (overrides project tstr.yaml)
@@ -1448,7 +1449,8 @@ last measured value, so it stays recognized as slow on the next
 Tracked here for visibility; none are blockers:
 
 - **`run` scoping is directory-only.** `tstr run path/to/sub` scopes the run to
-  that subdirectory; a non-directory target is an error. There is no name/glob
+  that subdirectory (several may be given, as long as they're in the same suite;
+  shared ancestor setups run once); a non-directory target is an error. There is no name/glob
   filtering and no single-file execution (by design — leaf tests aren't run in
   isolation). `tstr list` still supports a name pattern for searching.
 - **`.const.tstr` integration with `${name}`** — currently const returns flow into ambient scope; strict `${name}`-only access for const files is a follow-up.

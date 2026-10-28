@@ -135,7 +135,7 @@ fn dir_has_tstr_files(dir: &Path) -> bool {
 /// Returns a Suite representing the root directory, or errors if any files fail to parse.
 pub fn discover(root: &Path) -> Result<Suite, Vec<String>> {
     let mut errors = Vec::new();
-    let suite = discover_dir(root, &mut errors, None, false, true);
+    let suite = discover_dir(root, &mut errors, &[], false, true);
 
     if errors.is_empty() {
         Ok(suite)
@@ -151,13 +151,16 @@ pub fn discover(root: &Path) -> Result<Suite, Vec<String>> {
 /// (needed for scope). Sibling directories outside the target are skipped.
 pub fn discover_lenient(root: &Path) -> (Suite, Vec<String>) {
     let mut errors = Vec::new();
-    let suite = discover_dir(root, &mut errors, None, false, true);
+    let suite = discover_dir(root, &mut errors, &[], false, true);
     (suite, errors)
 }
 
-pub fn discover_lenient_scoped(root: &Path, target: Option<&Path>) -> (Suite, Vec<String>) {
+/// `targets` scopes discovery to one or more subtrees (empty = the whole
+/// suite). Ancestors shared by several targets are walked once, so their
+/// const/setup/lib files are kept a single time.
+pub fn discover_lenient_scoped(root: &Path, targets: &[PathBuf]) -> (Suite, Vec<String>) {
     let mut errors = Vec::new();
-    let suite = discover_dir(root, &mut errors, target, false, true);
+    let suite = discover_dir(root, &mut errors, targets, false, true);
     (suite, errors)
 }
 
@@ -216,26 +219,24 @@ fn collect_leaf_setup_cleanup(suite: &Suite, root: &Path, out: &mut Vec<String>)
 /// ancestor chain. Such a subtree isn't *dominated* by the target, but its libs
 /// still resolve into the target's scope (see `FileIndex::visible_libs`), so we
 /// traverse it and keep only its `.lib.tstr` files.
-fn discover_dir(dir: &Path, errors: &mut Vec<String>, target: Option<&Path>, lib_only: bool, is_root: bool) -> Suite {
+fn discover_dir(dir: &Path, errors: &mut Vec<String>, targets: &[PathBuf], lib_only: bool, is_root: bool) -> Suite {
     let mut entries = HashMap::new();
     let mut children = HashMap::new();
 
-    // Determine this directory's relationship to the target:
-    // - in_scope: this dir is the target or inside it → parse everything
-    // - ancestor: this dir is above the target → parse only scope-contributing
+    // Determine this directory's relationship to the targets:
+    // - in_scope: this dir is a target or inside one → parse everything
+    // - ancestor: this dir is above some target → parse only scope-contributing
     //   files (const + setup + lib), skip the ancestor's own tests/cleanups
-    // - outside: sibling branch → skip entirely (shouldn't be called)
-    let (in_scope, is_ancestor) = match target {
-        None => (true, false),
-        Some(t) => {
-            if dir.starts_with(t) || dir == t {
-                (true, false)
-            } else if t.starts_with(dir) {
-                (false, true)
-            } else {
-                (false, false)
-            }
-        }
+    // - outside: sibling branch of every target → skip entirely (shouldn't be called)
+    // Being inside one target wins over being above another.
+    let (in_scope, is_ancestor) = if targets.is_empty() {
+        (true, false)
+    } else if targets.iter().any(|t| dir.starts_with(t)) {
+        (true, false)
+    } else if targets.iter().any(|t| t.starts_with(dir)) {
+        (false, true)
+    } else {
+        (false, false)
     };
 
     // A directory named `lib` (or any subdir within a lib subtree) holds only
@@ -279,8 +280,8 @@ fn discover_dir(dir: &Path, errors: &mut Vec<String>, target: Option<&Path>, lib
                 // Already inside an ancestor lib/ subtree — keep descending
                 // (libs can nest into organizational subdirs), still lib-only.
                 true
-            } else if let Some(t) = target {
-                let dominated = t.starts_with(&path) || path.starts_with(t);
+            } else if !targets.is_empty() {
+                let dominated = targets.iter().any(|t| t.starts_with(&path) || path.starts_with(t));
                 if dominated {
                     false
                 } else if (in_scope || is_ancestor) && dir_name == "lib" {
@@ -297,7 +298,7 @@ fn discover_dir(dir: &Path, errors: &mut Vec<String>, target: Option<&Path>, lib
                 false
             };
 
-            let child_suite = discover_dir(&path, errors, target, child_lib_only, false);
+            let child_suite = discover_dir(&path, errors, targets, child_lib_only, false);
             children.insert(dir_name, child_suite);
         } else if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
             if filename.ends_with(".tstr") {
@@ -584,7 +585,7 @@ mod tests {
         ).unwrap();
 
         let target = root.join("payment");
-        let (suite, errors) = discover_lenient_scoped(root, Some(&target));
+        let (suite, errors) = discover_lenient_scoped(root, &[target.clone()]);
         assert!(errors.is_empty(), "unexpected parse errors: {:?}", errors);
 
         // The ancestor lib must survive scoped discovery...
@@ -627,7 +628,7 @@ mod tests {
         ).unwrap();
 
         let target = root.join("payment");
-        let (suite, _errors) = discover_lenient_scoped(root, Some(&target));
+        let (suite, _errors) = discover_lenient_scoped(root, &[target.clone()]);
 
         let mut libs = Vec::new();
         collect_lib_stems(&suite, &mut libs);
@@ -636,6 +637,31 @@ mod tests {
             "sibling-branch lib was wrongly pulled into leaf scope; found libs: {:?}",
             libs,
         );
+    }
+
+    /// Several targets: each targeted subtree is discovered in full, a shared
+    /// ancestor's setup is kept (once), and untargeted siblings are pruned.
+    #[test]
+    fn scoped_discovery_with_multiple_targets() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+
+        fs::create_dir_all(root.join("a/x")).unwrap();
+        fs::create_dir_all(root.join("b/y")).unwrap();
+        fs::create_dir_all(root.join("c")).unwrap();
+        fs::write(root.join("a/00-seed.setup.tstr"), "--> { export 1 as seed; }\n").unwrap();
+        fs::write(root.join("a/x/01-x.test.tstr"), "--> { true || \"x\"; }\n").unwrap();
+        fs::write(root.join("b/y/01-y.test.tstr"), "--> { true || \"y\"; }\n").unwrap();
+        fs::write(root.join("c/01-c.test.tstr"), "--> { true || \"c\"; }\n").unwrap();
+
+        let targets = [root.join("a/x"), root.join("b/y")];
+        let (suite, errors) = discover_lenient_scoped(root, &targets);
+        assert!(errors.is_empty(), "unexpected parse errors: {:?}", errors);
+
+        assert!(suite.children["a"].children["x"].entries.contains_key("01-x"));
+        assert!(suite.children["a"].entries.contains_key("00-seed"), "ancestor setup dropped");
+        assert!(suite.children["b"].children["y"].entries.contains_key("01-y"));
+        assert!(!suite.children.contains_key("c"), "untargeted sibling was discovered");
     }
 
     /// A `.test.tstr` file inside a `lib/` directory is rejected — lib dirs

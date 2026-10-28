@@ -1466,7 +1466,7 @@ mod tests {
 
         // `tstr a/ra` — only one path down, so descend to the leaf. (Scoped
         // discovery, as `run` uses: the `rb` branch isn't in the suite.)
-        let (suite, _) = crate::discovery::discover_lenient_scoped(root, Some(&root.join("a/ra")));
+        let (suite, _) = crate::discovery::discover_lenient_scoped(root, &[root.join("a/ra")]);
         let at_ra = effective_display_root(&suite, root.join("a/ra"));
         assert_eq!(at_ra, root.join("a/ra/r1/r2"));
         let slots = compute_slot_totals(&suite, &at_ra, &[]);

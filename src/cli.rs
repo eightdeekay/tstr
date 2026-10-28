@@ -45,9 +45,10 @@ impl DisplayMode {
 pub enum Commands {
     /// Run tests
     Run {
-        /// Directory to run — the suite root or a subdirectory (default: current directory)
-        #[arg(default_value = ".")]
-        target: String,
+        /// Directories to run — the suite root or one or more subdirectories
+        /// of the same suite (default: current directory)
+        #[arg(default_value = ".", value_name = "DIR")]
+        targets: Vec<String>,
 
         /// Set default base URL (shorthand for --set 'urlPrefix=<url>')
         #[arg(long = "url")]
@@ -179,7 +180,7 @@ pub enum Commands {
 pub fn run(cli: Cli) {
     let config_override = cli.config.clone();
     match cli.command {
-        Commands::Run { target, url, set, continue_on_error, repeat, stress, timeout, connect_timeout, name, verbose, quiet, display, threads, skip_slow, matrix, matrix_sequential } => {
+        Commands::Run { targets, url, set, continue_on_error, repeat, stress, timeout, connect_timeout, name, verbose, quiet, display, threads, skip_slow, matrix, matrix_sequential } => {
             crate::http::set_timeout(timeout);
             crate::http::set_connect_timeout(connect_timeout);
             // Note: the rayon pool is sized inside run_command, after config
@@ -192,7 +193,7 @@ pub fn run(cli: Cli) {
                     process::exit(1);
                 })
             });
-            run_command(&target, url, set, continue_on_error, repeat, stress, name.as_deref(), verbose, quiet, display, threads, skip_slow_ms, matrix, matrix_sequential, config_override);
+            run_command(&targets, url, set, continue_on_error, repeat, stress, name.as_deref(), verbose, quiet, display, threads, skip_slow_ms, matrix, matrix_sequential, config_override);
         }
         Commands::List { target, ty, flat, disabled } => {
             list_command(&target, &ty, flat, disabled);
@@ -318,7 +319,7 @@ fn resolve_target(target: &str) -> (PathBuf, Option<String>, Option<PathBuf>) {
     }
 }
 
-/// Resolve a `run` target into (suite_root, optional scoped subdir).
+/// Resolve one `run` target into (suite_root, optional scoped subdir).
 ///
 /// `run` takes a **directory** — the suite root, or a subdirectory to scope the
 /// run to. A target that isn't an existing directory is a hard error: there is
@@ -341,8 +342,60 @@ fn resolve_run_target(target: &str) -> Result<(PathBuf, Option<PathBuf>), String
     Ok((root, target_dir))
 }
 
+/// Resolve every `run` target into (suite_root, scoped subdirs). All targets
+/// must belong to the same suite. An empty list means the whole suite — which
+/// is also what a target naming the root itself asks for. Targets nested in
+/// another target are dropped (the outer one already covers them).
+fn resolve_run_targets(targets: &[String]) -> Result<(PathBuf, Vec<PathBuf>), String> {
+    let mut root: Option<PathBuf> = None;
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut whole_suite = false;
+    for t in targets {
+        let (r, dir) = resolve_run_target(t)?;
+        match &root {
+            Some(existing) if *existing != r => {
+                return Err(format!(
+                    "'{}' is in a different suite ({}) than the other targets ({})",
+                    t, r.display(), existing.display()
+                ));
+            }
+            _ => root = Some(r),
+        }
+        match dir {
+            Some(d) => dirs.push(d),
+            None => whole_suite = true,
+        }
+    }
+    let root = root.ok_or_else(|| "no target given".to_string())?;
+    if whole_suite {
+        return Ok((root, Vec::new()));
+    }
+    dirs.sort();
+    dirs.dedup();
+    let outer: Vec<PathBuf> = dirs.iter()
+        .filter(|d| !dirs.iter().any(|o| o != *d && d.starts_with(o)))
+        .cloned()
+        .collect();
+    Ok((root, outer))
+}
+
+/// Deepest directory containing every target — where the slot display is
+/// keyed from. `None` for an unscoped run (the suite root).
+fn common_ancestor(dirs: &[PathBuf]) -> Option<PathBuf> {
+    let (first, rest) = dirs.split_first()?;
+    let mut common = first.clone();
+    for d in rest {
+        while !d.starts_with(&common) {
+            if !common.pop() {
+                break;
+            }
+        }
+    }
+    Some(common)
+}
+
 fn run_command(
-    target: &str,
+    targets: &[String],
     url: Option<String>,
     set_vars: Vec<String>,
     continue_on_error: bool,
@@ -389,9 +442,9 @@ fn run_command(
         }
     }
 
-    // Resolve target into root + optional scoped subdir. A non-directory target
-    // fails fast (no pattern filtering, no whole-suite fallback).
-    let (root, target_dir) = match resolve_run_target(target) {
+    // Resolve targets into root + scoped subdirs. A non-directory target fails
+    // fast (no pattern filtering, no whole-suite fallback).
+    let (root, target_dirs) = match resolve_run_targets(targets) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("error: {}", e);
@@ -421,7 +474,7 @@ fn run_command(
 
     if verbose {
         eprintln!("Suite root: {}", root.display());
-        if let Some(ref d) = target_dir {
+        for d in &target_dirs {
             eprintln!("Scoped to: {}", d.display());
         }
         if !config.constants.is_empty() || !config.import.is_empty() {
@@ -434,8 +487,8 @@ fn run_command(
     // Determine output mode early
     let is_tty = atty::is(atty::Stream::Stdout);
 
-    // Discover from root (scoped to target directory if specified)
-    let (suite, warnings) = discovery::discover_lenient_scoped(&root, target_dir.as_deref());
+    // Discover from root (scoped to the target directories if specified)
+    let (suite, warnings) = discovery::discover_lenient_scoped(&root, &target_dirs);
     if !warnings.is_empty() {
         if verbose {
             eprintln!("Parse warnings ({}):", warnings.len());
@@ -493,8 +546,12 @@ fn run_command(
     // before a log pair is opened, so a stray `tstr run` leaves nothing behind
     // and doesn't pass with an all-zero summary.
     if suite.test_count() == 0 {
-        let scope = target_dir.as_deref().unwrap_or(&root);
-        eprintln!("error: no tstr tests found under {}", scope.display());
+        let scope = if target_dirs.is_empty() {
+            root.display().to_string()
+        } else {
+            target_dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", ")
+        };
+        eprintln!("error: no tstr tests found under {}", scope);
         if !warnings.is_empty() {
             eprintln!("       ({} file(s) skipped for parse errors — use -v to see them)", warnings.len());
         }
@@ -554,7 +611,7 @@ fn run_command(
 
     let opts = runner::RunOptions {
         continue_on_error,
-        display_root: target_dir.clone(),
+        display_root: common_ancestor(&target_dirs),
         config,
         constants,
         stats: Some(Arc::clone(&stats)),
@@ -611,7 +668,7 @@ fn run_command(
 fn list_command(target: &str, ty: &str, flat: bool, disabled: bool) {
     let (root, pattern, target_dir) = resolve_target(target);
 
-    let (suite, warnings) = discovery::discover_lenient_scoped(&root, target_dir.as_deref());
+    let (suite, warnings) = discovery::discover_lenient_scoped(&root, target_dir.as_slice());
     if !warnings.is_empty() {
         for w in &warnings {
             eprintln!("warning: {}", w);
@@ -893,5 +950,46 @@ mod tests {
         // The dir is its own suite root (has tstr.yaml), so nothing is scoped.
         assert_eq!(root, std::fs::canonicalize(dir.path()).unwrap());
         assert!(scoped.is_none());
+    }
+
+    #[test]
+    fn resolve_run_targets_scopes_to_each_and_drops_nested() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(root.join("tstr.yaml"), "constants: {}\n").unwrap();
+        std::fs::create_dir_all(root.join("a/x")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        let arg = |p: &str| root.join(p).to_string_lossy().to_string();
+
+        let (r, dirs) = resolve_run_targets(&[arg("b"), arg("a"), arg("a/x"), arg("b")]).unwrap();
+        assert_eq!(r, root);
+        assert_eq!(dirs, vec![root.join("a"), root.join("b")]);
+        assert_eq!(common_ancestor(&dirs), Some(root.clone()));
+
+        // Naming the root among the targets means the whole suite.
+        let (_, dirs) = resolve_run_targets(&[arg("a"), arg(".")]).unwrap();
+        assert!(dirs.is_empty());
+    }
+
+    #[test]
+    fn resolve_run_targets_rejects_mixed_suites() {
+        let one = tempfile::tempdir().unwrap();
+        let two = tempfile::tempdir().unwrap();
+        std::fs::write(one.path().join("tstr.yaml"), "constants: {}\n").unwrap();
+        std::fs::write(two.path().join("tstr.yaml"), "constants: {}\n").unwrap();
+        let err = resolve_run_targets(&[
+            one.path().to_string_lossy().to_string(),
+            two.path().to_string_lossy().to_string(),
+        ]).unwrap_err();
+        assert!(err.contains("different suite"), "got: {}", err);
+    }
+
+    #[test]
+    fn common_ancestor_of_targets() {
+        let p = |s: &str| PathBuf::from(s);
+        assert_eq!(common_ancestor(&[]), None);
+        assert_eq!(common_ancestor(&[p("/s/a/x")]), Some(p("/s/a/x")));
+        assert_eq!(common_ancestor(&[p("/s/a/x"), p("/s/a/y/z")]), Some(p("/s/a")));
+        assert_eq!(common_ancestor(&[p("/s/a/x"), p("/s/b")]), Some(p("/s")));
     }
 }
