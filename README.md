@@ -1027,6 +1027,8 @@ tagId = createTag("foo", "label").id;            # chain access
 
 No `call` keyword. Library calls share a namespace with built-in HTTP verbs — verb names (`get`, `post`, etc.) are reserved.
 
+A check that fails inside a lib (an `| "message"` assertion or a `? 2xx | "…"` status check) fails the **calling statement** as an ordinary assertion, reported at the caller's line with the lib's name: `line 12: in lib 'createTag': create tag failed (400)`. It behaves just like the same check failing in the test file: the file continues, and a `retry` around the call retries it. Only real evaluation errors inside a lib (an undefined variable, a bad call) are reported as `runtime error`.
+
 ### Resolution
 
 When a test calls `createTag(...)`, the runner walks the caller's directory chain from innermost to outermost (stopping at the suite root), checking at each level:

@@ -8,6 +8,27 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.14.4"></a>
+## [0.14.4] — 2026-10-28
+
+Two fixes: JSON request bodies now escape strings correctly, and a failed check
+inside a lib reads as an assertion failure instead of a runtime error.
+
+### Fixed
+- **JSON bodies escape strings and keys.** Strings in request bodies (and Kafka
+  payloads and Postgres JSON values) only had `"` escaped, so a newline, tab,
+  backslash or other control character went out raw and the server rejected
+  the body as invalid JSON (e.g. a WebVTT track with `\n`). Object keys weren't
+  escaped at all. Both are now escaped per RFC 8259. Number formatting and key
+  order are unchanged.
+- **Failed checks inside a lib are assertion failures.** An `| "message"` or
+  `? 2xx | "…"` check failing inside a lib used to report
+  `runtime error: in lib '…': …` and halt the file. It now fails the calling
+  statement as an ordinary assertion at the caller's line
+  (`line 12: in lib 'createTag': …`). It behaves the same as the check failing
+  in the test itself: the file continues, and a `retry` around the call retries
+  it. Real evaluation errors inside a lib are still runtime errors.
+
 <a id="v0.14.3"></a>
 ## [0.14.3] — 2026-10-28
 

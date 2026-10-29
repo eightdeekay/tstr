@@ -799,7 +799,9 @@ fn invoke_lib(
             StmtResult::Ok => {}
             StmtResult::Return(_) => break,
             StmtResult::AssertionFailed(f) => {
-                return Err(EvalError::new(format!("in lib '{}': {}", name, f.message)));
+                // A failed check in the lib fails the calling statement as an
+                // assertion (reported at the caller's line), not a runtime error.
+                return Err(EvalError::assertion(format!("in lib '{}': {}", name, f.message)));
             }
             StmtResult::MatrixDef(_) => {
                 return Err(EvalError::new(format!(
@@ -2791,6 +2793,35 @@ mod tests {
         let (_, failures) = exec("xs = [1]; xs.each({ a, b, c --> a == a | \"x\"; });");
         assert_eq!(failures.len(), 1);
         assert!(failures[0].message.contains("one or two parameters"), "{}", failures[0].message);
+    }
+
+    // --- Failures inside libs ---
+
+    fn scope_with_lib(name: &str, source: &str) -> Scope {
+        let lib = crate::parser::parse_file(source, &format!("{}.lib.tstr", name)).unwrap();
+        let mut libs = HashMap::new();
+        libs.insert(name.to_string(), std::sync::Arc::new(lib));
+        Scope::new().with_libs(std::sync::Arc::new(libs))
+    }
+
+    #[test]
+    fn test_failed_check_in_lib_is_an_assertion_at_caller_line() {
+        let scope = scope_with_lib("check", "x --> { x == 1 | \"bad x\"; }\n");
+        let (scope, failures) = exec_with_scope("a = 1;\nr = check(2);\nafter = 1;", scope);
+        assert_eq!(failures.len(), 1);
+        let msg = &failures[0].message;
+        assert!(msg.starts_with("line 2: in lib 'check': bad x"), "{}", msg);
+        assert!(!msg.contains("runtime error"), "{}", msg);
+        // Like a failed check in the test itself, it doesn't halt the file.
+        assert_eq!(scope.get("after"), Value::Number(1.0));
+    }
+
+    #[test]
+    fn test_evaluation_error_in_lib_stays_a_runtime_error() {
+        let scope = scope_with_lib("broken", "x --> { y = nope; }\n");
+        let (_, failures) = exec_with_scope("r = broken(1);", scope);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].message.contains("runtime error"), "{}", failures[0].message);
     }
 
     // --- Assertions inside callback blocks ---

@@ -637,7 +637,7 @@ pub(crate) fn value_to_json_string(val: &Value) -> String {
                 n.to_string()
             }
         }
-        Value::String(s) => format!("\"{}\"", s.replace('"', "\\\"")),
+        Value::String(s) => json_string(s),
         Value::Array(items) => {
             let inner: Vec<String> = items.iter().map(value_to_json_string).collect();
             format!("[{}]", inner.join(","))
@@ -649,11 +649,17 @@ pub(crate) fn value_to_json_string(val: &Value) -> String {
             // for any API where the first-declared key wins. `Value::Object` is
             // now an IndexMap, so insertion order is both stable and correct.
             let pairs: Vec<String> = map.iter()
-                .map(|(k, v)| format!("\"{}\":{}", k, value_to_json_string(v)))
+                .map(|(k, v)| format!("{}:{}", json_string(k), value_to_json_string(v)))
                 .collect();
             format!("{{{}}}", pairs.join(","))
         }
     }
+}
+
+/// A quoted JSON string literal with RFC 8259 escaping (`"`, `\\`, and every
+/// control character U+0000–U+001F). Used for both string values and keys.
+fn json_string(s: &str) -> String {
+    serde_json::to_string(s).expect("serializing a str cannot fail")
 }
 
 /// Extract response headers into a Value::Object. A header sent more than
@@ -1010,5 +1016,32 @@ mod tests {
         let json = value_to_json_string(&val);
         assert!(json.contains("\"name\":\"Test\""));
         assert!(json.contains("\"count\":3"));
+    }
+
+    #[test]
+    fn test_value_to_json_string_escapes_strings_and_keys() {
+        let tricky = "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\ttab \\ back \"quote\" \u{1} ctl";
+        let val = Value::Object(ValueMap::from([
+            ("zeta".to_string(), Value::String(tricky.to_string())),
+            ("say \"hi\"".to_string(), Value::Number(1.5)),
+            ("alpha".to_string(), Value::Array(vec![Value::String("a\nb".to_string())])),
+        ]));
+        let json = value_to_json_string(&val);
+
+        // Valid JSON that round-trips to the same value...
+        let parsed: serde_json::Value = serde_json::from_str(&json)
+            .unwrap_or_else(|e| panic!("invalid JSON {:?}: {}", json, e));
+        // (`Value` objects never compare equal, so check in serde_json terms.)
+        let expected = serde_json::json!({
+            "zeta": tricky,
+            "say \"hi\"": 1.5,
+            "alpha": ["a\nb"],
+        });
+        assert_eq!(parsed, expected);
+        // ...with no raw control characters left in it...
+        assert!(!json.chars().any(|c| (c as u32) < 0x20), "{:?}", json);
+        // ...and keys still in declaration order.
+        let keys: Vec<&String> = parsed.as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["zeta", "say \"hi\"", "alpha"]);
     }
 }
