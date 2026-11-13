@@ -998,6 +998,118 @@ as the HTTP client) — connection pooling is a later perf pass.
 Run the live Postgres tests against a throwaway server with `scripts/pg-it.sh`
 (spins up Postgres in Docker, points the tests at it, tears it down).
 
+## Valkey
+
+*Built by default. For a lean build without Valkey (dropping the `redis` crate),
+use `cargo build --no-default-features`. TLS is rustls (pure Rust, `ring`
+provider — no OpenSSL/C toolchain). Redis servers speak the same protocol, so
+this works against them too.*
+
+For flows that touch a cache or a Valkey-backed store — check that a write
+populated (or invalidated) a cache entry, seed a session or feature flag, assert
+on a counter or a TTL — `$.valkey` opens a connection handle you configure once
+and reuse. Same shape as `$.postgres`: the config lives in a `tstr.yaml`
+constant, no connection is opened until the first command, and a handle built
+in a parent `setup.tstr` and `export`ed cascades to the whole tree.
+
+```yaml
+# tstr.yaml
+constants:
+  cache:
+    host: localhost          # default localhost
+    port: 6379               # default 6379
+    user: app                # optional (ACL user); omit for the default user
+    password: ${VALKEY_PASSWORD}
+    db: 0                    # logical database; default 0
+    protocol: 3              # 2 | 3; default 3 (RESP3)
+    tls: false               # true = TLS (or use a valkeys:// URL)
+    tlsRootCert: ~/.auth/certs/valkey-ca.crt   # verify against this PEM CA bundle
+    tlsInsecure: false       # true = accept any cert (test servers only)
+```
+
+A URL string works too — `$.valkey("valkey://:pw@localhost:6379/0")`, with
+`valkeys://` (or `redis://` / `rediss://`) for TLS. In the object form, `url:`
+sets the base and any discrete field overrides that part of it. As with
+`$.postgres`, an unrecognized field is an error naming the key, and a bad
+`port`/`db`/`protocol` fails at the `$.valkey(...)` line rather than at the
+first command.
+
+```
+cache-checks.test.tstr
+
+v = $.valkey(${cache});
+
+// one primitive: any command, by name, with its arguments
+v.cmd("SET", "flag:beta:{{orgId}}", "on", "EX", 300);
+v.cmd("GET", "session:{{sid}}") != null          | "session not cached";
+v.cmd("TTL", "session:{{sid}}") > 0              | "session has no TTL";
+v.cmd("INCR", "hits:{{orgId}}") == 1             | "counter not fresh";
+
+// hashes come back as objects (RESP3)
+h = v.cmd("HGETALL", "user:{{userId}}");
+h.plan == "pro"                                  | "plan is {{h.plan}}";
+
+// JSON values: GET + parse in one step (null when the key is absent)
+u = v.getJson("cache:user:{{userId}}");
+u.email == email                                 | "stale cache entry";
+
+// all keys matching a pattern (SCAN, so it doesn't block the server)
+keys = v.scan("cache:org:{{orgId}}:*");
+keys.size == 0                                   | "cache not invalidated";
+```
+
+**Operations:**
+
+| Call | Returns |
+|---|---|
+| `$.valkey(config)` | a connection handle — `config` is a URL string or a config object (see above) |
+| `handle.cmd(name, ...args)` | the command's reply, mapped to a value (see below) |
+| `handle.getJson(key)` | `GET key` parsed as JSON; `null` if the key doesn't exist |
+| `handle.scan(pattern)` | an array of every key matching `pattern` |
+
+**Reply mapping.** nil → `null`; integers and doubles → numbers; strings
+(including `OK`/`PONG` status replies) → strings; arrays and sets → arrays;
+maps (RESP3, e.g. `HGETALL`, `CONFIG GET`) → objects; RESP3 booleans → bools. A
+server error (`WRONGTYPE …`, unknown command) fails the statement with the
+server's message.
+
+**Semantics:**
+
+- **`cmd` is the whole surface.** `get`/`delete` are reserved HTTP verbs, so
+  there are no `v.get(...)`/`v.del(...)` methods — every command, including
+  `GET` and `DEL`, goes through `v.cmd(...)`. A multi-word command can be
+  written as one string (`v.cmd("CONFIG GET", "maxmemory")`) or split across
+  arguments.
+- **Arguments.** Numbers go as their text (`5`, not `5.0`), bools as
+  `true`/`false`, objects and arrays as JSON — so `v.cmd("SET", k, { id: 7 })`
+  stores a JSON blob that `getJson` reads back. `null` is an error, since Valkey
+  has no null argument.
+- **`db` — settable per op.** Like `pg.schema`, the handle is re-read on every
+  command, so `v.db = 2;` switches the logical database for the next command
+  and every one after it.
+- **RESP3 by default.** Maps come back as objects, not flat `[k, v, k, v]`
+  arrays. Set `protocol: 2` for a server that doesn't support `HELLO 3` (Redis
+  before 6). A URL with `?protocol=…` keeps the protocol it names.
+- **TLS.** `tls: true` (or a `valkeys://`/`rediss://` URL) verifies against the
+  OS trust store plus the public webpki roots. For a managed cluster with its own
+  CA (ElastiCache, Memorystore, DigitalOcean), point `tlsRootCert` at the
+  provider's CA bundle. `tlsInsecure: true` skips verification for self-signed
+  test servers; never use it against production. `tlsRootCert`/`tlsInsecure`
+  without TLS on, or both together, is an error.
+- **Run log.** The endpoint column shows the command and its first argument
+  (`VALKEY SET session:abc`), never the values. `AUTH`/`HELLO` show only the
+  command name.
+- **Timeouts.** Connecting has a 10s limit, and each command 30s. A blocking
+  command (`BLPOP k 60`) that waits on the server longer than that fails.
+
+Each op opens a fresh connection, runs, and drops it (same no-keepalive stance
+as the HTTP client and `$.postgres`). Standalone servers only; there's no
+cluster or Sentinel routing yet.
+
+Run the live Valkey tests against a throwaway server with
+`scripts/valkey-it.sh` (spins up Valkey in Docker, points the tests at it,
+tears it down).
+
 ## Library Functions
 
 Libraries are `*.lib.tstr` files: callable functions with explicit parameters.
@@ -1522,6 +1634,7 @@ a, b --> {
 - **serde_json** — JSON parsing/serialization
 - **rskafka** — Kafka client (optional, `kafka` feature)
 - **tokio-postgres** + **rustls** — PostgreSQL client with pure-Rust TLS (optional, `postgres` feature)
+- **redis** — Valkey client (blocking, rustls TLS; optional, `valkey` feature)
 
 ## Editor Support
 

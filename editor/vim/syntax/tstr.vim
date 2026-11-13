@@ -26,7 +26,7 @@ syn match tstrRegex /\(~?\s*\|!~\s*\|~\s*\)\/[^/]*\// contains=tstrRegexDelim
 syn match tstrRegexDelim /\// contained
 
 " Built-in functions
-syn match tstrBuiltin /\$\.\(uuid\|string\|randEmail\|now\|log\|hmacSha256\|stripeSign\|kafka\|postgres\)\>/
+syn match tstrBuiltin /\$\.\(uuid\|string\|randEmail\|now\|log\|hmacSha256\|stripeSign\|kafka\|postgres\|valkey\)\>/
 syn match tstrBuiltin /\$\.[a-zA-Z_][a-zA-Z0-9_]*/
 
 " HTTP methods

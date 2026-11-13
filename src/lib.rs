@@ -19,3 +19,5 @@ pub mod selfupdate;
 pub mod kafka;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(feature = "valkey")]
+pub mod valkey;

@@ -649,6 +649,17 @@ fn eval_method_call(object: &Expr, method: &str, args: &[Expr], scope: &Scope) -
         return crate::postgres::dispatch_method(&kind, &obj, method, &vals, scope);
     }
 
+    // Valkey handles likewise — `.cmd`/`.getJson`/`.scan` are routed by
+    // receiver kind, so `.scan` etc. never collide with collection methods.
+    #[cfg(feature = "valkey")]
+    if let Some(kind) = crate::valkey::kind_of(&obj) {
+        let mut vals = Vec::with_capacity(args.len());
+        for a in args {
+            vals.push(eval_expr(a, scope)?);
+        }
+        return crate::valkey::dispatch_method(&kind, &obj, method, &vals, scope);
+    }
+
     match method {
         "filter" => {
             let arr = expect_array(&obj, "filter")?;
@@ -1114,6 +1125,15 @@ fn eval_builtin(name: &str, args: &[Expr], scope: &Scope) -> Result<Value, EvalE
             }
             let cfg = eval_expr(&args[0], scope)?;
             crate::postgres::connection_from_config(&cfg)
+        }
+
+        #[cfg(feature = "valkey")]
+        "valkey" => {
+            if args.len() != 1 {
+                return Err(EvalError::new("$.valkey(config) takes 1 argument"));
+            }
+            let cfg = eval_expr(&args[0], scope)?;
+            crate::valkey::connection_from_config(&cfg)
         }
 
         _ => Err(EvalError::new(format!("unknown built-in function '$.{}()'", name))),

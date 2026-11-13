@@ -22,6 +22,8 @@ mod selfupdate;
 mod kafka;
 #[cfg(feature = "postgres")]
 mod postgres;
+#[cfg(feature = "valkey")]
+mod valkey;
 
 use clap::Parser;
 

@@ -1,6 +1,6 @@
 [package]
 name = "tstr"
-version = "0.14.4"
+version = "0.14.5"
 edition = "2021"
 license = "MIT"
 description = "CLI HTTP API test runner with a custom DSL"
@@ -34,7 +34,10 @@ regex = "=1.9.5"
 atty = "=0.2.14"
 terminal_size = "=0.3.0"
 idna = "=0.4.0"
-url = "=2.4.1"
+# Loosened from an exact `=2.4.1` pin: the `valkey` feature's `redis` crate
+# needs url ≥2.5. tstr itself only uses `form_urlencoded`, so it floats within
+# 2.x (SemVer-compatible) — same reasoning as serde/serde_json above.
+url = "2.5"
 # Only used to restore the default SIGPIPE disposition in main() (see main.rs)
 # so piping tstr into `head` et al. exits quietly instead of panicking.
 libc = "0.2"
@@ -70,6 +73,15 @@ chrono = { version = "0.4", default-features = false, features = ["std"], option
 uuid = { version = "1", default-features = false, features = ["std"], optional = true }
 rust_decimal = { version = "1", default-features = false, features = ["std", "db-tokio-postgres"], optional = true }
 bytes = { version = "1", optional = true }
+# Valkey client — optional, gated behind the `valkey` feature. Valkey speaks the
+# Redis protocol, and the `redis` crate supports it natively (including the
+# `valkey://` / `valkeys://` URL schemes). Default features (typed command
+# helpers we don't use — tstr sends raw commands) are OFF. We use the crate's
+# *blocking* client, so no async runtime is involved. TLS is rustls; it shares
+# the `rustls` dep above (ring provider, no aws-lc-rs/C toolchain), with
+# OS-native roots plus webpki roots as a fallback for minimal containers.
+# `tls-rustls-insecure` backs the `tlsInsecure: true` config flag.
+redis = { version = "1.8", optional = true, default-features = false, features = ["tls-rustls", "tls-rustls-insecure", "tls-rustls-webpki-roots"] }
 
 [features]
 # Kafka produce/consume support. ON by default — the primary use case needs
@@ -80,9 +92,13 @@ bytes = { version = "1", optional = true }
 # PostgreSQL support is likewise ON by default — `$.postgres` should be in the
 # on-PATH binary. `cargo build --no-default-features` drops both kafka and
 # postgres (and their transitive deps) for a lean HTTP-only build.
-default = ["kafka", "postgres"]
+#
+# Valkey support is likewise ON by default (`$.valkey`); `--no-default-features`
+# drops it too.
+default = ["kafka", "postgres", "valkey"]
 kafka = ["dep:rskafka"]
 postgres = ["dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:rustls", "dep:webpki-roots", "dep:chrono", "dep:uuid", "dep:rust_decimal", "dep:bytes"]
+valkey = ["dep:redis", "dep:rustls"]
 
 [dev-dependencies]
 tempfile = "=3.8.0"

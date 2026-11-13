@@ -8,6 +8,32 @@ All notable changes to tstr are recorded here. The format follows
 Releases with a ⚠️ block require action on existing suites — the migration steps
 live in [UPGRADING.md](UPGRADING.md), cross-linked per version.
 
+<a id="v0.14.5"></a>
+## [0.14.5] — 2026-11-13
+
+Tests can now read and write Valkey (or Redis) directly with `$.valkey`, for
+checking a cache entry, seeding a session or flag, or asserting on a counter or
+TTL.
+
+### Added
+- **`$.valkey(config)`**, a connection handle configured from a URL
+  (`valkey://`, `valkeys://`, `redis://`, `rediss://`) or a `tstr.yaml` object
+  (`host`, `port`, `user`, `password`, `db`, `protocol`, `tls`, `tlsRootCert`,
+  `tlsInsecure`). As with `$.postgres`, an unknown config field is an error.
+- **`v.cmd(name, ...args)`** runs any command and maps the reply to a value:
+  nil → `null`, integers → numbers, and hashes (RESP3, the default) → objects.
+  A server error such as `WRONGTYPE` fails the statement. Objects and arrays
+  passed as arguments are sent as JSON.
+- **`v.getJson(key)`** does a `GET` and parses the value as JSON (`null` if the
+  key is absent). **`v.scan(pattern)`** returns every matching key using
+  `SCAN`, which doesn't block the server.
+- **`v.db = n`** switches the logical database for later commands, like
+  `pg.schema`.
+- TLS uses rustls, so no OpenSSL is needed. `tlsRootCert` takes a managed
+  cluster's private CA. Built by default; `--no-default-features` leaves it out.
+- `scripts/valkey-it.sh` runs the live Valkey tests against a throwaway server
+  in Docker.
+
 <a id="v0.14.4"></a>
 ## [0.14.4] — 2026-10-28
 

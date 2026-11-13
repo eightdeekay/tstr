@@ -84,7 +84,7 @@
       "patterns": [
         {
           "name": "support.function.builtin.tstr",
-          "match": "\\$\\.(uuid|string|randEmail|now|log|hmacSha256|stripeSign|kafka|postgres)\\b"
+          "match": "\\$\\.(uuid|string|randEmail|now|log|hmacSha256|stripeSign|kafka|postgres|valkey)\\b"
         },
         {
           "name": "support.function.builtin.tstr",
